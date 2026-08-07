@@ -171,6 +171,11 @@ class MarketScheduler:
         # Determine trade direction from structure
         current_price = df.iloc[-1]["close"]
 
+        # Set paper prices so PaperExecutor can execute
+        if hasattr(self.executor, 'set_price'):
+            spread_est = current_price * 0.0002  # ~2 pip spread estimate
+            self.executor.set_price(symbol, current_price - spread_est, current_price + spread_est)
+
         if structure.trend == Trend.BULLISH:
             direction = "BUY"
         elif structure.trend == Trend.BEARISH:

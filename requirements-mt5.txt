@@ -1,0 +1,4 @@
+# MetaTrader5 — install ONLY on Windows VPS or Linux+Wine
+# This package requires the MT5 terminal application running.
+# Do NOT install on standard Linux/Docker (paper mode doesn't need it).
+MetaTrader5==5.0.45

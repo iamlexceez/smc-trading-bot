@@ -130,6 +130,7 @@ def detect_trend_and_structure(
     """
     Determine trend and last structural event from swing point sequence.
     BOS = continuation, CHoCH = reversal.
+    We need at least 3 swing points of each type to detect a prior trend.
     """
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return Trend.RANGING, StructureEvent.NONE
@@ -139,17 +140,22 @@ def detect_trend_and_structure(
     last_sl = swing_lows[-1]
     prev_sl = swing_lows[-2]
 
-    # Determine HH/HL or LH/LL
+    # Determine prior trend from earlier swings (if available)
+    prior_trend = Trend.RANGING
+    if len(swing_highs) >= 3 and len(swing_lows) >= 3:
+        pp_sh = swing_highs[-3]
+        pp_sl = swing_lows[-3]
+        if prev_sh.price > pp_sh.price and prev_sl.price > pp_sl.price:
+            prior_trend = Trend.BULLISH
+        elif prev_sh.price < pp_sh.price and prev_sl.price < pp_sl.price:
+            prior_trend = Trend.BEARISH
+
+    # Current structure
     hh = last_sh.price > prev_sh.price
     hl = last_sl.price > prev_sl.price
     lh = last_sh.price < prev_sh.price
     ll = last_sl.price < prev_sl.price
 
-    # Track previous trend for CHoCH detection
-    was_bullish = hh and hl
-    was_bearish = lh and ll
-
-    # Current structure
     if hh and hl:
         trend = Trend.BULLISH
         event = StructureEvent.BOS_BULLISH
@@ -157,12 +163,13 @@ def detect_trend_and_structure(
         trend = Trend.BEARISH
         event = StructureEvent.BOS_BEARISH
     elif hh and ll:
-        # Divergence — potential reversal
+        # Divergence — potential reversal from bearish to bullish
         trend = Trend.RANGING
-        event = StructureEvent.CHOCH_BULLISH if was_bearish else StructureEvent.NONE
+        event = StructureEvent.CHOCH_BULLISH if prior_trend == Trend.BEARISH else StructureEvent.NONE
     elif lh and hl:
+        # Divergence — potential reversal from bullish to bearish
         trend = Trend.RANGING
-        event = StructureEvent.CHOCH_BEARISH if was_bullish else StructureEvent.NONE
+        event = StructureEvent.CHOCH_BEARISH if prior_trend == Trend.BULLISH else StructureEvent.NONE
     else:
         trend = Trend.RANGING
         event = StructureEvent.NONE

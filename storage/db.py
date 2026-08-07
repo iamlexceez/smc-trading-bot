@@ -3,13 +3,14 @@ SQLite storage layer for settings persistence, trade history, and daily stats.
 Uses aiosqlite for async operations.
 """
 
+import os
 import aiosqlite
 import json
 from datetime import datetime, date
 from typing import Optional
 from config import TradeSettings
 
-DB_PATH = "smc_bot.db"
+DB_PATH = os.getenv("DB_PATH", "smc_bot.db")
 
 
 async def init_db(db_path: str = DB_PATH) -> None:

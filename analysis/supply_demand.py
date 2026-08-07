@@ -139,18 +139,21 @@ def detect_sd_zones(df: pd.DataFrame, lookback: int = 50, min_base_bars: int = 1
                             base_index=base_start,
                         )
 
-                    # Check freshness: has price returned to the zone since creation?
+                    # Check freshness: has price returned to the zone since the impulse departed?
+                    # Fresh = price has NOT revisited the zone after creation
                     post_zone_high = df.iloc[j:]["high"].max() if j < len(df) else 0
                     post_zone_low = df.iloc[j:]["low"].min() if j < len(df) else 0
 
                     if zone.zone_type == ZoneType.SUPPLY:
-                        zone.fresh = post_zone_low < zone.bottom  # Price hasn't returned up to zone
+                        # Supply zone: price should NOT have come back UP into the zone
+                        zone.fresh = post_zone_high < zone.bottom
                         zone.touches = sum(
                             1 for k in range(j, len(df))
                             if df.iloc[k]["high"] >= zone.bottom
                         )
                     else:
-                        zone.fresh = post_zone_high > zone.top  # Price hasn't returned down to zone
+                        # Demand zone: price should NOT have come back DOWN into the zone
+                        zone.fresh = post_zone_low > zone.top
                         zone.touches = sum(
                             1 for k in range(j, len(df))
                             if df.iloc[k]["low"] <= zone.top

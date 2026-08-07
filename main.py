@@ -144,8 +144,21 @@ async def main():
     logger.info(f"Mode: {settings.trading_mode}")
     logger.info(f"Symbols: {settings.symbols}")
 
-    # Start polling
-    await app.run_polling(allowed_updates=["message", "callback_query"])
+    # Start polling using async lifecycle (compatible with asyncio.run)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=["message", "callback_query"])
+
+    # Keep running until interrupted
+    stop_event = asyncio.Event()
+    try:
+        await stop_event.wait()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 
 if __name__ == "__main__":

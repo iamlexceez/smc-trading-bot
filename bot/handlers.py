@@ -46,17 +46,18 @@ def is_admin(user_id: int) -> bool:
 
 
 def admin_only(func):
-    """Decorator to restrict commands to admin users."""
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Decorator to restrict commands to admin users. Works with class methods."""
+    async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if not update.effective_user:
             return
         if not is_admin(update.effective_user.id):
-            await update.message.reply_text(
-                "⛔ You are not authorized to use this bot.\n"
-                "Add your Telegram ID to TELEGRAM_ADMIN_IDS in .env"
-            )
+            if update.message:
+                await update.message.reply_text(
+                    "⛔ You are not authorized to use this bot.\n"
+                    "Add your Telegram ID to TELEGRAM_ADMIN_IDS in .env"
+                )
             return
-        return await func(update, context)
+        return await func(self, update, context, *args, **kwargs)
     return wrapper
 
 
@@ -409,19 +410,45 @@ class BotHandlers:
             await db.save_settings(self.settings)
             await query.edit_message_text("▶️ Auto-trading resumed.", reply_markup=keyboards.main_menu())
         elif data == "close_all":
+            positions = await self.executor.get_open_positions()
+            if not positions:
+                await query.edit_message_text("No open positions to close.", reply_markup=keyboards.main_menu())
+            else:
+                await query.edit_message_text(
+                    f"⚠️ Close all {len(positions)} open positions?\nThis cannot be undone.",
+                    reply_markup=keyboards.confirm_keyboard("close_all")
+                )
+        elif data == "confirm_close_all":
             count = await self.executor.close_all_positions()
             await query.edit_message_text(f"✅ Closed {count} positions.", reply_markup=keyboards.main_menu())
+        elif data == "cancel":
+            await query.edit_message_text("Action cancelled.", reply_markup=keyboards.main_menu())
         elif data == "set_autotrade":
             await query.edit_message_text(
                 f"Auto-Trade is currently {'ON ✅' if self.settings.auto_trade else 'OFF ❌'}",
                 reply_markup=keyboards.autotrade_menu(self.settings.auto_trade)
             )
         elif data == "toggle_autotrade":
-            self.settings.auto_trade = not self.settings.auto_trade
+            if not self.settings.auto_trade:
+                # Turning ON — require confirmation
+                await query.edit_message_text(
+                    "⚠️ Enable auto-trade? The bot will automatically execute trades that pass all risk gates.",
+                    reply_markup=keyboards.confirm_keyboard("autotrade_on")
+                )
+            else:
+                # Turning OFF — no confirmation needed
+                self.settings.auto_trade = False
+                await db.save_settings(self.settings)
+                await query.edit_message_text(
+                    "Auto-Trade is now OFF ❌",
+                    reply_markup=keyboards.autotrade_menu(self.settings.auto_trade)
+                )
+        elif data == "confirm_autotrade_on":
+            self.settings.auto_trade = True
             await db.save_settings(self.settings)
             await query.edit_message_text(
-                f"Auto-Trade is now {'ON ✅' if self.settings.auto_trade else 'OFF ❌'}",
-                reply_markup=keyboards.autotrade_menu(self.settings.auto_trade)
+                "Auto-Trade is now ON ✅",
+                reply_markup=keyboards.main_menu()
             )
         elif data == "set_mode":
             await query.edit_message_text(
@@ -433,9 +460,116 @@ class BotHandlers:
             await db.save_settings(self.settings)
             await query.edit_message_text("✅ Switched to PAPER mode.", reply_markup=keyboards.settings_menu())
         elif data == "mode_live":
+            await query.edit_message_text(
+                "⚠️ Switch to LIVE mode? Real trades will execute with real money.",
+                reply_markup=keyboards.confirm_keyboard("mode_live")
+            )
+        elif data == "confirm_mode_live":
             self.settings.trading_mode = "live"
             await db.save_settings(self.settings)
             await query.edit_message_text("⚠️ LIVE mode enabled. Real trades will execute.", reply_markup=keyboards.settings_menu())
+        elif data == "set_risk":
+            await query.edit_message_text(
+                f"Current risk per trade: {self.settings.risk_per_trade}%\nUse command: /risk 1.5\n(Range: 0.1% - 10%)",
+                reply_markup=keyboards.settings_menu()
+            )
+        elif data == "set_rr":
+            await query.edit_message_text(
+                f"Current min RR: 1:{self.settings.min_rr_ratio}\nUse command: /rr 3.0\n(Range: 1.0 - 20.0)",
+                reply_markup=keyboards.settings_menu()
+            )
+        elif data == "set_score":
+            await query.edit_message_text(
+                f"Current score threshold: {self.settings.score_threshold}%\nUse command: /score 40\n(Range: 1 - 100)",
+                reply_markup=keyboards.settings_menu()
+            )
+        elif data == "set_spread":
+            old = self.settings.max_spread_pips
+            self.settings.max_spread_pips = 10.0 if old < 10.0 else 3.0
+            await db.save_settings(self.settings)
+            await query.edit_message_text(
+                f"Max spread set to {self.settings.max_spread_pips} pips.",
+                reply_markup=keyboards.settings_menu()
+            )
+        elif data == "set_daily_loss":
+            old = self.settings.max_daily_loss_pct
+            self.settings.max_daily_loss_pct = 10.0 if old < 10.0 else 3.0
+            await db.save_settings(self.settings)
+            await query.edit_message_text(
+                f"Max daily loss set to {self.settings.max_daily_loss_pct}%.",
+                reply_markup=keyboards.settings_menu()
+            )
+        elif data == "set_max_trades":
+            old = self.settings.max_trades_per_day
+            self.settings.max_trades_per_day = 20 if old < 20 else 5
+            await db.save_settings(self.settings)
+            await query.edit_message_text(
+                f"Max trades/day set to {self.settings.max_trades_per_day}.",
+                reply_markup=keyboards.settings_menu()
+            )
+        elif data == "set_max_pos":
+            old = self.settings.max_open_positions
+            self.settings.max_open_positions = 10 if old < 10 else 3
+            await db.save_settings(self.settings)
+            await query.edit_message_text(
+                f"Max open positions set to {self.settings.max_open_positions}.",
+                reply_markup=keyboards.settings_menu()
+            )
+        elif data == "set_cooldown":
+            old = self.settings.symbol_cooldown_minutes
+            self.settings.symbol_cooldown_minutes = 60 if old < 60 else 15
+            await db.save_settings(self.settings)
+            await query.edit_message_text(
+                f"Symbol cooldown set to {self.settings.symbol_cooldown_minutes} min.",
+                reply_markup=keyboards.settings_menu()
+            )
+        elif data == "set_symbols":
+            all_symbols = [
+                "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD",
+                "Volatility 75 Index", "Volatility 100 Index",
+                "Boom 500 Index", "Boom 1000 Index",
+                "Crash 500 Index", "Crash 1000 Index",
+            ]
+            await query.edit_message_text(
+                "Toggle symbols (✅ = active):",
+                reply_markup=keyboards.symbol_select_keyboard(all_symbols, self.settings.symbols)
+            )
+        elif data.startswith("sym_"):
+            sym = data.replace("sym_", "")
+            if sym in self.settings.symbols:
+                self.settings.symbols.remove(sym)
+            else:
+                self.settings.symbols.append(sym)
+            await db.save_settings(self.settings)
+            all_symbols = [
+                "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD",
+                "Volatility 75 Index", "Volatility 100 Index",
+                "Boom 500 Index", "Boom 1000 Index",
+                "Crash 500 Index", "Crash 1000 Index",
+            ]
+            await query.edit_message_text(
+                "Toggle symbols (✅ = active):",
+                reply_markup=keyboards.symbol_select_keyboard(all_symbols, self.settings.symbols)
+            )
+        elif data == "set_timeframes":
+            all_tfs = ["M5", "M15", "M30", "H1", "H4", "D1"]
+            await query.edit_message_text(
+                "Toggle timeframes (✅ = active):",
+                reply_markup=keyboards.timeframe_select_keyboard(all_tfs, self.settings.timeframes)
+            )
+        elif data.startswith("tf_"):
+            tf = data.replace("tf_", "")
+            if tf in self.settings.timeframes:
+                if len(self.settings.timeframes) > 1:
+                    self.settings.timeframes.remove(tf)
+            else:
+                self.settings.timeframes.append(tf)
+            await db.save_settings(self.settings)
+            all_tfs = ["M5", "M15", "M30", "H1", "H4", "D1"]
+            await query.edit_message_text(
+                "Toggle timeframes (✅ = active):",
+                reply_markup=keyboards.timeframe_select_keyboard(all_tfs, self.settings.timeframes)
+            )
         elif data.startswith("analyze_"):
             symbol = data.replace("analyze_", "")
             await query.edit_message_text(f"📊 Analyzing {symbol}...")
@@ -447,7 +581,7 @@ class BotHandlers:
                     await context.bot.send_message(query.message.chat_id, f"No signal for {symbol}.")
             await context.bot.send_message(query.message.chat_id, "Menu:", reply_markup=keyboards.main_menu())
         else:
-            await query.edit_message_text("Feature coming soon.", reply_markup=keyboards.main_menu())
+            await query.edit_message_text("Unknown action.", reply_markup=keyboards.main_menu())
 
     # ─── Setup ─────────────────────────────────────────────
 
