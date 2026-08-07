@@ -1,0 +1,21 @@
+# Core
+python-telegram-bot[ext]==21.6
+APScheduler==3.10.4
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# Data / TA
+pandas==2.2.2
+numpy==2.1.1
+ta==0.11.0
+
+# MT5 (install only on Windows VPS or Linux+Wine; falls back to paper mode)
+MetaTrader5==5.0.45
+
+# Storage
+aiosqlite==0.20.0
+
+# Utils
+python-dotenv==1.0.1
+tabulate==0.9.0
+structlog==24.4.0

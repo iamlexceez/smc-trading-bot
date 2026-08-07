@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  smc-bot:
+    build: .
+    container_name: smc-trading-bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - bot-data:/app/data
+    environment:
+      - DB_PATH=/app/data/smc_bot.db
+
+volumes:
+  bot-data:
