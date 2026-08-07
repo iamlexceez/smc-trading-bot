@@ -9,6 +9,10 @@ pandas==2.2.2
 numpy==2.1.1
 ta==0.11.0
 
+# Market Data (free APIs)
+yfinance==0.2.43
+aiohttp==3.10.10
+
 # Storage
 aiosqlite==0.20.0
 

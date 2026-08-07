@@ -69,16 +69,46 @@ class TradeSettings:
     trading_mode: str = "paper"  # paper | live
     magic_number: int = 20260807
 
+    # Entry confirmation
+    require_zone_retest: bool = True
+    require_candle_confirmation: bool = True
+    require_displacement: bool = False
+
+    # Trade management
+    breakeven_at_rr: float = 1.0
+    trail_atr_multiplier: float = 2.0
+    partial_close_rr: float = 2.0
+    partial_close_percent: float = 0.50
+    max_hold_bars: int = 100
+
+    # Session filtering
+    enabled_sessions: list[str] = field(default_factory=lambda: ["london", "new_york", "overlap"])
+
+    # News filtering
+    news_filter_enabled: bool = True
+    news_impact_levels: list[str] = field(default_factory=lambda: ["High"])
+    news_blackout_minutes: int = 15
+
     def to_dict(self) -> dict:
         d = asdict(self)
         # Lists → comma strings for SQLite storage
-        d["symbols"] = ",".join(d["symbols"])
-        d["timeframes"] = ",".join(d["timeframes"])
-        d["htf_timeframes"] = ",".join(d["htf_timeframes"])
+        for key in ("symbols", "timeframes", "htf_timeframes", "enabled_sessions", "news_impact_levels"):
+            if isinstance(d.get(key), list):
+                d[key] = ",".join(d[key])
         return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "TradeSettings":
+        def parse_bool(val, default=False):
+            return val in ("true", "1", True) if isinstance(val, str) else (val if isinstance(val, bool) else default)
+
+        def parse_list(val, default=None):
+            if isinstance(val, list):
+                return val
+            if isinstance(val, str):
+                return [s.strip() for s in val.split(",") if s.strip()]
+            return default or []
+
         return cls(
             risk_per_trade=float(d.get("risk_per_trade", 1.0)),
             max_daily_loss_pct=float(d.get("max_daily_loss_pct", 5.0)),
@@ -88,13 +118,25 @@ class TradeSettings:
             score_threshold=float(d.get("score_threshold", 40.0)),
             max_spread_pips=float(d.get("max_spread_pips", 5.0)),
             symbol_cooldown_minutes=int(d.get("symbol_cooldown_minutes", 30)),
-            auto_trade=d.get("auto_trade", "false") in ("true", "1", True),
-            is_paused=d.get("is_paused", "false") in ("true", "1", True),
-            symbols=[s.strip() for s in str(d.get("symbols", "")).split(",") if s.strip()],
-            timeframes=[s.strip() for s in str(d.get("timeframes", "")).split(",") if s.strip()],
-            htf_timeframes=[s.strip() for s in str(d.get("htf_timeframes", "")).split(",") if s.strip()],
+            auto_trade=parse_bool(d.get("auto_trade", "false")),
+            is_paused=parse_bool(d.get("is_paused", "false")),
+            symbols=parse_list(d.get("symbols")),
+            timeframes=parse_list(d.get("timeframes")),
+            htf_timeframes=parse_list(d.get("htf_timeframes")),
             trading_mode=d.get("trading_mode", "paper"),
             magic_number=int(d.get("magic_number", 20260807)),
+            require_zone_retest=parse_bool(d.get("require_zone_retest", "true"), True),
+            require_candle_confirmation=parse_bool(d.get("require_candle_confirmation", "true"), True),
+            require_displacement=parse_bool(d.get("require_displacement", "false"), False),
+            breakeven_at_rr=float(d.get("breakeven_at_rr", 1.0)),
+            trail_atr_multiplier=float(d.get("trail_atr_multiplier", 2.0)),
+            partial_close_rr=float(d.get("partial_close_rr", 2.0)),
+            partial_close_percent=float(d.get("partial_close_percent", 0.50)),
+            max_hold_bars=int(d.get("max_hold_bars", 100)),
+            enabled_sessions=parse_list(d.get("enabled_sessions"), ["london", "new_york", "overlap"]),
+            news_filter_enabled=parse_bool(d.get("news_filter_enabled", "true"), True),
+            news_impact_levels=parse_list(d.get("news_impact_levels"), ["High"]),
+            news_blackout_minutes=int(d.get("news_blackout_minutes", 15)),
         )
 
     @classmethod
@@ -115,4 +157,16 @@ class TradeSettings:
             htf_timeframes=[s.strip() for s in os.getenv("HTF_TIMEFRAMES", "H1,H4,D1").split(",")],
             trading_mode=get_trading_mode(),
             magic_number=20260807,
+            require_zone_retest=os.getenv("REQUIRE_ZONE_RETEST", "true").lower() == "true",
+            require_candle_confirmation=os.getenv("REQUIRE_CANDLE_CONFIRMATION", "true").lower() == "true",
+            require_displacement=os.getenv("REQUIRE_DISPLACEMENT", "false").lower() == "true",
+            breakeven_at_rr=float(os.getenv("BREAKEVEN_AT_RR", "1.0")),
+            trail_atr_multiplier=float(os.getenv("TRAIL_ATR_MULTIPLIER", "2.0")),
+            partial_close_rr=float(os.getenv("PARTIAL_CLOSE_RR", "2.0")),
+            partial_close_percent=float(os.getenv("PARTIAL_CLOSE_PERCENT", "0.50")),
+            max_hold_bars=int(os.getenv("MAX_HOLD_BARS", "100")),
+            enabled_sessions=[s.strip() for s in os.getenv("ENABLED_SESSIONS", "london,new_york,overlap").split(",")],
+            news_filter_enabled=os.getenv("NEWS_FILTER_ENABLED", "true").lower() == "true",
+            news_impact_levels=[s.strip() for s in os.getenv("NEWS_IMPACT_LEVELS", "High").split(",")],
+            news_blackout_minutes=int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")),
         )

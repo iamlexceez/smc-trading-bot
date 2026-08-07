@@ -19,11 +19,15 @@ from apscheduler.triggers.interval import IntervalTrigger
 from config import TradeSettings
 from storage import db
 from analysis.structure import analyze_structure, MarketStructure, Trend
-from analysis.supply_demand import detect_sd_zones, SupplyDemandZone
+from analysis.supply_demand import detect_sd_zones, SupplyDemandZone, ZoneType
 from analysis.scoring import compute_signal, TradeSignal, format_signal_report
-from analysis.indicators import pip_value
+from analysis.indicators import pip_value, atr
+from analysis.sessions import check_trading_session
+from analysis.confirmation import get_confirmation
 from risk.manager import RiskManager
 from executors.base import BaseExecutor
+from data.provider import DataProvider
+from news.filter import NewsFilter
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +56,15 @@ class MarketScheduler:
         self.admin_chat_id = admin_chat_id
         self.scheduler = AsyncIOScheduler()
         self._running = False
+        self.data_provider = DataProvider()
+        self.news_filter = NewsFilter(
+            impact_levels=settings.news_impact_levels,
+            blackout_minutes=settings.news_blackout_minutes,
+        )
 
     async def start(self, interval_seconds: int = 300):
         """Start the periodic market scanner."""
+        await self.data_provider.init()
         self.scheduler.add_job(
             self.scan_and_execute,
             IntervalTrigger(seconds=interval_seconds),
@@ -71,24 +81,8 @@ class MarketScheduler:
         self._running = False
 
     async def fetch_candles(self, symbol: str, timeframe: str, count: int = 200) -> "pd.DataFrame":
-        """Fetch OHLCV data for a symbol/timeframe."""
-        import pandas as pd
-
-        # Try MT5 data
-        try:
-            import MetaTrader5 as mt5
-            if mt5.terminal_info() is not None:
-                tf_const = getattr(mt5, f"TIMEFRAME_{timeframe}", mt5.TIMEFRAME_M15)
-                rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, count)
-                if rates is not None and len(rates) > 0:
-                    df = pd.DataFrame(rates)
-                    df["time"] = pd.to_datetime(df["time"], unit="s")
-                    return df
-        except (ImportError, Exception):
-            pass
-
-        # Generate synthetic data for paper mode / testing
-        return self._generate_synthetic_data(symbol, count)
+        """Fetch OHLCV data using the real market data provider."""
+        return await self.data_provider.get_candles(symbol, timeframe, count)
 
     def _generate_synthetic_data(self, symbol: str, count: int = 200):
         """Generate realistic OHLCV data for paper mode testing."""
@@ -206,6 +200,30 @@ class MarketScheduler:
             sl = entry + atr_val * 1.5
             tp = entry - atr_val * 1.5 * self.settings.min_rr_ratio
 
+        # Entry confirmation
+        nearest_zone = None
+        for z in zones:
+            if direction == "BUY" and z.zone_type == ZoneType.DEMAND:
+                nearest_zone = z
+                break
+            elif direction == "SELL" and z.zone_type == ZoneType.SUPPLY:
+                nearest_zone = z
+                break
+
+        if nearest_zone and self.settings.require_zone_retest:
+            confirmation = get_confirmation(
+                df.tail(20),
+                direction,
+                zone_top=nearest_zone.top,
+                zone_bottom=nearest_zone.bottom,
+                require_retest=self.settings.require_zone_retest,
+                require_candle=self.settings.require_candle_confirmation,
+                require_displacement=self.settings.require_displacement,
+            )
+            if not confirmation.confirmed:
+                logger.debug(f"No entry confirmation for {symbol}: {confirmation.detail}")
+                return None
+
         # Compute signal score
         signal = compute_signal(
             symbol=symbol,
@@ -246,6 +264,19 @@ class MarketScheduler:
 
         for symbol in self.settings.symbols:
             try:
+                # Check session filter
+                session_info = check_trading_session(self.settings.enabled_sessions)
+                if not session_info.is_trading_time:
+                    logger.debug(f"Outside trading session: {session_info.reason}")
+                    continue
+
+                # Check news filter
+                if self.settings.news_filter_enabled:
+                    news_result = await self.news_filter.check_news(symbol)
+                    if news_result.is_blackout:
+                        logger.info(f"News blackout for {symbol}: {news_result.reason}")
+                        continue
+
                 signal = await self.analyze_symbol(symbol)
                 if not signal or signal.score < self.settings.score_threshold:
                     continue

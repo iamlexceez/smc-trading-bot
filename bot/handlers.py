@@ -307,24 +307,83 @@ class BotHandlers:
             await update.message.reply_text(f"Current threshold: {self.settings.score_threshold}%\nUsage: /score 40")
 
     @admin_only
+    async def cmd_backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Run a backtest."""
+        symbol = context.args[0] if len(context.args) > 0 else "EURUSD"
+        timeframe = context.args[1] if len(context.args) > 1 else "H1"
+        try:
+            days = int(context.args[2]) if len(context.args) > 2 else 180
+        except ValueError:
+            days = 180
+
+        await update.message.reply_text(
+            f"📊 Running backtest: {symbol} {timeframe} over {days} days...\n"
+            f"This may take 1-2 minutes."
+        )
+
+        try:
+            from backtest.runner import run_backtest
+            await self.reload_settings()
+            result = await run_backtest(symbol, timeframe, days, self.settings)
+            await update.message.reply_text(result.summary())
+        except Exception as e:
+            logger.error(f"Backtest error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Backtest failed: {e}")
+
+    @admin_only
+    async def cmd_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show trading session status."""
+        from analysis.sessions import format_session_status
+        await update.message.reply_text(format_session_status(self.settings.enabled_sessions))
+
+    @admin_only
+    async def cmd_news(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Check news filter status for a symbol."""
+        symbol = context.args[0] if context.args else self.settings.symbols[0]
+        if self.scheduler and hasattr(self.scheduler, 'news_filter') and self.scheduler.news_filter:
+            result = await self.scheduler.news_filter.check_news(symbol)
+            status = "🔴 BLOCKED" if result.is_blackout else "🟢 CLEAR"
+            lines = [
+                f"📰 **News Filter — {symbol}** — {status}\n",
+                f"Status: {result.reason}",
+            ]
+            if result.events_today:
+                lines.append(f"\n**Today's Events:**")
+                for e in result.events_today[:10]:
+                    emoji = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(e.impact, "⚪")
+                    lines.append(f"{emoji} {e.date.strftime('%H:%M')} {e.currency} — {e.title}")
+            await update.message.reply_text("\n".join(lines))
+        else:
+            await update.message.reply_text("News filter not initialized.")
+
+    @admin_only
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help."""
         await update.message.reply_text(
             "🤖 **SMC Trading Bot — Commands**\n\n"
+            "**Trading:**\n"
             "/start — Main menu\n"
             "/scan — Scan all symbols for signals\n"
             "/analyze [symbol] — Deep analysis of a symbol\n"
             "/positions — Show open positions\n"
             "/close_all — Close all positions\n"
-            "/settings — Adjust all settings\n"
-            "/account — Account info\n"
-            "/history — Recent trades\n"
             "/pause — Pause auto-trading\n"
-            "/resume — Resume auto-trading\n"
+            "/resume — Resume auto-trading\n\n"
+            "**Settings:**\n"
+            "/settings — Adjust all settings\n"
             "/mode [paper|live] — Switch execution mode\n"
             "/risk [pct] — Set risk per trade\n"
             "/rr [ratio] — Set min RR ratio\n"
-            "/score [val] — Set score threshold\n"
+            "/score [val] — Set score threshold\n\n"
+            "**Info:**\n"
+            "/account — Account info\n"
+            "/history — Recent trades\n"
+            "/sessions — Show trading session status\n"
+            "/news [symbol] — Check news blackout status\n\n"
+            "**Backtesting:**\n"
+            "/backtest [symbol] [tf] [days] — Run historical backtest\n"
+            "  Example: /backtest EURUSD H1 180\n"
+            "  Tests the strategy on 6 months of H1 data\n\n"
             "/help — This message"
         )
 
@@ -602,5 +661,8 @@ class BotHandlers:
         app.add_handler(CommandHandler("risk", self.cmd_risk))
         app.add_handler(CommandHandler("rr", self.cmd_rr))
         app.add_handler(CommandHandler("score", self.cmd_score))
+        app.add_handler(CommandHandler("backtest", self.cmd_backtest))
+        app.add_handler(CommandHandler("sessions", self.cmd_sessions))
+        app.add_handler(CommandHandler("news", self.cmd_news))
         app.add_handler(CallbackQueryHandler(self.handle_callback))
         self.app = app
