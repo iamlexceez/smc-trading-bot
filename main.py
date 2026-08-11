@@ -23,8 +23,6 @@ from config import (
 )
 from storage import db
 from bot.handlers import BotHandlers
-from bot.keyboards import main_menu
-from executors.paper import PaperExecutor
 from executors.mt5 import MT5Executor, MT5_AVAILABLE
 from risk.manager import RiskManager
 from scheduler import MarketScheduler
@@ -47,29 +45,31 @@ logger = logging.getLogger(__name__)
 
 
 async def create_executor(settings: TradeSettings) -> object:
-    """Create the appropriate executor based on settings."""
-    if settings.trading_mode == "live" and MT5_AVAILABLE:
-        creds = get_mt5_credentials()
-        if creds["login"] and creds["password"] and creds["server"]:
-            executor = MT5Executor(
-                login=creds["login"],
-                password=creds["password"],
-                server=creds["server"],
-                path=creds["path"],
-            )
-            connected = await executor.connect()
-            if connected:
-                logger.info("✅ MT5 executor connected")
-                return executor
-            else:
-                logger.warning("⚠️ MT5 connection failed, falling back to paper mode")
-        else:
-            logger.warning("⚠️ MT5 credentials not set, falling back to paper mode")
+    """Create the appropriate MT5 executor based on settings (demo or live)."""
+    if not MT5_AVAILABLE:
+        logger.error("❌ MetaTrader5 package not available. Bot cannot run in demo or live mode.")
+        sys.exit(1)
 
-    # Default: paper mode
-    executor = PaperExecutor(starting_balance=10000.0)
-    await executor.connect()
-    logger.info("✅ Paper executor initialized ($10,000 balance)")
+    mode = settings.trading_mode
+    creds = get_mt5_credentials(mode)
+    
+    if not creds["login"] or not creds["password"] or not creds["server"]:
+        logger.error(f"❌ MT5 {mode.upper()} credentials not set in .env. Cannot start.")
+        sys.exit(1)
+
+    executor = MT5Executor(
+        login=creds["login"],
+        password=creds["password"],
+        server=creds["server"],
+        path=creds["path"],
+    )
+    
+    connected = await executor.connect()
+    if not connected:
+        logger.error(f"❌ Failed to connect to MT5 {mode.upper()} account {creds['login']}. Exiting.")
+        sys.exit(1)
+
+    logger.info(f"✅ MT5 executor connected to {mode.upper()} account")
     return executor
 
 
@@ -93,7 +93,7 @@ async def main():
     settings = await db.load_settings()
     logger.info(f"Settings loaded: mode={settings.trading_mode}, auto_trade={settings.auto_trade}")
 
-    # Create executor
+    # Create executor (demo or live MT5)
     executor = await create_executor(settings)
 
     # Create risk manager
@@ -131,9 +131,8 @@ async def main():
                 await app.bot.send_message(
                     admin_id,
                     f"🤖 **SMC Trading Bot Started**\n\n"
-                    f"Mode: `{settings.trading_mode}`\n"
-                    f"Auto-Trade: {'✅ ON' if settings.auto_trade else '❌ OFF'}\n"
-                    f"Paper balance: $10,000\n\n"
+                    f"Mode: `{settings.trading_mode.upper()}`\n"
+                    f"Auto-Trade: {'✅ ON' if settings.auto_trade else '❌ OFF'}\n\n"
                     f"Use /help to see all commands."
                 )
             except Exception as e:

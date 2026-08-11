@@ -84,55 +84,6 @@ class MarketScheduler:
         """Fetch OHLCV data using the real market data provider."""
         return await self.data_provider.get_candles(symbol, timeframe, count)
 
-    def _generate_synthetic_data(self, symbol: str, count: int = 200):
-        """Generate realistic OHLCV data for paper mode testing."""
-        import pandas as pd
-        import numpy as np
-
-        np.random.seed(hash(symbol) % 2**32)
-
-        # Base price depends on symbol type
-        symbol_upper = symbol.upper()
-        if "XAU" in symbol_upper or "GOLD" in symbol_upper:
-            base = 2000.0
-            vol = 2.0
-        elif "JPY" in symbol_upper:
-            base = 150.0
-            vol = 0.2
-        elif "VOLATILITY" in symbol_upper:
-            base = 5000.0
-            vol = 50.0
-        elif "BOOM" in symbol_upper:
-            base = 2000.0
-            vol = 5.0
-        elif "CRASH" in symbol_upper:
-            base = 2000.0
-            vol = 5.0
-        else:
-            base = 1.1000
-            vol = 0.001
-
-        # Random walk
-        returns = np.random.normal(0, vol, count)
-        prices = base * np.exp(np.cumsum(returns / base))
-
-        timestamps = pd.date_range(end=datetime.now(), periods=count, freq="15min")
-
-        df = pd.DataFrame({
-            "time": timestamps,
-            "open": prices,
-            "high": prices + np.abs(np.random.normal(0, vol * 0.5, count)),
-            "low": prices - np.abs(np.random.normal(0, vol * 0.5, count)),
-            "close": prices + np.random.normal(0, vol * 0.3, count),
-            "tick_volume": np.random.randint(100, 10000, count),
-        })
-
-        # Ensure high >= max(open, close) and low <= min(open, close)
-        df["high"] = df[["high", "open", "close"]].max(axis=1)
-        df["low"] = df[["low", "open", "close"]].min(axis=1)
-
-        return df
-
     async def analyze_symbol(self, symbol: str) -> Optional[TradeSignal]:
         """
         Full analysis of a single symbol across all timeframes.
@@ -165,7 +116,7 @@ class MarketScheduler:
         # Determine trade direction from structure
         current_price = df.iloc[-1]["close"]
 
-        # Set paper prices so PaperExecutor can execute
+        # Set paper prices so PaperExecutor can execute (if still in use by backtester)
         if hasattr(self.executor, 'set_price'):
             spread_est = current_price * 0.0002  # ~2 pip spread estimate
             self.executor.set_price(symbol, current_price - spread_est, current_price + spread_est)
@@ -184,8 +135,8 @@ class MarketScheduler:
                 return None  # No clear direction
 
         # Calculate SL and TP
-        from analysis.indicators import atr
-        atr_val = atr(df, 14).iloc[-1]
+        atr_series = atr(df, 14)
+        atr_val = atr_series.iloc[-1]
         if atr_val <= 0 or (isinstance(atr_val, float) and atr_val != atr_val):  # NaN check
             atr_val = current_price * 0.002  # fallback
 
@@ -224,7 +175,7 @@ class MarketScheduler:
                 logger.debug(f"No entry confirmation for {symbol}: {confirmation.detail}")
                 return None
 
-        # Compute signal score
+        # Compute signal score using real ATR
         signal = compute_signal(
             symbol=symbol,
             direction=direction,
@@ -234,6 +185,7 @@ class MarketScheduler:
             ltf_structure=structure,
             htf_structures=htf_structures,
             zones=zones,
+            atr_val=atr_val,
             min_rr=self.settings.min_rr_ratio,
             timeframe=primary_tf,
         )
@@ -283,6 +235,7 @@ class MarketScheduler:
 
                 # Run risk checks
                 account = await self.executor.get_account_info()
+                equity = account.get("equity", account.get("balance", 0))
                 free_margin = account.get("free_margin", 0)
                 balance = account.get("balance", 10000)
                 today_pnl = await db.get_today_pnl()
@@ -306,6 +259,7 @@ class MarketScheduler:
                     score=signal.score,
                     rr_ratio=signal.rr_ratio,
                     spread_pips=spread / pip if pip > 0 else 0,
+                    account_equity=equity,
                     free_margin=free_margin,
                     required_margin=required_margin,
                     today_pnl=today_pnl,

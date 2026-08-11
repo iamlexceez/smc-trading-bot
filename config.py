@@ -26,17 +26,26 @@ def get_admin_ids() -> list[int]:
     return [int(x.strip()) for x in raw.split(",") if x.strip().isdigit()]
 
 
-def get_mt5_credentials() -> dict:
+def get_mt5_credentials(mode: str = "demo") -> dict:
+    """Get MT5 credentials for the specified mode (demo or live)."""
+    prefix = "MT5_LIVE" if mode == "live" else "MT5_DEMO"
+    
+    # Fallback to generic MT5_ keys if mode-specific ones are missing (for backward compatibility)
+    login = os.getenv(f"{prefix}_LOGIN") or os.getenv("MT5_LOGIN")
+    password = os.getenv(f"{prefix}_PASSWORD") or os.getenv("MT5_PASSWORD")
+    server = os.getenv(f"{prefix}_SERVER") or os.getenv("MT5_SERVER")
+    path = os.getenv(f"{prefix}_PATH") or os.getenv("MT5_PATH")
+    
     return {
-        "login": int(os.getenv("MT5_LOGIN", "0") or "0") or None,
-        "password": os.getenv("MT5_PASSWORD", ""),
-        "server": os.getenv("MT5_SERVER", ""),
-        "path": os.getenv("MT5_PATH", "") or None,
+        "login": int(login) if login and login.isdigit() else None,
+        "password": password or "",
+        "server": server or "",
+        "path": path or None,
     }
 
 
 def get_trading_mode() -> str:
-    return os.getenv("TRADING_MODE", "paper").lower()
+    return os.getenv("TRADING_MODE", "demo").lower()
 
 
 # ─── Tradeable Settings (persisted in DB, adjustable via Telegram) ──
@@ -49,7 +58,7 @@ class TradeSettings:
     max_trades_per_day: int = 10
     max_open_positions: int = 5
     min_rr_ratio: float = 3.0
-    score_threshold: float = 40.0
+    score_threshold: float = 60.0  # Raised from 40 to 60
     max_spread_pips: float = 5.0
     symbol_cooldown_minutes: int = 30
 
@@ -66,13 +75,13 @@ class TradeSettings:
     htf_timeframes: list[str] = field(default_factory=lambda: ["H1", "H4", "D1"])
 
     # Execution
-    trading_mode: str = "paper"  # paper | live
+    trading_mode: str = "demo"  # demo | live
     magic_number: int = 20260807
 
     # Entry confirmation
     require_zone_retest: bool = True
     require_candle_confirmation: bool = True
-    require_displacement: bool = False
+    require_displacement: bool = True  # Turned on by default
 
     # Trade management
     breakeven_at_rr: float = 1.0
@@ -115,7 +124,7 @@ class TradeSettings:
             max_trades_per_day=int(d.get("max_trades_per_day", 10)),
             max_open_positions=int(d.get("max_open_positions", 5)),
             min_rr_ratio=float(d.get("min_rr_ratio", 3.0)),
-            score_threshold=float(d.get("score_threshold", 40.0)),
+            score_threshold=float(d.get("score_threshold", 60.0)),
             max_spread_pips=float(d.get("max_spread_pips", 5.0)),
             symbol_cooldown_minutes=int(d.get("symbol_cooldown_minutes", 30)),
             auto_trade=parse_bool(d.get("auto_trade", "false")),
@@ -123,11 +132,11 @@ class TradeSettings:
             symbols=parse_list(d.get("symbols")),
             timeframes=parse_list(d.get("timeframes")),
             htf_timeframes=parse_list(d.get("htf_timeframes")),
-            trading_mode=d.get("trading_mode", "paper"),
+            trading_mode=d.get("trading_mode", "demo"),
             magic_number=int(d.get("magic_number", 20260807)),
             require_zone_retest=parse_bool(d.get("require_zone_retest", "true"), True),
             require_candle_confirmation=parse_bool(d.get("require_candle_confirmation", "true"), True),
-            require_displacement=parse_bool(d.get("require_displacement", "false"), False),
+            require_displacement=parse_bool(d.get("require_displacement", "true"), True),
             breakeven_at_rr=float(d.get("breakeven_at_rr", 1.0)),
             trail_atr_multiplier=float(d.get("trail_atr_multiplier", 2.0)),
             partial_close_rr=float(d.get("partial_close_rr", 2.0)),
@@ -147,7 +156,7 @@ class TradeSettings:
             max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "10")),
             max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "5")),
             min_rr_ratio=float(os.getenv("MIN_RR_RATIO", "3.0")),
-            score_threshold=float(os.getenv("SCORE_THRESHOLD", "40.0")),
+            score_threshold=float(os.getenv("SCORE_THRESHOLD", "60.0")),
             max_spread_pips=float(os.getenv("MAX_SPREAD_PIPS", "5.0")),
             symbol_cooldown_minutes=int(os.getenv("SYMBOL_COOLDOWN_MINUTES", "30")),
             auto_trade=os.getenv("AUTO_TRADE", "false").lower() == "true",
@@ -159,7 +168,7 @@ class TradeSettings:
             magic_number=20260807,
             require_zone_retest=os.getenv("REQUIRE_ZONE_RETEST", "true").lower() == "true",
             require_candle_confirmation=os.getenv("REQUIRE_CANDLE_CONFIRMATION", "true").lower() == "true",
-            require_displacement=os.getenv("REQUIRE_DISPLACEMENT", "false").lower() == "true",
+            require_displacement=os.getenv("REQUIRE_DISPLACEMENT", "true").lower() == "true",
             breakeven_at_rr=float(os.getenv("BREAKEVEN_AT_RR", "1.0")),
             trail_atr_multiplier=float(os.getenv("TRAIL_ATR_MULTIPLIER", "2.0")),
             partial_close_rr=float(os.getenv("PARTIAL_CLOSE_RR", "2.0")),
