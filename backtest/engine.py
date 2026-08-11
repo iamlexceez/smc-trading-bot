@@ -261,7 +261,8 @@ class BacktestEngine:
                 continue
 
             # Calculate SL and TP
-            atr_val = atr(slice_df, 14).iloc[-1]
+            atr_series = atr(slice_df, 14)
+            atr_val = atr_series.iloc[-1]
             if atr_val <= 0 or np.isnan(atr_val):
                 atr_val = current_price * 0.002
 
@@ -274,7 +275,7 @@ class BacktestEngine:
                 sl = entry + atr_val * 1.5
                 tp = entry - atr_val * 1.5 * self.settings.min_rr_ratio
 
-            # Compute signal score
+            # Compute signal score using real ATR
             signal = compute_signal(
                 symbol=symbol,
                 direction=direction,
@@ -284,6 +285,7 @@ class BacktestEngine:
                 ltf_structure=structure,
                 htf_structures=htf_structures,
                 zones=zones,
+                atr_val=atr_val,
                 min_rr=self.settings.min_rr_ratio,
                 timeframe=timeframe,
             )
@@ -311,6 +313,7 @@ class BacktestEngine:
                     zone_bottom=nearest_zone.bottom,
                     require_retest=True,
                     require_candle=True,
+                    require_displacement=self.settings.require_displacement,
                 )
                 if not confirmation.confirmed:
                     self.equity_curve.append(self.balance)
@@ -413,10 +416,6 @@ class BacktestEngine:
                 partial_pnl = self._calculate_pnl(trade, bar["close"], pip, percent=0.5)
                 self.balance += partial_pnl
 
-        # Time-based exit
-        if trade.bars_held > 100 and current_rr < 1.0:
-            self._close_trade(trade, bar["close"], "time_exit", pip)
-
     def _calculate_pnl(self, trade: BacktestTrade, exit_price: float, pip: float, percent: float = 1.0) -> float:
         """Calculate P&L for a trade (or partial)."""
         if trade.direction == "BUY":
@@ -431,11 +430,10 @@ class BacktestEngine:
         """Close a trade and record it."""
         trade.exit_price = exit_price
         trade.exit_reason = reason
-
         # Calculate P&L (account for partial close)
         remaining_percent = 0.5 if trade.partial_closed else 1.0
         pnl = self._calculate_pnl(trade, exit_price, pip, percent=remaining_percent)
-
+        
         if trade.partial_closed:
             # Add the remaining P&L to balance (partial already added)
             self.balance += pnl
@@ -453,7 +451,7 @@ class BacktestEngine:
                 trade.rr_result = (exit_price - trade.entry_price) / risk
             else:
                 trade.rr_result = (trade.entry_price - exit_price) / risk
-
+        
         self.daily_pnl += trade.pnl
         self.trades.append(trade)
         self.open_trade = None
@@ -479,7 +477,7 @@ class BacktestEngine:
 
         wins = [t.pnl for t in self.trades if t.pnl > 0]
         losses = [t.pnl for t in self.trades if t.pnl <= 0]
-
+        
         result.total_pnl = sum(t.pnl for t in self.trades)
         result.avg_win = np.mean(wins) if wins else 0
         result.avg_loss = np.mean(losses) if losses else 0
@@ -502,6 +500,7 @@ class BacktestEngine:
             returns = np.diff(equity) / equity[:-1]
             if np.std(returns) > 0:
                 result.sharpe_ratio = (np.mean(returns) / np.std(returns)) * np.sqrt(252)
+            
             # Sortino ratio
             downside = returns[returns < 0]
             if len(downside) > 0 and np.std(downside) > 0:
