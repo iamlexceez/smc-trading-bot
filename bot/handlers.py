@@ -134,6 +134,7 @@ class BotHandlers:
             "/close_all - Close all open positions\n"
             "/settings - Adjust bot settings\n"
             "/account - Show MT5 account info\n"
+            "/debug_mt5 - Run MT5 health & permission check\n"
             "/history - Show recent trade history\n"
             "/pause - Pause auto-trading\n"
             "/resume - Resume auto-trading\n"
@@ -262,6 +263,42 @@ class BotHandlers:
             f"Currency: {info.get('currency', 'USD')}\n"
             f"Server: {info.get('server', 'N/A')}"
         )
+
+    @admin_only
+    async def cmd_debug_mt5(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Deep health check for MT5 connection and permissions."""
+        if not hasattr(self.executor, 'get_diagnostic_info'):
+            await update.message.reply_text("Diagnostic tool not supported by current executor.")
+            return
+
+        await update.message.reply_text("🔍 Running MT5 diagnostic health check...")
+        diag = await self.executor.get_diagnostic_info()
+
+        if not diag.get("available"):
+            await update.message.reply_text(f"❌ MT5 Package Error: {diag.get('error')}")
+            return
+
+        lines = [
+            "🛠 **MT5 Diagnostic Report**\n",
+            f"**Terminal Status:** {'✅ Running' if diag.get('terminal_running') else '❌ Not Found'}",
+            f"**Connection:** {'✅ Connected' if diag.get('connected_to_server') else '❌ Disconnected'}",
+            f"**Algo Trading (Global):** {'✅ ENABLED' if diag.get('trade_expert') else '❌ DISABLED (Check Green Button)'}",
+            f"**DLL Imports:** {'✅ Allowed' if diag.get('dll_allowed') else '❌ Blocked'}",
+            f"**Account Trading:** {'✅ Allowed' if diag.get('trade_allowed_acc') else '❌ Restricted (Check Password)'}",
+            f"**Expert Trading:** {'✅ Allowed' if diag.get('trade_expert_acc') else '❌ Restricted'}",
+            f"\n**Session Info:**",
+            f"Login: `{diag.get('login', 'N/A')}`",
+            f"Server: `{diag.get('server', 'N/A')}`",
+            f"Build: `{diag.get('build', 'N/A')}`",
+            f"\n**Last MT5 Error:** `{diag.get('last_error', 'None')}`"
+        ]
+
+        if not diag.get('trade_expert'):
+            lines.append("\n⚠️ *Action Required: Click the 'Algo Trading' button in MT5 to turn it GREEN.*")
+        if not diag.get('trade_allowed_acc'):
+            lines.append("\n⚠️ *Action Required: Ensure you are logged in with the MASTER password, not Investor.*")
+
+        await update.message.reply_text("\n".join(lines))
 
     @admin_only
     async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -622,6 +659,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("close_all", self.cmd_close_all))
         app.add_handler(CommandHandler("settings", self.cmd_settings))
         app.add_handler(CommandHandler("account", self.cmd_account))
+        app.add_handler(CommandHandler("debug_mt5", self.cmd_debug_mt5))
         app.add_handler(CommandHandler("history", self.cmd_history))
         app.add_handler(CommandHandler("pause", self.cmd_pause))
         app.add_handler(CommandHandler("resume", self.cmd_resume))
