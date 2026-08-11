@@ -48,14 +48,14 @@ async def create_executor(settings: TradeSettings) -> object:
     """Create the appropriate MT5 executor based on settings (demo or live)."""
     if not MT5_AVAILABLE:
         logger.error("❌ MetaTrader5 package not available. Bot cannot run in demo or live mode.")
-        sys.exit(1)
+        return None
 
     mode = settings.trading_mode
     creds = get_mt5_credentials(mode)
     
     if not creds["login"] or not creds["password"] or not creds["server"]:
-        logger.error(f"❌ MT5 {mode.upper()} credentials not set in .env. Cannot start.")
-        sys.exit(1)
+        logger.error(f"❌ MT5 {mode.upper()} credentials not set in .env.")
+        return None
 
     executor = MT5Executor(
         login=creds["login"],
@@ -66,8 +66,8 @@ async def create_executor(settings: TradeSettings) -> object:
     
     connected = await executor.connect()
     if not connected:
-        logger.error(f"❌ Failed to connect to MT5 {mode.upper()} account {creds['login']}. Exiting.")
-        sys.exit(1)
+        logger.error(f"❌ Failed to connect to MT5 {mode.upper()} account {creds['login']}.")
+        return executor # Return even if not connected so bot stays alive
 
     logger.info(f"✅ MT5 executor connected to {mode.upper()} account")
     return executor
@@ -128,13 +128,18 @@ async def main():
     if admin_ids:
         for admin_id in admin_ids:
             try:
-                await app.bot.send_message(
-                    admin_id,
-                    f"🤖 **SMC Trading Bot Started**\n\n"
-                    f"Mode: `{settings.trading_mode.upper()}`\n"
-                    f"Auto-Trade: {'✅ ON' if settings.auto_trade else '❌ OFF'}\n\n"
-                    f"Use /help to see all commands."
-                )
+                status_msg = f"🤖 **SMC Trading Bot Started**\n\n"
+                status_msg += f"Mode: `{settings.trading_mode.upper()}`\n"
+                status_msg += f"Auto-Trade: {'✅ ON' if settings.auto_trade else '❌ OFF'}\n\n"
+                
+                if executor and executor.is_connected():
+                    status_msg += "✅ **MT5 Connected**"
+                else:
+                    status_msg += "❌ **MT5 Connection Failed**\nCheck if MT5 terminal is open on VPS and credentials are correct."
+                
+                status_msg += f"\n\nUse /help to see all commands."
+                
+                await app.bot.send_message(admin_id, status_msg)
             except Exception as e:
                 logger.error(f"Failed to notify admin {admin_id}: {e}")
 
