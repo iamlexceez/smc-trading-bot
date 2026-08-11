@@ -10,7 +10,7 @@ Scoring criteria (total 100%):
 6. Risk-reward ratio ≥ 1:3        — 15%
 7. Multi-timeframe confluence     — 10%
 
-Trade auto-executes when score ≥ threshold (default 40%)
+Trade auto-executes when score ≥ threshold (default 60%)
 AND all hard gates pass (min RR, valid SL/TP, risk limits, spread, etc.)
 """
 
@@ -110,7 +110,7 @@ def score_sd_zone(zones: list[SupplyDemandZone], direction: str, current_price: 
     return ScoreFactor(name="S/D Zone", score=score, weight=0.15, detail=detail)
 
 
-def score_order_block(structure: MarketStructure, direction: str, current_price: float) -> ScoreFactor:
+def score_order_block(structure: MarketStructure, direction: str, current_price: float, atr_val: float) -> ScoreFactor:
     """Factor 3: Order block confluence (15%)."""
     if direction == "BUY":
         obs = [ob for ob in structure.order_blocks if ob.direction == "bullish" and not ob.mitigated]
@@ -124,10 +124,10 @@ def score_order_block(structure: MarketStructure, direction: str, current_price:
     nearest_ob = min(obs, key=lambda ob: abs((ob.high + ob.low) / 2 - current_price))
     distance = abs((nearest_ob.high + nearest_ob.low) / 2 - current_price)
 
-    # Score based on proximity
-    if distance < atr_proxy(current_price) * 2:
+    # Score based on proximity using real ATR
+    if distance < atr_val * 2:
         score = 100.0
-    elif distance < atr_proxy(current_price) * 5:
+    elif distance < atr_val * 5:
         score = 60.0
     else:
         score = 30.0
@@ -137,16 +137,7 @@ def score_order_block(structure: MarketStructure, direction: str, current_price:
     return ScoreFactor(name="Order Block", score=score, weight=0.15, detail=detail)
 
 
-def atr_proxy(price: float) -> float:
-    """Rough ATR proxy when we don't have full data context."""
-    if price > 1000:  # Gold
-        return price * 0.002
-    if price > 10:  # Synthetic indices
-        return price * 0.01
-    return price * 0.003  # Forex
-
-
-def score_fvg(structure: MarketStructure, direction: str, current_price: float) -> ScoreFactor:
+def score_fvg(structure: MarketStructure, direction: str, current_price: float, atr_val: float) -> ScoreFactor:
     """Factor 4: Fair value gap / imbalance (10%)."""
     if direction == "BUY":
         fvgs = [f for f in structure.fvgs if f.direction == "bullish"]
@@ -156,14 +147,13 @@ def score_fvg(structure: MarketStructure, direction: str, current_price: float) 
     if not fvgs:
         return ScoreFactor(name="FVG", score=0.0, weight=0.10, detail="No FVG detected")
 
-    nearest = min(fvgs, key=lambda f: abs(f.midpoint - current_price)) if hasattr(fvgs[0], 'midpoint') else fvgs[0]
-    # Since FVG doesn't have midpoint, compute it
+    nearest = min(fvgs, key=lambda f: abs(((f.top + f.bottom) / 2) - current_price))
     nearest_mid = (nearest.top + nearest.bottom) / 2
     distance = abs(nearest_mid - current_price)
 
-    if distance < atr_proxy(current_price) * 2:
+    if distance < atr_val * 2:
         score = 100.0
-    elif distance < atr_proxy(current_price) * 5:
+    elif distance < atr_val * 5:
         score = 50.0
     else:
         score = 20.0
@@ -172,10 +162,9 @@ def score_fvg(structure: MarketStructure, direction: str, current_price: float) 
     return ScoreFactor(name="FVG", score=score, weight=0.10, detail=detail)
 
 
-def score_liquidity(structure: MarketStructure, direction: str, current_price: float) -> ScoreFactor:
+def score_liquidity(structure: MarketStructure, direction: str, current_price: float, atr_val: float) -> ScoreFactor:
     """Factor 5: Liquidity sweep / grab (15%)."""
     if direction == "BUY":
-        # Look for sell-side liquidity sweep (equal lows taken out)
         pools = [p for p in structure.liquidity_pools if p.type == "sell-side"]
     else:
         pools = [p for p in structure.liquidity_pools if p.type == "buy-side"]
@@ -183,14 +172,13 @@ def score_liquidity(structure: MarketStructure, direction: str, current_price: f
     if not pools:
         return ScoreFactor(name="Liquidity Sweep", score=0.0, weight=0.15, detail="No liquidity pool detected")
 
-    # Check if price recently swept a liquidity pool
     nearest = min(pools, key=lambda p: abs(p.price - current_price))
     distance = abs(nearest.price - current_price)
 
-    if distance < atr_proxy(current_price) * 1:
+    if distance < atr_val * 1:
         score = 100.0
         detail = f"{'Sell-side' if direction == 'BUY' else 'Buy-side'} liquidity swept at {nearest.price:.5f}"
-    elif distance < atr_proxy(current_price) * 3:
+    elif distance < atr_val * 3:
         score = 60.0
         detail = f"{'Sell-side' if direction == 'BUY' else 'Buy-side'} liquidity near at {nearest.price:.5f}"
     else:
@@ -254,6 +242,7 @@ def compute_signal(
     ltf_structure: MarketStructure,
     htf_structures: list[MarketStructure],
     zones: list[SupplyDemandZone],
+    atr_val: float,
     min_rr: float = 3.0,
     timeframe: str = "M15",
 ) -> TradeSignal:
@@ -263,9 +252,9 @@ def compute_signal(
     factors = [
         score_structure_alignment(ltf_structure, direction),
         score_sd_zone(zones, direction, entry_price),
-        score_order_block(ltf_structure, direction, entry_price),
-        score_fvg(ltf_structure, direction, entry_price),
-        score_liquidity(ltf_structure, direction, entry_price),
+        score_order_block(ltf_structure, direction, entry_price, atr_val),
+        score_fvg(ltf_structure, direction, entry_price, atr_val),
+        score_liquidity(ltf_structure, direction, entry_price, atr_val),
         score_rr(entry_price, stop_loss, take_profit, min_rr),
         score_mtf_confluence(ltf_structure, htf_structures, direction),
     ]
