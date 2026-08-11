@@ -100,6 +100,43 @@ class MT5Executor(BaseExecutor):
             "server": info.server,
         }
 
+    async def get_diagnostic_info(self) -> dict:
+        """Gather detailed MT5 terminal and account health data."""
+        if not MT5_AVAILABLE:
+            return {"available": False, "error": "MetaTrader5 package not installed"}
+        
+        term_info = mt5.terminal_info()
+        acc_info = mt5.account_info()
+        last_error = mt5.last_error()
+        
+        diag = {
+            "available": True,
+            "connected": self._connected,
+            "terminal_running": term_info is not None,
+            "last_error": last_error,
+        }
+        
+        if term_info:
+            diag.update({
+                "connected_to_server": term_info.connected,
+                "dll_allowed": term_info.dlls_allowed,
+                "trade_allowed": term_info.trade_allowed,
+                "trade_expert": term_info.trade_expert, # This is the "Algo Trading" button
+                "company": term_info.company,
+                "name": term_info.name,
+                "build": term_info.build,
+            })
+            
+        if acc_info:
+            diag.update({
+                "login": acc_info.login,
+                "trade_allowed_acc": acc_info.trade_allowed,
+                "trade_expert_acc": acc_info.trade_expert,
+                "server": acc_info.server,
+            })
+            
+        return diag
+
     async def get_symbol_price(self, symbol: str) -> tuple[float, float]:
         if not MT5_AVAILABLE:
             return (0.0, 0.0)
