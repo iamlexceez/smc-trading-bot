@@ -43,6 +43,7 @@ class RiskManager:
         score: float,
         rr_ratio: float,
         spread_pips: float,
+        account_equity: float,
         free_margin: float,
         required_margin: float,
         today_pnl: float,
@@ -67,8 +68,7 @@ class RiskManager:
         checks.append(("Symbol not in cooldown", not in_cooldown,
                        f"cooldown={self.settings.symbol_cooldown_minutes}min"))
 
-        # 4. Daily loss limit
-        account_equity = free_margin  # approximation
+        # 4. Daily loss limit (calculated against real account equity)
         daily_loss_limit = account_equity * (self.settings.max_daily_loss_pct / 100)
         passed = today_pnl > -daily_loss_limit
         checks.append(("Daily loss limit", passed,
