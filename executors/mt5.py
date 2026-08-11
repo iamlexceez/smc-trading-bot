@@ -5,7 +5,7 @@ IMPORTANT: The MetaTrader5 Python package requires:
 - Windows: MT5 terminal installed and running
 - Linux VPS: MT5 running under Wine + Xvfb (see VPS_DEPLOYMENT.md)
 
-If MT5 is not available, the bot automatically falls back to PaperExecutor.
+If MT5 is not available, the bot logs a clear error and exits in live mode.
 """
 
 from __future__ import annotations
@@ -40,6 +40,10 @@ class MT5Executor(BaseExecutor):
             logger.error("MetaTrader5 package not available")
             return False
 
+        # If already connected, shutdown first to ensure a clean new connection
+        if self._connected:
+            await self.disconnect()
+
         kwargs = {
             "login": self.login,
             "password": self.password,
@@ -50,7 +54,19 @@ class MT5Executor(BaseExecutor):
 
         if not mt5.initialize(**kwargs):
             error = mt5.last_error()
-            logger.error(f"MT5 initialize failed: {error}")
+            logger.error(f"MT5 initialize failed for {self.login} @ {self.server}: {error}")
+            return False
+
+        # Verify account matches the credentials
+        acc_info = mt5.account_info()
+        if acc_info is None:
+            logger.error("Failed to get account info after initialization")
+            mt5.shutdown()
+            return False
+        
+        if acc_info.login != self.login:
+            logger.error(f"Account mismatch: requested {self.login}, got {acc_info.login}")
+            mt5.shutdown()
             return False
 
         self._connected = True
@@ -242,3 +258,4 @@ class MT5Executor(BaseExecutor):
         if MT5_AVAILABLE:
             mt5.shutdown()
         self._connected = False
+        logger.info("MT5 disconnected")
