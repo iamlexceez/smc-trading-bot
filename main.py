@@ -132,7 +132,7 @@ async def main():
                 status_msg += f"Mode: `{settings.trading_mode.upper()}`\n"
                 status_msg += f"Auto-Trade: {'✅ ON' if settings.auto_trade else '❌ OFF'}\n\n"
                 
-                if executor and executor.is_connected():
+                if executor and await executor.is_connected():
                     status_msg += "✅ **MT5 Connected**"
                 else:
                     status_msg += "❌ **MT5 Connection Failed**\nCheck if MT5 terminal is open on VPS and credentials are correct."
