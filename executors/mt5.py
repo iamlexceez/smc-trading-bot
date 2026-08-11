@@ -81,6 +81,11 @@ class MT5Executor(BaseExecutor):
     async def get_account_info(self) -> dict:
         if not MT5_AVAILABLE:
             return {}
+        
+        # Try to reconnect if not connected
+        if not await self.is_connected():
+            await self.connect()
+
         info = mt5.account_info()
         if info is None:
             return {}
