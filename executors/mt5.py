@@ -44,17 +44,39 @@ class MT5Executor(BaseExecutor):
         if self._connected:
             await self.disconnect()
 
-        kwargs = {
-            "login": self.login,
-            "password": self.password,
-            "server": self.server,
-        }
+        paths_to_try = []
         if self.path:
-            kwargs["path"] = self.path
+            paths_to_try.append(self.path)
+        
+        # Add common MT5 installation paths on Windows
+        paths_to_try.extend([
+            r"C:\Program Files\MetaTrader 5 Terminal\terminal64.exe",
+            r"C:\Program Files\Deriv MT5\terminal64.exe",
+            r"C:\Program Files\MetaTrader 5\terminal64.exe",
+            r"C:\MT5\terminal64.exe",
+            None # Try without explicit path as last resort
+        ])
 
-        if not mt5.initialize(**kwargs):
-            error = mt5.last_error()
-            logger.error(f"MT5 initialize failed for {self.login} @ {self.server}: {error}")
+        initialized = False
+        error = None
+        for p in paths_to_try:
+            kwargs = {
+                "login": self.login,
+                "password": self.password,
+                "server": self.server,
+            }
+            if p:
+                kwargs["path"] = p
+            
+            if mt5.initialize(**kwargs):
+                initialized = True
+                logger.info(f"MT5 initialized successfully using path: {p}")
+                break
+            else:
+                error = mt5.last_error()
+
+        if not initialized:
+            logger.error(f"MT5 initialize failed for {self.login} @ {self.server}. Last error: {error}")
             return False
 
         # Verify account matches the credentials
