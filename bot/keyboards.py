@@ -37,7 +37,7 @@ def settings_menu() -> InlineKeyboardMarkup:
          InlineKeyboardButton("Cooldown (min)", callback_data="set_cooldown")],
         [InlineKeyboardButton("Symbols", callback_data="set_symbols"),
          InlineKeyboardButton("Timeframes", callback_data="set_timeframes")],
-        [InlineKeyboardButton("Mode: Paper/Live", callback_data="set_mode"),
+        [InlineKeyboardButton("Mode: Demo/Live", callback_data="set_mode"),
          InlineKeyboardButton("Auto-Trade", callback_data="set_autotrade")],
         [InlineKeyboardButton("⬅️ Back", callback_data="main")],
     ]
@@ -55,11 +55,11 @@ def autotrade_menu(current: bool) -> InlineKeyboardMarkup:
 
 
 def mode_menu(current_mode: str) -> InlineKeyboardMarkup:
-    """Switch between paper and live mode."""
+    """Switch between demo and live mode."""
     keyboard = [
         [InlineKeyboardButton(
-            f"{'✅' if current_mode == 'paper' else '⬜'} Paper Mode",
-            callback_data="mode_paper"
+            f"{'✅' if current_mode == 'demo' else '⬜'} Demo Mode",
+            callback_data="mode_demo"
         )],
         [InlineKeyboardButton(
             f"{'✅' if current_mode == 'live' else '⬜'} Live Mode",

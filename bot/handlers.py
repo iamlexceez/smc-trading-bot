@@ -12,7 +12,7 @@ Commands:
 /history        — Show recent trade history
 /pause          — Pause auto-trading
 /resume         — Resume auto-trading
-/mode [paper|live] — Switch execution mode
+/mode [demo|live] — Switch execution mode
 /risk [pct]     — Set risk per trade
 /rr [ratio]     — Set minimum RR ratio
 /score [val]    — Set score threshold
@@ -31,11 +31,12 @@ from telegram.ext import (
     ContextTypes, filters, Application,
 )
 
-from config import TradeSettings, get_admin_ids
+from config import TradeSettings, get_admin_ids, get_mt5_credentials
 from bot import keyboards
 from storage import db
 from analysis.scoring import format_signal_report, TradeSignal
 from risk.manager import RiskManager
+from executors.mt5 import MT5Executor
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,31 @@ class BotHandlers:
         self.settings = await db.load_settings()
         self.risk_manager.settings = self.settings
 
+    async def reconnect_executor(self, mode: str) -> bool:
+        """Disconnect current MT5 session and reconnect to the requested mode."""
+        try:
+            # Disconnect current
+            if hasattr(self.executor, 'disconnect'):
+                await self.executor.disconnect()
+            
+            # Get new credentials
+            creds = get_mt5_credentials(mode)
+            if not creds["login"] or not creds["password"] or not creds["server"]:
+                logger.error(f"Missing credentials for {mode}")
+                return False
+            
+            # Update executor attributes
+            self.executor.login = creds["login"]
+            self.executor.password = creds["password"]
+            self.executor.server = creds["server"]
+            self.executor.path = creds["path"]
+            
+            # Connect
+            return await self.executor.connect()
+        except Exception as e:
+            logger.error(f"Reconnection error: {e}")
+            return False
+
     # ─── Commands ──────────────────────────────────────────
 
     @admin_only
@@ -84,7 +110,7 @@ class BotHandlers:
         await self.reload_settings()
         text = (
             f"🤖 **SMC Trading Bot**\n\n"
-            f"Mode: `{self.settings.trading_mode}`\n"
+            f"Mode: `{self.settings.trading_mode.upper()}`\n"
             f"Auto-Trade: {'✅ ON' if self.settings.auto_trade else '❌ OFF'}\n"
             f"Paused: {'⏸ YES' if self.settings.is_paused else '▶️ NO'}\n\n"
             f"Risk/trade: {self.settings.risk_per_trade}%\n"
@@ -95,6 +121,31 @@ class BotHandlers:
             f"Choose an option below 👇"
         )
         await update.message.reply_text(text, reply_markup=keyboards.main_menu())
+
+    @admin_only
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show help message."""
+        help_text = (
+            "🤖 **SMC Trading Bot Commands**\n\n"
+            "/start - Show main menu\n"
+            "/scan - Scan all symbols for signals\n"
+            "/analyze [symbol] - Deep analysis of a symbol\n"
+            "/positions - Show open positions\n"
+            "/close_all - Close all open positions\n"
+            "/settings - Adjust bot settings\n"
+            "/account - Show MT5 account info\n"
+            "/history - Show recent trade history\n"
+            "/pause - Pause auto-trading\n"
+            "/resume - Resume auto-trading\n"
+            "/mode [demo|live] - Switch execution mode\n"
+            "/risk [pct] - Set risk per trade (e.g. /risk 1.0)\n"
+            "/rr [ratio] - Set min RR ratio (e.g. /rr 3.0)\n"
+            "/score [val] - Set score threshold (e.g. /score 60)\n"
+            "/backtest [symbol] [tf] [days] - Run a backtest\n"
+            "/sessions - Check trading session status\n"
+            "/news - Check news filter status"
+        )
+        await update.message.reply_text(help_text)
 
     @admin_only
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -188,7 +239,7 @@ class BotHandlers:
             f"Max spread: {self.settings.max_spread_pips} pips\n"
             f"Cooldown: {self.settings.symbol_cooldown_minutes} min\n"
             f"Auto-trade: {'ON' if self.settings.auto_trade else 'OFF'}\n"
-            f"Mode: {self.settings.trading_mode}\n"
+            f"Mode: {self.settings.trading_mode.upper()}\n"
             f"Symbols: {', '.join(self.settings.symbols)}\n"
             f"Timeframes: {', '.join(self.settings.timeframes)}"
         )
@@ -201,7 +252,8 @@ class BotHandlers:
             await update.message.reply_text("Could not retrieve account info.")
             return
         await update.message.reply_text(
-            f"💰 **Account Info**\n\n"
+            f"💰 **Account Info ({self.settings.trading_mode.upper()})**\n\n"
+            f"Login: {info.get('login', 'N/A')}\n"
             f"Balance: ${info.get('balance', 0):.2f}\n"
             f"Equity: ${info.get('equity', 0):.2f}\n"
             f"Free Margin: ${info.get('free_margin', 0):.2f}\n"
@@ -247,7 +299,7 @@ class BotHandlers:
     @admin_only
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Switch execution mode."""
-        if context.args and context.args[0].lower() in ("paper", "live"):
+        if context.args and context.args[0].lower() in ("demo", "live"):
             mode = context.args[0].lower()
             if mode == "live":
                 await update.message.reply_text(
@@ -256,12 +308,17 @@ class BotHandlers:
                     reply_markup=keyboards.confirm_keyboard("mode_live")
                 )
             else:
-                self.settings.trading_mode = "paper"
-                await db.save_settings(self.settings)
-                await update.message.reply_text("✅ Switched to PAPER mode.")
+                # Switching to demo
+                success = await self.reconnect_executor("demo")
+                if success:
+                    self.settings.trading_mode = "demo"
+                    await db.save_settings(self.settings)
+                    await update.message.reply_text("✅ Switched to DEMO mode.")
+                else:
+                    await update.message.reply_text("❌ Failed to connect to Demo account. Check .env credentials.")
         else:
             await update.message.reply_text(
-                f"Current mode: {self.settings.trading_mode}\nUsage: /mode paper or /mode live"
+                f"Current mode: {self.settings.trading_mode.upper()}\nUsage: /mode demo or /mode live"
             )
 
     @admin_only
@@ -302,14 +359,18 @@ class BotHandlers:
                 await db.save_settings(self.settings)
                 await update.message.reply_text(f"✅ Score threshold set to {self.settings.score_threshold}%")
             except ValueError:
-                await update.message.reply_text("Usage: /score 40")
+                await update.message.reply_text("Usage: /score 60")
         else:
-            await update.message.reply_text(f"Current threshold: {self.settings.score_threshold}%\nUsage: /score 40")
+            await update.message.reply_text(f"Current threshold: {self.settings.score_threshold}%\nUsage: /score 60")
 
     @admin_only
     async def cmd_backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Run a backtest."""
-        symbol = context.args[0] if len(context.args) > 0 else "EURUSD"
+        if not context.args:
+            await update.message.reply_text("Usage: /backtest EURUSD H1 180")
+            return
+            
+        symbol = context.args[0]
         timeframe = context.args[1] if len(context.args) > 1 else "H1"
         try:
             days = int(context.args[2]) if len(context.args) > 2 else 180
@@ -318,7 +379,7 @@ class BotHandlers:
 
         await update.message.reply_text(
             f"📊 Running backtest: {symbol} {timeframe} over {days} days...\n"
-            f"This may take 1-2 minutes."
+            f"This may take a moment."
         )
 
         try:
@@ -343,145 +404,46 @@ class BotHandlers:
         if self.scheduler and hasattr(self.scheduler, 'news_filter') and self.scheduler.news_filter:
             result = await self.scheduler.news_filter.check_news(symbol)
             status = "🔴 BLOCKED" if result.is_blackout else "🟢 CLEAR"
-            lines = [
-                f"📰 **News Filter — {symbol}** — {status}\n",
-                f"Status: {result.reason}",
-            ]
-            if result.events_today:
-                lines.append(f"\n**Today's Events:**")
-                for e in result.events_today[:10]:
-                    emoji = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}.get(e.impact, "⚪")
-                    lines.append(f"{emoji} {e.date.strftime('%H:%M')} {e.currency} — {e.title}")
-            await update.message.reply_text("\n".join(lines))
+            await update.message.reply_text(
+                f"📰 **News Filter: {symbol}**\n\n"
+                f"Status: {status}\n"
+                f"Reason: {result.reason}"
+            )
         else:
             await update.message.reply_text("News filter not initialized.")
 
-    @admin_only
-    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show help."""
-        await update.message.reply_text(
-            "🤖 **SMC Trading Bot — Commands**\n\n"
-            "**Trading:**\n"
-            "/start — Main menu\n"
-            "/scan — Scan all symbols for signals\n"
-            "/analyze [symbol] — Deep analysis of a symbol\n"
-            "/positions — Show open positions\n"
-            "/close_all — Close all positions\n"
-            "/pause — Pause auto-trading\n"
-            "/resume — Resume auto-trading\n\n"
-            "**Settings:**\n"
-            "/settings — Adjust all settings\n"
-            "/mode [paper|live] — Switch execution mode\n"
-            "/risk [pct] — Set risk per trade\n"
-            "/rr [ratio] — Set min RR ratio\n"
-            "/score [val] — Set score threshold\n\n"
-            "**Info:**\n"
-            "/account — Account info\n"
-            "/history — Recent trades\n"
-            "/sessions — Show trading session status\n"
-            "/news [symbol] — Check news blackout status\n\n"
-            "**Backtesting:**\n"
-            "/backtest [symbol] [tf] [days] — Run historical backtest\n"
-            "  Example: /backtest EURUSD H1 180\n"
-            "  Tests the strategy on 6 months of H1 data\n\n"
-            "/help — This message"
-        )
-
-    # ─── Callback handlers ─────────────────────────────────
+    # ─── Callbacks ──────────────────────────────────────────
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard callbacks."""
-        if not is_admin(update.effective_user.id):
-            return
-
         query = update.callback_query
         await query.answer()
         data = query.data
 
-        await self.reload_settings()
-
         if data == "main":
-            await query.edit_message_text(
-                "🤖 SMC Trading Bot — Main Menu",
-                reply_markup=keyboards.main_menu()
-            )
-        elif data == "settings":
-            await query.edit_message_text(
-                self._format_settings(),
-                reply_markup=keyboards.settings_menu()
-            )
+            await self.cmd_start(update, context)
+            await query.message.delete()
         elif data == "scan":
-            await query.edit_message_text("🔍 Scanning markets...")
-            if self.scheduler:
-                results = await self.scheduler.scan_markets()
-                if results:
-                    for signal in results:
-                        await context.bot.send_message(
-                            query.message.chat_id,
-                            format_signal_report(signal)
-                        )
-                else:
-                    await context.bot.send_message(query.message.chat_id, "No signals found.")
-            await context.bot.send_message(
-                query.message.chat_id, "Back to menu:",
-                reply_markup=keyboards.main_menu()
-            )
+            await self.cmd_scan(update, context)
         elif data == "positions":
-            positions = await self.executor.get_open_positions()
-            if not positions:
-                text = "No open positions."
-            else:
-                lines = ["📈 **Open Positions**\n"]
-                total = 0
-                for p in positions:
-                    emoji = "🟢" if p.profit >= 0 else "🔴"
-                    lines.append(f"{emoji} #{p.ticket} | {p.direction} {p.volume} {p.symbol} | PnL: ${p.profit:.2f}")
-                    total += p.profit
-                lines.append(f"\n**Total: ${total:.2f}**")
-                text = "\n".join(lines)
-            await query.edit_message_text(text, reply_markup=keyboards.main_menu())
-        elif data == "history":
-            trades = await db.get_trade_history(limit=10)
-            if not trades:
-                text = "No trade history."
-            else:
-                lines = ["📋 **Recent Trades**\n"]
-                for t in trades:
-                    emoji = "✅" if t["pnl"] >= 0 else "❌"
-                    lines.append(f"{emoji} {t['direction']} {t['symbol']} | Score: {t['score']:.0f} | PnL: ${t['pnl']:.2f}")
-                text = "\n".join(lines)
-            await query.edit_message_text(text, reply_markup=keyboards.main_menu())
+            await self.cmd_positions(update, context)
+        elif data == "settings":
+            await self.cmd_settings(update, context)
         elif data == "account":
-            info = await self.executor.get_account_info()
-            text = (
-                f"💰 **Account**\n\n"
-                f"Balance: ${info.get('balance', 0):.2f}\n"
-                f"Equity: ${info.get('equity', 0):.2f}\n"
-                f"Free Margin: ${info.get('free_margin', 0):.2f}"
-            )
-            await query.edit_message_text(text, reply_markup=keyboards.main_menu())
+            await self.cmd_account(update, context)
+        elif data == "history":
+            await self.cmd_history(update, context)
+        elif data == "analyze":
+            await self.cmd_analyze(update, context)
         elif data == "pause":
-            self.settings.is_paused = True
-            await db.save_settings(self.settings)
-            await query.edit_message_text("⏸ Auto-trading paused.", reply_markup=keyboards.main_menu())
+            await self.cmd_pause(update, context)
         elif data == "resume":
-            self.settings.is_paused = False
-            await db.save_settings(self.settings)
-            await query.edit_message_text("▶️ Auto-trading resumed.", reply_markup=keyboards.main_menu())
+            await self.cmd_resume(update, context)
         elif data == "close_all":
-            positions = await self.executor.get_open_positions()
-            if not positions:
-                await query.edit_message_text("No open positions to close.", reply_markup=keyboards.main_menu())
-            else:
-                await query.edit_message_text(
-                    f"⚠️ Close all {len(positions)} open positions?\nThis cannot be undone.",
-                    reply_markup=keyboards.confirm_keyboard("close_all")
-                )
+            await self.cmd_close_all(update, context)
         elif data == "confirm_close_all":
-            count = await self.executor.close_all_positions()
-            await query.edit_message_text(f"✅ Closed {count} positions.", reply_markup=keyboards.main_menu())
-        elif data == "cancel":
-            await query.edit_message_text("Action cancelled.", reply_markup=keyboards.main_menu())
+            closed = await self.executor.close_all_positions()
+            await query.edit_message_text(f"✅ Closed {closed} positions.")
         elif data == "set_autotrade":
             await query.edit_message_text(
                 f"Auto-Trade is currently {'ON ✅' if self.settings.auto_trade else 'OFF ❌'}",
@@ -489,13 +451,11 @@ class BotHandlers:
             )
         elif data == "toggle_autotrade":
             if not self.settings.auto_trade:
-                # Turning ON — require confirmation
                 await query.edit_message_text(
-                    "⚠️ Enable auto-trade? The bot will automatically execute trades that pass all risk gates.",
+                    "⚠️ Enable Auto-Trade? The bot will execute trades automatically.",
                     reply_markup=keyboards.confirm_keyboard("autotrade_on")
                 )
             else:
-                # Turning OFF — no confirmation needed
                 self.settings.auto_trade = False
                 await db.save_settings(self.settings)
                 await query.edit_message_text(
@@ -511,22 +471,30 @@ class BotHandlers:
             )
         elif data == "set_mode":
             await query.edit_message_text(
-                f"Current mode: {self.settings.trading_mode}",
+                f"Current mode: {self.settings.trading_mode.upper()}",
                 reply_markup=keyboards.mode_menu(self.settings.trading_mode)
             )
-        elif data == "mode_paper":
-            self.settings.trading_mode = "paper"
-            await db.save_settings(self.settings)
-            await query.edit_message_text("✅ Switched to PAPER mode.", reply_markup=keyboards.settings_menu())
+        elif data == "mode_demo":
+            success = await self.reconnect_executor("demo")
+            if success:
+                self.settings.trading_mode = "demo"
+                await db.save_settings(self.settings)
+                await query.edit_message_text("✅ Switched to DEMO mode.", reply_markup=keyboards.settings_menu())
+            else:
+                await query.edit_message_text("❌ Failed to connect to Demo account. Check .env.", reply_markup=keyboards.settings_menu())
         elif data == "mode_live":
             await query.edit_message_text(
                 "⚠️ Switch to LIVE mode? Real trades will execute with real money.",
                 reply_markup=keyboards.confirm_keyboard("mode_live")
             )
         elif data == "confirm_mode_live":
-            self.settings.trading_mode = "live"
-            await db.save_settings(self.settings)
-            await query.edit_message_text("⚠️ LIVE mode enabled. Real trades will execute.", reply_markup=keyboards.settings_menu())
+            success = await self.reconnect_executor("live")
+            if success:
+                self.settings.trading_mode = "live"
+                await db.save_settings(self.settings)
+                await query.edit_message_text("⚠️ LIVE mode enabled. Real trades will execute.", reply_markup=keyboards.settings_menu())
+            else:
+                await query.edit_message_text("❌ Failed to connect to Live account. Check .env.", reply_markup=keyboards.settings_menu())
         elif data == "set_risk":
             await query.edit_message_text(
                 f"Current risk per trade: {self.settings.risk_per_trade}%\nUse command: /risk 1.5\n(Range: 0.1% - 10%)",
@@ -539,7 +507,7 @@ class BotHandlers:
             )
         elif data == "set_score":
             await query.edit_message_text(
-                f"Current score threshold: {self.settings.score_threshold}%\nUse command: /score 40\n(Range: 1 - 100)",
+                f"Current score threshold: {self.settings.score_threshold}%\nUse command: /score 60\n(Range: 1 - 100)",
                 reply_markup=keyboards.settings_menu()
             )
         elif data == "set_spread":
