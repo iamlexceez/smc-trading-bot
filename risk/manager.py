@@ -59,9 +59,9 @@ class RiskManager:
                        f"auto_trade={self.settings.auto_trade}, paused={self.settings.is_paused}"))
 
         # 2. Symbol allowed
-        passed = symbol in self.settings.symbols
+        passed = symbol in self.settings.enabled_symbols
         checks.append(("Symbol allowed", passed,
-                       f"{symbol} in {self.settings.symbols}"))
+                       f"{symbol} in {self.settings.enabled_symbols}"))
 
         # 3. Symbol cooldown
         in_cooldown = await db.is_symbol_in_cooldown(symbol, self.settings.symbol_cooldown_minutes)

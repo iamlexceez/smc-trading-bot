@@ -211,13 +211,14 @@ class BotHandlers:
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Trigger a market scan."""
         if self.scheduler:
-            await update.message.reply_text("🔍 Scanning markets... This may take a moment.")
+            await update.message.reply_text("🔍 **MANUAL SCAN INITIATED**\n_Note: This command is for analysis only. The background scheduler handles actual execution._")
             results = await self.scheduler.scan_markets()
             if not results:
-                await update.message.reply_text("No signals found in this scan.")
-                return
-            for signal in results:
-                await update.message.reply_text(format_signal_report(signal))
+                await update.message.reply_text("No tradeable setups found at this time.")
+            else:
+                for signal in results:
+                    signal.rejection_reason = "Manual Scan (No Execution)"
+                    await update.message.reply_text(format_signal_report(signal))
         else:
             await update.message.reply_text("Scheduler not initialized.")
 

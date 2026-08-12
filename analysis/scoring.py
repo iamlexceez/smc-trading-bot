@@ -439,7 +439,10 @@ def format_signal_report(signal: TradeSignal) -> str:
 
     lines.append(f"")
     if signal.passed:
-        lines.append("✅ **SIGNAL PASSED** — auto-execution eligible")
+        if signal.rejection_reason:
+            lines.append(f"✅ **SIGNAL PASSED** — {signal.rejection_reason}")
+        else:
+            lines.append("✅ **SIGNAL PASSED** — Analysis complete")
     else:
         lines.append(f"❌ **REJECTED**: {signal.rejection_reason}")
 
