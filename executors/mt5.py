@@ -172,11 +172,16 @@ class MT5Executor(BaseExecutor):
         return (tick.bid, tick.ask)
 
     async def get_symbol_info(self, symbol: str) -> dict:
+        """Get detailed 'Symbol DNA' for precise lot and pip calculations."""
         if not MT5_AVAILABLE:
             return {}
+        
+        # Ensure symbol is selected so we get full info
+        mt5.symbol_select(symbol, True)
         info = mt5.symbol_info(symbol)
         if info is None:
             return {}
+            
         return {
             "pip_size": info.point,
             "min_lot": info.volume_min,
@@ -186,6 +191,10 @@ class MT5Executor(BaseExecutor):
             "digits": info.digits,
             "spread": info.spread,
             "visible": info.visible,
+            "trade_mode": info.trade_mode,
+            "filling_mode": getattr(info, 'filling_mode', 0),
+            "tick_size": info.tick_size,
+            "tick_value": info.tick_value,
         }
 
     async def execute_trade(

@@ -112,34 +112,58 @@ class RiskManager:
 
         return RiskCheckResult(passed=all_passed, reason=reason, checks=checks)
 
+    def normalize_lot(self, lot: float, symbol_info: dict) -> float:
+        """Normalize lot size to respect broker's min_lot, max_lot, and step_lot."""
+        min_lot = symbol_info.get("min_lot", 0.01)
+        max_lot = symbol_info.get("max_lot", 100.0)
+        step_lot = symbol_info.get("step_lot", 0.01)
+        
+        # Adjust to step
+        normalized = round(round(lot / step_lot) * step_lot, 2)
+        
+        # Clamp between min and max
+        return max(min(normalized, max_lot), min_lot)
+
     def calculate_position_size(
         self,
         account_balance: float,
         entry_price: float,
         stop_loss: float,
-        pip_size: float,
-        contract_size: float = 100000,
+        symbol_info: dict,
     ) -> float:
         """
-        Calculate lot size based on risk percentage.
-        lot = (balance * risk%) / (SL_distance_in_pips * pip_value_per_lot)
+        Calculate expert lot size based on risk percentage and symbol DNA.
         """
         base_balance = self.settings.virtual_balance if self.settings.virtual_balance else account_balance
         risk_amount = base_balance * (self.settings.risk_per_trade / 100)
-        sl_distance_pips = abs(entry_price - stop_loss) / pip_size
-        if sl_distance_pips <= 0:
+        
+        # Use tick_value and tick_size for precise calculation (Deriv style)
+        tick_size = symbol_info.get("tick_size", 0.0001)
+        tick_value = symbol_info.get("tick_value", 1.0)
+        
+        sl_distance_ticks = abs(entry_price - stop_loss) / tick_size
+        if sl_distance_ticks <= 0:
             return 0.0
 
-        # Pip value per standard lot (approximate)
-        pip_value_per_lot = contract_size * pip_size
+        # lot = risk / (ticks * tick_value)
+        lot_size = risk_amount / (sl_distance_ticks * tick_value)
+        
+        return self.normalize_lot(lot_size, symbol_info)
 
-        lot_size = risk_amount / (sl_distance_pips * pip_value_per_lot)
-
-        # Round to nearest 0.01
-        lot_size = round(lot_size, 2)
-
-        # Safety: cap at 10% of balance worth
-        max_lot = (account_balance * 0.1) / (contract_size * entry_price) if entry_price > 0 else 0
-        lot_size = min(lot_size, max(max_lot, 0.01))
-
-        return max(lot_size, 0.01)  # Minimum 0.01 lots
+    def get_layering_plan(self, total_lot: float, entry: float, sl: float, symbol_info: dict) -> list[dict]:
+        """Split a trade into 3 expert layers."""
+        if total_lot < symbol_info.get("min_lot", 0.01) * 3:
+            # Too small to layer, return single entry
+            return [{"price": entry, "lot": total_lot, "comment": "SMC Single"}]
+            
+        # Split: 40% at entry, 30% at 50% level, 30% at extreme
+        # For simplicity in this version, we'll use price levels: entry, mid, extreme
+        extreme = entry - (entry - sl) * 0.2 # 80% deep into the SL zone
+        mid = (entry + extreme) / 2
+        
+        layers = [
+            {"price": entry, "lot": self.normalize_lot(total_lot * 0.4, symbol_info), "comment": "Layer 1 (Agg)"},
+            {"price": mid, "lot": self.normalize_lot(total_lot * 0.3, symbol_info), "comment": "Layer 2 (Bal)"},
+            {"price": extreme, "lot": self.normalize_lot(total_lot * 0.3, symbol_info), "comment": "Layer 3 (Sniper)"},
+        ]
+        return layers

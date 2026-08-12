@@ -415,8 +415,8 @@ class BotHandlers:
                     sym_info = await self.executor.get_symbol_info(sym)
                     if not sym_info or not sym_info.get("max_lot"): continue
                     
-                    # Determine safe lot size (start with max, scale down if needed)
-                    test_lot = sym_info.get("max_lot")
+                    # Determine safe lot size using normalization
+                    test_lot = self.risk_manager.normalize_lot(sym_info.get("max_lot"), sym_info)
                     res = await self.executor.execute_trade(
                         symbol=sym, direction="BUY", lot_size=test_lot,
                         sl=0, tp=0, magic=999999, comment="BURN"
@@ -424,7 +424,7 @@ class BotHandlers:
                     
                     # If max lot fails, try a smaller safer lot
                     if not res.success:
-                        test_lot = round(test_lot * 0.1, 2) # Try 10% of max
+                        test_lot = self.risk_manager.normalize_lot(test_lot * 0.1, sym_info)
                         res = await self.executor.execute_trade(
                             symbol=sym, direction="BUY", lot_size=test_lot,
                             sl=0, tp=0, magic=999999, comment="BURN"

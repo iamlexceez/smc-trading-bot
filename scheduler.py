@@ -266,11 +266,15 @@ class MarketScheduler:
                 contract = sym_info.get("contract_size", 100000)
                 spread = sym_info.get("spread", 0) * pip
 
-                # Calculate lot size
+                # Calculate lot size using Expert DNA
                 lot_size = self.risk_manager.calculate_position_size(
-                    balance, signal.entry_price, signal.stop_loss, pip, contract
+                    balance, signal.entry_price, signal.stop_loss, sym_info
                 )
-                required_margin = lot_size * contract * signal.entry_price / (account.get("leverage", 500))
+                
+                # Estimate required margin
+                contract = sym_info.get("contract_size", 100000)
+                leverage = account.get("leverage", 500)
+                required_margin = lot_size * contract * signal.entry_price / leverage
 
                 risk_result = await self.risk_manager.check_all(
                     symbol=symbol,
@@ -293,16 +297,26 @@ class MarketScheduler:
                     await self._notify(format_signal_report(signal))
                     continue
 
-                # Execute trade
-                result = await self.executor.execute_trade(
-                    symbol=symbol,
-                    direction=signal.direction,
-                    lot_size=lot_size,
-                    sl=signal.stop_loss,
-                    tp=signal.take_profit,
-                    magic=self.settings.magic_number,
-                    comment=f"SMC Bot Score:{signal.score:.0f}",
+                # EXPERT LAYERING: Split the trade into 3 entries
+                layers = self.risk_manager.get_layering_plan(
+                    lot_size, signal.entry_price, signal.stop_loss, sym_info
                 )
+                
+                results = []
+                for layer in layers:
+                    res = await self.executor.execute_trade(
+                        symbol=symbol,
+                        direction=signal.direction,
+                        lot_size=layer["lot"],
+                        sl=signal.stop_loss,
+                        tp=signal.take_profit,
+                        magic=self.settings.magic_number,
+                        comment=layer["comment"],
+                    )
+                    results.append(res)
+                
+                # Use the first successful result for reporting
+                result = results[0] if results else ExecutionResult(success=False, message="No layers executed")
 
                 if result.success:
                     await db.record_trade(
