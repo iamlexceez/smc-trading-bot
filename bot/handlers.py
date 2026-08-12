@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import json
+import asyncio
 from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
