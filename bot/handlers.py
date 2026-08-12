@@ -396,14 +396,27 @@ class BotHandlers:
     async def cmd_debug_mt5(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Deep health check for MT5 connection and permissions."""
         if not hasattr(self.executor, 'get_diagnostic_info'):
-            await update.message.reply_text("Diagnostic tool not supported by current executor.")
+            msg = "Diagnostic tool not supported by current executor."
+            if update.callback_query:
+                await update.callback_query.edit_message_text(msg)
+            else:
+                await update.message.reply_text(msg)
             return
 
-        await update.message.reply_text("🔍 Running MT5 diagnostic health check...")
+        msg = "🔍 Running MT5 diagnostic health check..."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg)
+        else:
+            await update.message.reply_text(msg)
+            
         diag = await self.executor.get_diagnostic_info()
 
         if not diag.get("available"):
-            await update.message.reply_text(f"❌ MT5 Package Error: {diag.get('error')}")
+            err_msg = f"❌ MT5 Package Error: {diag.get('error')}"
+            if update.callback_query:
+                await update.callback_query.edit_message_text(err_msg)
+            else:
+                await update.message.reply_text(err_msg)
             return
 
         lines = [
@@ -426,7 +439,11 @@ class BotHandlers:
         if not diag.get('trade_allowed_acc'):
             lines.append("\n⚠️ *Action Required: Ensure you are logged in with the MASTER password, not Investor.*")
 
-        await update.message.reply_text("\n".join(lines))
+        text = "\n".join(lines)
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=keyboards.main_menu(), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=keyboards.main_menu(), parse_mode="Markdown")
 
     @admin_only
     async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
