@@ -67,6 +67,11 @@ class MarketScheduler:
     async def start(self, interval_seconds: int = 300):
         """Start the periodic market scanner."""
         await self.data_provider.init()
+        
+        # In aggressive mode, scan every 2 minutes
+        if self.settings.aggressive_mode:
+            interval_seconds = 120
+            
         self.scheduler.add_job(
             self.scan_and_execute,
             IntervalTrigger(seconds=interval_seconds),
@@ -76,6 +81,9 @@ class MarketScheduler:
         self.scheduler.start()
         self._running = True
         logger.info(f"Market scanner started (every {interval_seconds}s)")
+        
+        # Force an immediate scan on startup in a background task
+        asyncio.create_task(self.scan_and_execute())
 
     async def stop(self):
         """Stop the scanner."""
@@ -242,8 +250,11 @@ class MarketScheduler:
                 return
 
         logger.info("Starting market scan...")
+        # Heartbeat to user
+        await self._notify("💓 **HEARTBEAT**: Market scan in progress...")
 
         for symbol in self.settings.symbols:
+            logger.info(f"Analyzing {symbol}...")
             try:
                 # Check session filter
                 session_info = check_trading_session(self.settings.enabled_sessions)

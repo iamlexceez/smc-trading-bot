@@ -153,6 +153,10 @@ async def main():
     await app.start()
     await app.updater.start_polling(allowed_updates=["message", "callback_query"])
 
+    # Explicitly start the first scan if not running
+    if not scheduler._running:
+        await scheduler.start()
+
     # Keep running until interrupted
     stop_event = asyncio.Event()
     try:
