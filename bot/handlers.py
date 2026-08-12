@@ -326,21 +326,27 @@ class BotHandlers:
         """Close all positions with confirmation."""
         positions = await self.executor.get_open_positions()
         if not positions:
-            await update.message.reply_text("No open positions to close.")
+            msg = "No open positions to close."
+            if update.callback_query:
+                await update.callback_query.edit_message_text(msg)
+            else:
+                await update.message.reply_text(msg)
             return
-        await update.message.reply_text(
-            f"⚠️ Close all {len(positions)} open positions?\nThis action cannot be undone.",
-            reply_markup=keyboards.confirm_keyboard("close_all")
-        )
+        text = f"⚠️ Close all {len(positions)} open positions?\nThis action cannot be undone."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=keyboards.confirm_keyboard("close_all"))
+        else:
+            await update.message.reply_text(text, reply_markup=keyboards.confirm_keyboard("close_all"))
 
     @admin_only
     async def cmd_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show settings menu."""
         await self.reload_settings()
-        await update.message.reply_text(
-            self._format_settings(),
-            reply_markup=keyboards.settings_menu()
-        )
+        text = self._format_settings()
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=keyboards.settings_menu(), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=keyboards.settings_menu(), parse_mode="Markdown")
 
     def _format_settings(self) -> str:
         return (
@@ -364,9 +370,13 @@ class BotHandlers:
         """Show account info."""
         info = await self.executor.get_account_info()
         if not info:
-            await update.message.reply_text("Could not retrieve account info.")
+            msg = "Could not retrieve account info."
+            if update.callback_query:
+                await update.callback_query.edit_message_text(msg)
+            else:
+                await update.message.reply_text(msg)
             return
-        await update.message.reply_text(
+        text = (
             f"💰 **Account Info ({self.settings.trading_mode.upper()})**\n\n"
             f"Login: {info.get('login', 'N/A')}\n"
             f"Balance: ${info.get('balance', 0):.2f}\n"
@@ -377,6 +387,10 @@ class BotHandlers:
             f"Currency: {info.get('currency', 'USD')}\n"
             f"Server: {info.get('server', 'N/A')}"
         )
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=keyboards.main_menu(), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=keyboards.main_menu(), parse_mode="Markdown")
 
     @admin_only
     async def cmd_debug_mt5(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -419,7 +433,11 @@ class BotHandlers:
         """Show recent trade history."""
         trades = await db.get_trade_history(limit=15)
         if not trades:
-            await update.message.reply_text("No trade history yet.")
+            msg = "No trade history yet."
+            if update.callback_query:
+                await update.callback_query.edit_message_text(msg, reply_markup=keyboards.main_menu())
+            else:
+                await update.message.reply_text(msg, reply_markup=keyboards.main_menu())
             return
 
         lines = ["📋 **Recent Trades**\n"]
@@ -431,21 +449,33 @@ class BotHandlers:
                 f"   Score: {t['score']:.1f} | RR: 1:{t['rr_ratio']:.1f} | "
                 f"PnL: ${t['pnl']:.2f} | {t['executor']}"
             )
-        await update.message.reply_text("\n".join(lines))
+        text = "\n".join(lines)
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=keyboards.main_menu(), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=keyboards.main_menu(), parse_mode="Markdown")
 
     @admin_only
     async def cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Pause auto-trading."""
         self.settings.is_paused = True
         await db.save_settings(self.settings)
-        await update.message.reply_text("⏸ Auto-trading paused. Use /resume to continue.")
+        msg = "⏸ Auto-trading paused. Use /resume to continue."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=keyboards.main_menu())
+        else:
+            await update.message.reply_text(msg, reply_markup=keyboards.main_menu())
 
     @admin_only
     async def cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Resume auto-trading."""
         self.settings.is_paused = False
         await db.save_settings(self.settings)
-        await update.message.reply_text("▶️ Auto-trading resumed.")
+        msg = "▶️ Auto-trading resumed."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=keyboards.main_menu())
+        else:
+            await update.message.reply_text(msg, reply_markup=keyboards.main_menu())
 
     @admin_only
     async def cmd_set_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
