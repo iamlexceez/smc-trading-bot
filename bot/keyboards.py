@@ -43,6 +43,8 @@ def settings_menu() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⚡️ Arbitrage", callback_data="toggle_arbitrage")],
         [InlineKeyboardButton("Symbols", callback_data="set_symbols"),
          InlineKeyboardButton("Timeframes", callback_data="set_timeframes")],
+        [InlineKeyboardButton("📅 Daily Limit %", callback_data="set_daily_limit"),
+         InlineKeyboardButton("⏱ Cooldown", callback_data="set_cooldown")],
         [InlineKeyboardButton("Mode: Demo/Live", callback_data="set_mode"),
          InlineKeyboardButton("Auto-Trade", callback_data="set_autotrade")],
         [InlineKeyboardButton("⬅️ Back", callback_data="main")],

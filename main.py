@@ -125,14 +125,17 @@ async def main():
     from telegram import BotCommand
     commands = [
         BotCommand("start", "Show main menu"),
-        BotCommand("scan", "Scan enabled symbols for signals"),
-        BotCommand("account", "Show MT5 account info"),
+        BotCommand("scan", "Institutional Market Scan"),
         BotCommand("positions", "Show open positions"),
+        BotCommand("account", "Show MT5 account info"),
+        BotCommand("optimize", "Trigger AI Weight Tuning"),
         BotCommand("settings", "Adjust bot settings"),
+        BotCommand("aggressive", "Toggle High-Growth Mode"),
+        BotCommand("scalping", "Toggle Scalping mode"),
+        BotCommand("daily_limit", "Set Daily PnL Target %"),
+        BotCommand("cooldown", "Set Symbol Cooldown"),
+        BotCommand("add_broker", "Add Multi-Broker Terminal"),
         BotCommand("debug_mt5", "Run MT5 health check"),
-        BotCommand("aggressive", "Toggle Aggressive Growth mode"),
-        BotCommand("scalping", "Toggle M1/M5 Scalping mode"),
-        BotCommand("expert_mode", "Activate institutional expert pairs"),
         BotCommand("help", "Show all commands"),
     ]
     await app.bot.set_my_commands(commands)

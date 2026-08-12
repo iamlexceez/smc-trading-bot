@@ -63,7 +63,8 @@ class BrokerConfig:
 class TradeSettings:
     # Risk
     risk_per_trade: float = 1.0
-    max_daily_loss_pct: float = 5.0
+    max_daily_loss_pct: float = 20.0
+    daily_pnl_limit_pct: float = 20.0
     max_trades_per_day: int = 10
     max_open_positions: int = 5
     min_rr_ratio: float = 3.0
@@ -184,7 +185,8 @@ class TradeSettings:
 
         return cls(
             risk_per_trade=float(d.get("risk_per_trade", 1.0)),
-            max_daily_loss_pct=float(d.get("max_daily_loss_pct", 5.0)),
+            max_daily_loss_pct=float(d.get("max_daily_loss_pct", 20.0)),
+            daily_pnl_limit_pct=float(d.get("daily_pnl_limit_pct", 20.0)),
             max_trades_per_day=int(d.get("max_trades_per_day", 10)),
             max_open_positions=int(d.get("max_open_positions", 5)),
             min_rr_ratio=float(d.get("min_rr_ratio", 3.0)),
@@ -232,7 +234,8 @@ class TradeSettings:
     def defaults(cls) -> "TradeSettings":
         return cls(
             risk_per_trade=float(os.getenv("RISK_PER_TRADE", "1.0")),
-            max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0")),
+            max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", "20.0")),
+            daily_pnl_limit_pct=float(os.getenv("DAILY_PNL_LIMIT_PCT", "20.0")),
             max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "10")),
             max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "5")),
             min_rr_ratio=float(os.getenv("MIN_RR_RATIO", "3.0")),

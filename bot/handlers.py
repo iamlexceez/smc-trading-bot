@@ -797,6 +797,34 @@ class BotHandlers:
             await update.message.reply_text(f"Current threshold: {self.settings.score_threshold}%\nUsage: /score 60")
 
     @admin_only
+    async def cmd_daily_limit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set daily PnL limit percentage."""
+        if context.args:
+            try:
+                val = float(context.args[0])
+                self.settings.daily_pnl_limit_pct = max(1.0, min(val, 100.0))
+                await db.save_settings(self.settings)
+                await update.message.reply_text(f"✅ Daily PnL limit set to {self.settings.daily_pnl_limit_pct}%")
+            except ValueError:
+                await update.message.reply_text("Usage: /daily_limit 20")
+        else:
+            await update.message.reply_text(f"Current daily limit: {self.settings.daily_pnl_limit_pct}%\nUsage: /daily_limit 20")
+
+    @admin_only
+    async def cmd_cooldown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set symbol cooldown minutes."""
+        if context.args:
+            try:
+                val = int(context.args[0])
+                self.settings.symbol_cooldown_minutes = max(0, min(val, 1440))
+                await db.save_settings(self.settings)
+                await update.message.reply_text(f"✅ Symbol cooldown set to {self.settings.symbol_cooldown_minutes} minutes")
+            except ValueError:
+                await update.message.reply_text("Usage: /cooldown 30")
+        else:
+            await update.message.reply_text(f"Current cooldown: {self.settings.symbol_cooldown_minutes} min\nUsage: /cooldown 30")
+
+    @admin_only
     async def cmd_backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Run a backtest."""
         if not context.args:
@@ -1053,11 +1081,15 @@ class BotHandlers:
                 reply_markup=keyboards.settings_menu()
             )
         elif data == "set_cooldown":
-            old = self.settings.symbol_cooldown_minutes
-            self.settings.symbol_cooldown_minutes = 60 if old < 60 else 15
-            await db.save_settings(self.settings)
             await query.edit_message_text(
-                f"Symbol cooldown set to {self.settings.symbol_cooldown_minutes} min.",
+                f"Current cooldown: {self.settings.symbol_cooldown_minutes} min.\nUse command: `/cooldown 15` to change.",
+                reply_markup=keyboards.settings_menu()
+            )
+        elif data == "set_daily_limit":
+            await query.edit_message_text(
+                f"Current daily PnL limit: {self.settings.daily_pnl_limit_pct}%\n"
+                f"The bot will halt if profit or loss hits this %.\n"
+                f"Use command: `/daily_limit 20` to change.",
                 reply_markup=keyboards.settings_menu()
             )
         elif data == "set_symbols":
@@ -1151,6 +1183,8 @@ class BotHandlers:
         app.add_handler(CommandHandler("add_broker", self.cmd_add_broker))
         app.add_handler(CommandHandler("optimize", self.cmd_optimize))
         app.add_handler(CommandHandler("score", self.cmd_score))
+        app.add_handler(CommandHandler("daily_limit", self.cmd_daily_limit))
+        app.add_handler(CommandHandler("cooldown", self.cmd_cooldown))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))
         app.add_handler(CommandHandler("sessions", self.cmd_sessions))
         app.add_handler(CommandHandler("sessions_all", self.cmd_sessions_all))

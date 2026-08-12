@@ -68,12 +68,22 @@ class RiskManager:
         checks.append(("Symbol not in cooldown", not in_cooldown,
                        f"cooldown={self.settings.symbol_cooldown_minutes}min"))
 
-        # 4. Daily loss limit (with 0.01 tolerance)
+        # 4. Daily PnL Limit (Symmetric Profit/Loss Target)
         base_equity = self.settings.virtual_balance if self.settings.virtual_balance else account_equity
-        daily_loss_limit = base_equity * (self.settings.max_daily_loss_pct / 100)
-        passed = today_pnl > (-daily_loss_limit - 0.01)
-        checks.append(("Daily loss limit", passed,
-                       f"pnl={today_pnl:.2f}, limit=-{daily_loss_limit:.2f}"))
+        limit_amount = base_equity * (self.settings.daily_pnl_limit_pct / 100)
+        
+        # Check if we hit either the profit target or the loss limit
+        if today_pnl >= (limit_amount - 0.01):
+            passed = False
+            detail = f"Profit target hit: +${today_pnl:.2f} (Limit: ${limit_amount:.2f})"
+        elif today_pnl <= (-limit_amount - 0.01):
+            passed = False
+            detail = f"Daily loss limit hit: -${abs(today_pnl):.2f} (Limit: ${limit_amount:.2f})"
+        else:
+            passed = True
+            detail = f"PnL: ${today_pnl:.2f}, Limit: ±${limit_amount:.2f}"
+            
+        checks.append(("Daily PnL Limit", passed, detail))
 
         # 5. Daily trade count
         passed = today_trade_count < self.settings.max_trades_per_day
