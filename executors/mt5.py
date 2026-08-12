@@ -331,6 +331,42 @@ class MT5Executor(BaseExecutor):
         result = mt5.order_send(request)
         return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
 
+    async def modify_position(self, ticket: int, sl: float = None, tp: float = None) -> bool:
+        if not MT5_AVAILABLE:
+            return False
+        
+        if not await self._ensure_connected():
+            return False
+
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            return False
+
+        pos = positions[0]
+        
+        # If no changes requested, return True
+        if (sl is None or sl == pos.sl) and (tp is None or tp == pos.tp):
+            return True
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "sl": float(sl) if sl is not None else pos.sl,
+            "tp": float(tp) if tp is not None else pos.tp,
+            "magic": pos.magic,
+        }
+
+        result = mt5.order_send(request)
+        if result is None:
+            logger.error(f"modify_position order_send returned None: {mt5.last_error()}")
+            return False
+            
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"modify_position failed: retcode={result.retcode}, comment={result.comment}")
+            return False
+            
+        return True
+
     async def close_all_positions(self) -> int:
         if not MT5_AVAILABLE:
             return 0

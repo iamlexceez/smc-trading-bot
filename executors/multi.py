@@ -82,6 +82,18 @@ class MultiBrokerManager(BaseExecutor):
             total_closed += await executor.close_all_positions()
         return total_closed
 
+    async def modify_position(self, ticket: int, sl: float = None, tp: float = None) -> bool:
+        """Modify position by searching all active brokers for the ticket."""
+        for name, executor in self.executors.items():
+            # Check if this executor owns the ticket
+            positions = await executor.get_open_positions()
+            if any(p.ticket == ticket for p in positions):
+                logger.info(f"Modifying position #{ticket} on broker {name}")
+                return await executor.modify_position(ticket, sl, tp)
+        
+        logger.warning(f"Ticket #{ticket} not found on any active broker")
+        return False
+
     async def get_open_positions(self) -> List[Position]:
         """Get open positions from all brokers."""
         all_positions = []

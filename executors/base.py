@@ -72,6 +72,11 @@ class BaseExecutor(ABC):
         ...
 
     @abstractmethod
+    async def modify_position(self, ticket: int, sl: float = None, tp: float = None) -> bool:
+        """Modify SL and/or TP of an open position."""
+        ...
+
+    @abstractmethod
     async def close_all_positions(self) -> int:
         """Close all open positions. Returns count closed."""
         ...
