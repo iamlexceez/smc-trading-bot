@@ -26,6 +26,7 @@ from analysis.sessions import check_trading_session, Session
 from analysis.institutional import calculate_ote_levels
 from analysis.profiler import profiler, SymbolProfile
 from analysis.order_flow import order_flow, OrderFlowProfile
+from analysis.sentiment import sentiment_analyzer
 import pandas as pd
 import numpy as np
 
@@ -331,6 +332,24 @@ def score_order_flow(of_profile: Optional[OrderFlowProfile], entry_price: float,
     
     return ScoreFactor(name="Order Flow", score=score, weight=0.15, detail=detail)
 
+def score_sentiment(sentiment: Optional[Dict[str, Any]], direction: str) -> ScoreFactor:
+    """Factor 12: AI Sentiment (15%)."""
+    if not sentiment:
+        return ScoreFactor(name="AI Sentiment", score=50.0, weight=0.15, detail="No sentiment data")
+
+    score = sentiment.get("score", 50.0)
+    bias = sentiment.get("bias", "Neutral")
+    
+    # If direction is BUY and sentiment is Bullish, high score
+    if direction == "BUY":
+        if bias == "Bullish": score = 100.0
+        elif bias == "Bearish": score = 0.0
+    else: # SELL
+        if bias == "Bearish": score = 100.0
+        elif bias == "Bullish": score = 0.0
+        
+    return ScoreFactor(name="AI Sentiment", score=score, weight=0.15, detail=f"Bias: {bias}")
+
 def compute_signal(
     symbol: str,
     direction: str,
@@ -346,6 +365,7 @@ def compute_signal(
     aggressive: bool = False,
     profile: SymbolProfile = None,
     of_profile: OrderFlowProfile = None,
+    sentiment: Dict[str, Any] = None,
 ) -> TradeSignal:
     """
     Compute the full trade signal with multi-factor scoring.
@@ -362,6 +382,7 @@ def compute_signal(
         score_ote(entry_price, ltf_structure, direction),
         score_historical_backing(profile, ltf_structure),
         score_order_flow(of_profile, entry_price, zones, direction),
+        score_sentiment(sentiment, direction),
     ]
     
     # Adaptive Weight Adjustment based on Symbol Profile

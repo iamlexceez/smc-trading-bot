@@ -6,7 +6,7 @@ Uses aiosqlite for async operations.
 import os
 import aiosqlite
 import json
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 from config import TradeSettings
 
@@ -166,6 +166,18 @@ async def get_trade_history(limit: int = 20, db_path: str = DB_PATH) -> list[dic
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM trades ORDER BY timestamp DESC LIMIT ?", (limit,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_recent_trades(days: int = 7, db_path: str = DB_PATH) -> list[dict]:
+    """Fetch trades from the last X days."""
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM trades WHERE timestamp >= ?", (since,)
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]

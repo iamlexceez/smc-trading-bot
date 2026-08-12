@@ -28,8 +28,12 @@ from analysis.confirmation import get_confirmation
 from analysis.visuals import render_smc_chart
 from analysis.profiler import profiler
 from analysis.order_flow import order_flow
+from analysis.sentiment import sentiment_analyzer
 from risk.manager import RiskManager
 from executors.base import BaseExecutor, ExecutionResult
+from executors.multi import MultiBrokerManager
+from analysis.arbitrage import ArbitrageMonitor
+from analysis.optimizer import SelfOptimizer
 from data.provider import DataProvider
 from news.filter import NewsFilter
 
@@ -66,6 +70,18 @@ class MarketScheduler:
             blackout_minutes=settings.news_blackout_minutes,
         )
         self.last_structure_events = {}  # symbol -> last StructureEvent
+        
+        # Initialize Multi-Broker and Arbitrage if needed
+        self.multi_manager = None
+        self.arb_monitor = None
+        if self.settings.brokers:
+            self.multi_manager = MultiBrokerManager(self.settings)
+            self.arb_monitor = ArbitrageMonitor(self.multi_manager)
+            # Use multi_manager as the primary executor
+            self.executor = self.multi_manager
+            
+        # Initialize Self-Optimizer
+        self.optimizer = SelfOptimizer(self.settings)
 
     async def start(self, interval_seconds: int = 300):
         """Start the periodic market scanner."""
@@ -88,6 +104,13 @@ class MarketScheduler:
         self._running = True
         logger.info(f"Market scanner started (every {interval_seconds}s)")
         
+        # Schedule Self-Optimization (once a week)
+        self.scheduler.add_job(
+            self.run_self_optimization,
+            IntervalTrigger(days=self.settings.optimization_interval_days),
+            id="self_optimization"
+        )
+
         # Force an immediate scan on startup in a background task
         asyncio.create_task(self.scan_and_execute())
 
@@ -126,6 +149,11 @@ class MarketScheduler:
         
         # 2.6 Order Flow Analysis
         of_profile = order_flow.calculate_profile(df)
+        
+        # 2.7 AI Sentiment Analysis
+        sentiment = None
+        if self.settings.sentiment_analysis_enabled:
+            sentiment = await sentiment_analyzer.get_market_sentiment(symbol)
         
         # Check for new structural events (BOS/CHoCH)
         from analysis.structure import StructureEvent
@@ -234,6 +262,7 @@ class MarketScheduler:
             aggressive=is_hyper_scalp,
             profile=profile,
             of_profile=of_profile,
+            sentiment=sentiment,
         )
 
         return signal
@@ -406,6 +435,24 @@ class MarketScheduler:
         for symbol in self.settings.enabled_symbols:
             logger.info(f"Analyzing {symbol}...")
             try:
+                # ─── ARBITRAGE CHECK ──────────────────────────
+                if self.settings.arbitrage_enabled and self.arb_monitor:
+                    arb_opp = await self.arb_monitor.check_arbitrage(symbol)
+                    if arb_opp:
+                        await self._notify(
+                            f"⚡️ **ARBITRAGE OPPORTUNITY FOUND**\n"
+                            f"Symbol: `{symbol}`\n"
+                            f"Buy: `{arb_opp['buy_broker']}` @ `{arb_opp['buy_price']}`\n"
+                            f"Sell: `{arb_opp['sell_broker']}` @ `{arb_opp['sell_price']}`\n"
+                            f"Profit: `{arb_opp['profit_pct']:.2f}%`\n\n"
+                            f"Executing multi-broker hedge..."
+                        )
+                        success = await self.arb_monitor.execute_arbitrage(arb_opp)
+                        if success:
+                            await self._notify(f"✅ **ARBITRAGE EXECUTED**\nProfit locked across `{arb_opp['buy_broker']}` and `{arb_opp['sell_broker']}`.")
+                        else:
+                            await self._notify(f"❌ **ARBITRAGE FAILED**\nCheck terminal logs for execution errors.")
+
                 # Check session filter
                 session_info = check_trading_session(self.settings.enabled_sessions)
                 if not session_info.is_trading_time:
@@ -436,6 +483,16 @@ class MarketScheduler:
 
             except Exception as e:
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
+
+    async def run_self_optimization(self):
+        """Analyze trade history and tune the bot's brain."""
+        logger.info("Running Self-Optimization AI...")
+        new_weights = await self.optimizer.run_optimization()
+        if new_weights:
+            await self._notify(
+                f"🧠 **SELF-OPTIMIZATION COMPLETE**\n"
+                f"The bot has analyzed recent trades and updated its scoring weights for better performance."
+            )
 
     async def _notify(self, message: str, photo: bytes = None):
         """Send notification to admin via Telegram and WhatsApp if configured."""

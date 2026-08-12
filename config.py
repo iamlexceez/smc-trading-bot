@@ -51,6 +51,15 @@ def get_trading_mode() -> str:
 # ─── Tradeable Settings (persisted in DB, adjustable via Telegram) ──
 
 @dataclass
+class BrokerConfig:
+    name: str
+    login: int
+    password: str
+    server: str
+    terminal_path: str
+    is_active: bool = True
+
+@dataclass
 class TradeSettings:
     # Risk
     risk_per_trade: float = 1.0
@@ -58,7 +67,7 @@ class TradeSettings:
     max_trades_per_day: int = 10
     max_open_positions: int = 5
     min_rr_ratio: float = 3.0
-    score_threshold: float = 60.0  # Raised from 40 to 60
+    score_threshold: float = 60.0
     max_spread_pips: float = 5.0
     symbol_cooldown_minutes: int = 30
     virtual_balance: Optional[float] = None
@@ -81,6 +90,24 @@ class TradeSettings:
     ])
     timeframes: list[str] = field(default_factory=lambda: ["M15", "H1", "H4"])
     htf_timeframes: list[str] = field(default_factory=lambda: ["H1", "H4", "D1"])
+    expert_mode: bool = False
+    scalping_mode: bool = False
+
+    # ─── Institutional 10/10 Features ───────────────────
+    # Multi-Broker Sync
+    brokers: list[BrokerConfig] = field(default_factory=list)
+    arbitrage_enabled: bool = False
+    sync_mode: str = "mirror" # mirror | split
+
+    # AI Sentiment Analysis
+    sentiment_analysis_enabled: bool = False
+    llm_provider: str = "openai" # openai | local
+    sentiment_weight: float = 0.15 # Impact on total score
+
+    # Self-Optimization AI
+    self_optimization_enabled: bool = False
+    optimization_interval_days: int = 7
+    last_optimization_date: Optional[str] = None
 
     # Execution
     trading_mode: str = "demo"  # demo | live
@@ -107,11 +134,17 @@ class TradeSettings:
     news_blackout_minutes: int = 15
 
     def to_dict(self) -> dict:
+        import json
         d = asdict(self)
         # Lists → comma strings for SQLite storage
         for key in ("symbols", "enabled_symbols", "timeframes", "htf_timeframes", "enabled_sessions", "news_impact_levels"):
             if isinstance(d.get(key), list):
                 d[key] = ",".join(d[key])
+        
+        # Complex objects → JSON
+        if isinstance(d.get("brokers"), list):
+            d["brokers"] = json.dumps([asdict(b) for b in self.brokers])
+            
         return d
 
     @classmethod
@@ -135,6 +168,20 @@ class TradeSettings:
         # Parse master symbols first
         symbols_list = parse_list(d.get("symbols"))
 
+        import json
+        
+        # Parse brokers
+        brokers_raw = d.get("brokers", "[]")
+        brokers = []
+        if isinstance(brokers_raw, str):
+            try:
+                brokers_data = json.loads(brokers_raw)
+                brokers = [BrokerConfig(**b) for b in brokers_data]
+            except:
+                brokers = []
+        elif isinstance(brokers_raw, list):
+            brokers = [BrokerConfig(**b) if isinstance(b, dict) else b for b in brokers_raw]
+
         return cls(
             risk_per_trade=float(d.get("risk_per_trade", 1.0)),
             max_daily_loss_pct=float(d.get("max_daily_loss_pct", 5.0)),
@@ -154,6 +201,8 @@ class TradeSettings:
             enabled_symbols=parse_list(d.get("enabled_symbols"), symbols_list),
             timeframes=parse_list(d.get("timeframes"), ["M15", "H1", "H4"]),
             htf_timeframes=parse_list(d.get("htf_timeframes"), ["H1", "H4", "D1"]),
+            expert_mode=parse_bool(d.get("expert_mode", "false")),
+            scalping_mode=parse_bool(d.get("scalping_mode", "false")),
             trading_mode=d.get("trading_mode", "demo"),
             magic_number=int(d.get("magic_number", 20260807)),
             require_zone_retest=parse_bool(d.get("require_zone_retest", "true"), True),
@@ -168,6 +217,15 @@ class TradeSettings:
             news_filter_enabled=parse_bool(d.get("news_filter_enabled", "true"), True),
             news_impact_levels=parse_list(d.get("news_impact_levels"), ["High"]),
             news_blackout_minutes=int(d.get("news_blackout_minutes", 15)),
+            brokers=brokers,
+            arbitrage_enabled=parse_bool(d.get("arbitrage_enabled", "false")),
+            sync_mode=d.get("sync_mode", "mirror"),
+            sentiment_analysis_enabled=parse_bool(d.get("sentiment_analysis_enabled", "false")),
+            llm_provider=d.get("llm_provider", "openai"),
+            sentiment_weight=float(d.get("sentiment_weight", 0.15)),
+            self_optimization_enabled=parse_bool(d.get("self_optimization_enabled", "false")),
+            optimization_interval_days=int(d.get("optimization_interval_days", 7)),
+            last_optimization_date=d.get("last_optimization_date"),
         )
 
     @classmethod

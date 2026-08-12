@@ -727,6 +727,41 @@ class BotHandlers:
             await update.message.reply_text(f"Current risk: {self.settings.risk_per_trade}%\nUsage: /risk 1.5")
 
     @admin_only
+    async def cmd_add_broker(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Add a new MT5 broker configuration."""
+        if len(context.args) < 5:
+            await update.message.reply_text(
+                "Usage: `/add_broker [name] [login] [password] [server] [terminal_path]`\n\n"
+                "Example:\n`/add_broker ICMarkets 123456 pass IC-Server C:\\MT5\\terminal64.exe`"
+            )
+            return
+
+        try:
+            from config import BrokerConfig
+            new_broker = BrokerConfig(
+                name=context.args[0],
+                login=int(context.args[1]),
+                password=context.args[2],
+                server=context.args[3],
+                terminal_path=context.args[4]
+            )
+            self.settings.brokers.append(new_broker)
+            await db.save_settings(self.settings)
+            await update.message.reply_text(f"✅ **Broker Added**: {new_broker.name}\nRestart the bot to initialize the connection.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error adding broker: {e}")
+
+    @admin_only
+    async def cmd_optimize(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Manually trigger self-optimization."""
+        await update.message.reply_text("🧠 **Initiating Self-Optimization AI...**\nAnalyzing recent trade history...")
+        if self.scheduler:
+            await self.scheduler.run_self_optimization()
+            await update.message.reply_text("✅ Optimization complete. Scoring weights have been tuned.")
+        else:
+            await update.message.reply_text("❌ Scheduler not initialized.")
+
+    @admin_only
     async def cmd_rr(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Set minimum RR ratio."""
         if context.args:
@@ -918,6 +953,35 @@ class BotHandlers:
             await db.save_settings(self.settings)
             status = "ON 🎯" if self.settings.index_focus else "OFF 🛡"
             await query.edit_message_text(f"Index Focus is now **{status}**.", reply_markup=keyboards.settings_menu())
+            
+        elif data == "toggle_sentiment":
+            self.settings.sentiment_analysis_enabled = not self.settings.sentiment_analysis_enabled
+            await db.save_settings(self.settings)
+            status = "ON 🌊" if self.settings.sentiment_analysis_enabled else "OFF 🛡"
+            await query.edit_message_text(f"AI Sentiment is now **{status}**.", reply_markup=keyboards.settings_menu())
+            
+        elif data == "toggle_optimization":
+            self.settings.self_optimization_enabled = not self.settings.self_optimization_enabled
+            await db.save_settings(self.settings)
+            status = "ON 🧠" if self.settings.self_optimization_enabled else "OFF 🛡"
+            await query.edit_message_text(f"Self-Optimization is now **{status}**.", reply_markup=keyboards.settings_menu())
+            
+        elif data == "toggle_arbitrage":
+            self.settings.arbitrage_enabled = not self.settings.arbitrage_enabled
+            await db.save_settings(self.settings)
+            status = "ON ⚡️" if self.settings.arbitrage_enabled else "OFF 🛡"
+            await query.edit_message_text(f"Arbitrage Monitor is now **{status}**.", reply_markup=keyboards.settings_menu())
+            
+        elif data == "multi_broker_menu":
+            text = "🏦 **Multi-Broker Management**\n\nActive Brokers:\n"
+            if not self.settings.brokers:
+                text += "_No additional brokers configured._"
+            else:
+                for b in self.settings.brokers:
+                    text += f"• {b.name} ({b.server}) - {'✅' if b.is_active else '❌'}\n"
+            
+            text += "\nUse `/add_broker` to add a new MT5 terminal."
+            await query.edit_message_text(text, reply_markup=keyboards.confirm_keyboard("main"), parse_mode="Markdown")
         elif data == "confirm_expert_mode":
             await query.edit_message_text(
                 "⚠️ Activate Expert Mode? This will focus on high-probability institutional pairs.",
@@ -1077,6 +1141,8 @@ class BotHandlers:
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("risk", self.cmd_risk))
         app.add_handler(CommandHandler("rr", self.cmd_rr))
+        app.add_handler(CommandHandler("add_broker", self.cmd_add_broker))
+        app.add_handler(CommandHandler("optimize", self.cmd_optimize))
         app.add_handler(CommandHandler("score", self.cmd_score))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))
         app.add_handler(CommandHandler("sessions", self.cmd_sessions))
