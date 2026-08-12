@@ -22,6 +22,8 @@ class Session(Enum):
     LONDON = "london"
     NEW_YORK = "new_york"
     LONDON_NY_OVERLAP = "london_ny_overlap"
+    ICT_LONDON_KZ = "ict_london_killzone"
+    ICT_NY_KZ = "ict_ny_killzone"
 
 
 SESSION_HOURS = {
@@ -29,6 +31,8 @@ SESSION_HOURS = {
     Session.LONDON: (8, 17),
     Session.NEW_YORK: (13, 22),
     Session.LONDON_NY_OVERLAP: (13, 17),
+    Session.ICT_LONDON_KZ: (6, 9),
+    Session.ICT_NY_KZ: (11, 14),
 }
 
 
@@ -170,6 +174,8 @@ def format_session_status(enabled_sessions: list[str]) -> str:
         "london": "🇬🇧 London (08:00-17:00 UTC)",
         "new_york": "🇺🇸 New York (13:00-22:00 UTC)",
         "overlap": "🔀 London/NY Overlap (13:00-17:00 UTC)",
+        "ict_london_killzone": "🏹 ICT London Kill Zone (06:00-09:00 UTC)",
+        "ict_ny_killzone": "🏹 ICT NY Kill Zone (11:00-14:00 UTC)",
         "all": "🌍 All sessions (24/5)",
     }
 

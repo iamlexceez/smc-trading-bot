@@ -22,6 +22,8 @@ from typing import Optional
 from analysis.structure import MarketStructure, Trend, StructureEvent
 from analysis.supply_demand import SupplyDemandZone, ZoneType, get_nearest_zones
 from analysis.indicators import rsi, ema, atr
+from analysis.sessions import check_trading_session, Session
+from analysis.institutional import calculate_ote_levels
 import pandas as pd
 import numpy as np
 
@@ -212,9 +214,9 @@ def score_rr(entry: float, sl: float, tp: float, min_rr: float = 3.0) -> ScoreFa
 
 
 def score_mtf_confluence(ltf_structure: MarketStructure, htf_structures: list[MarketStructure], direction: str) -> ScoreFactor:
-    """Factor 7: Multi-timeframe confluence (10%)."""
+    """Factor 7: Multi-timeframe confluence (15%)."""
     if not htf_structures:
-        return ScoreFactor(name="MTF Confluence", score=50.0, weight=0.10, detail="No HTF data")
+        return ScoreFactor(name="MTF Confluence", score=50.0, weight=0.15, detail="No HTF data")
 
     aligned = 0
     total = len(htf_structures)
@@ -230,7 +232,44 @@ def score_mtf_confluence(ltf_structure: MarketStructure, htf_structures: list[Ma
     score = (aligned / total) * 100 if total > 0 else 0
     detail = f"{aligned}/{total} HTF timeframes aligned"
 
-    return ScoreFactor(name="MTF Confluence", score=score, weight=0.10, detail=detail)
+    return ScoreFactor(name="MTF Confluence", score=score, weight=0.15, detail=detail)
+
+
+def score_kill_zone() -> ScoreFactor:
+    """Factor 8: ICT Kill Zone Timing (10%)."""
+    info = check_trading_session(["ict_london_killzone", "ict_ny_killzone"])
+    if info.current_session in (Session.ICT_LONDON_KZ, Session.ICT_NY_KZ):
+        score = 100.0
+        detail = f"Inside {info.current_session.value.replace('_', ' ').upper()}"
+    else:
+        score = 0.0
+        detail = "Outside ICT Kill Zones"
+    return ScoreFactor(name="Kill Zone", score=score, weight=0.10, detail=detail)
+
+
+def score_ote(entry: float, structure: MarketStructure, direction: str) -> ScoreFactor:
+    """Factor 9: Optimal Trade Entry (OTE) Fibonacci (10%)."""
+    # Use the most recent swing high/low from structure
+    if not structure.swing_highs or not structure.swing_lows:
+        return ScoreFactor(name="OTE Fibonacci", score=0.0, weight=0.10, detail="No swings found")
+        
+    last_high = structure.swing_highs[-1].price
+    last_low = structure.swing_lows[-1].price
+    
+    ote = calculate_ote_levels(last_high, last_low, direction)
+    
+    # Check if entry is between 62% and 79%
+    low_bound = min(ote["62.0"], ote["79.0"])
+    high_bound = max(ote["62.0"], ote["79.0"])
+    
+    if low_bound <= entry <= high_bound:
+        score = 100.0
+        detail = "Entry inside OTE (62%-79%)"
+    else:
+        score = 0.0
+        detail = "Entry outside OTE range"
+        
+    return ScoreFactor(name="OTE Fibonacci", score=score, weight=0.10, detail=detail)
 
 
 def compute_signal(
@@ -257,7 +296,15 @@ def compute_signal(
         score_liquidity(ltf_structure, direction, entry_price, atr_val),
         score_rr(entry_price, stop_loss, take_profit, min_rr),
         score_mtf_confluence(ltf_structure, htf_structures, direction),
+        score_kill_zone(),
+        score_ote(entry_price, ltf_structure, direction),
     ]
+    
+    # Adjust weights to total 1.0 (currently 0.15+0.15+0.15+0.10+0.15+0.15+0.15+0.10+0.10 = 1.20)
+    # Let's normalize them
+    total_weight = sum(f.weight for f in factors)
+    for f in factors:
+        f.weight = f.weight / total_weight
 
     # Compute weighted score
     total_score = sum(f.score * f.weight for f in factors)
