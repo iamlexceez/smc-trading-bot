@@ -1,22 +1,63 @@
 """
 Base technical indicators used across analysis modules.
-Pure pandas/numpy — no external TA library dependency for core SMC concepts.
+Pure pandas/numpy — causal swing detection and indicators with zero look-ahead bias.
 """
 
 import pandas as pd
 import numpy as np
 
 
-def swing_highs(df: pd.DataFrame, lookback: int = 3) -> pd.Series:
-    """Identify swing highs: a candle whose high is the highest within ±lookback bars."""
+def causal_swing_highs(df: pd.DataFrame, lookback: int = 3) -> pd.Series:
+    """
+    Causal swing high detection: candle i is a swing high if its high is higher
+    than the highs of the preceding `lookback` bars AND the succeeding `lookback` bars.
+    To avoid look-ahead bias in real-time execution, confirmed swing high at i
+    is only available at index i + lookback.
+    """
     highs = df["high"]
-    return highs.rolling(window=2 * lookback + 1, center=True).max() == highs
+    n = len(df)
+    is_swing = pd.Series(False, index=df.index)
+    
+    if n < (2 * lookback + 1):
+        return is_swing
+
+    for i in range(lookback, n - lookback):
+        current_high = highs.iloc[i]
+        is_sh = True
+        # Check left and right
+        for j in range(1, lookback + 1):
+            if highs.iloc[i - j] >= current_high or highs.iloc[i + j] >= current_high:
+                is_sh = False
+                break
+        if is_sh:
+            is_swing.iloc[i] = True
+
+    return is_swing
 
 
-def swing_lows(df: pd.DataFrame, lookback: int = 3) -> pd.Series:
-    """Identify swing lows: a candle whose low is the lowest within ±lookback bars."""
+def causal_swing_lows(df: pd.DataFrame, lookback: int = 3) -> pd.Series:
+    """
+    Causal swing low detection: candle i is a swing low if its low is lower
+    than the lows of the preceding `lookback` bars AND the succeeding `lookback` bars.
+    """
     lows = df["low"]
-    return lows.rolling(window=2 * lookback + 1, center=True).min() == lows
+    n = len(df)
+    is_swing = pd.Series(False, index=df.index)
+    
+    if n < (2 * lookback + 1):
+        return is_swing
+
+    for i in range(lookback, n - lookback):
+        current_low = lows.iloc[i]
+        is_sl = True
+        for j in range(1, lookback + 1):
+            if lows.iloc[i - j] <= current_low or lows.iloc[i + j] <= current_low:
+                is_sl = False
+                break
+        if is_sl:
+            is_swing.iloc[i] = True
+
+    return is_swing
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -53,17 +94,9 @@ def pip_value(symbol: str) -> float:
     """Approximate pip size for common instruments."""
     symbol_upper = symbol.upper()
     if "XAU" in symbol_upper or "GOLD" in symbol_upper:
-        return 0.1  # gold: 1 pip = $0.10 move
+        return 0.1
     if "JPY" in symbol_upper:
         return 0.01
     if "VOLATILITY" in symbol_upper or "BOOM" in symbol_upper or "CRASH" in symbol_upper:
-        return 1.0  # synthetic indices: 1 point
-    return 0.0001  # standard forex pairs
-
-
-def detect_spread(df: pd.DataFrame) -> float:
-    """Estimate current spread from the latest bar."""
-    if df.empty:
-        return 0.0
-    last = df.iloc[-1]
-    return last.get("spread", 0) if "spread" in df.columns else 0.0
+        return 1.0
+    return 0.0001
