@@ -409,48 +409,49 @@ class BotHandlers:
                 # Sort symbols to prioritize Indices for faster burning
                 sorted_symbols = sorted(self.settings.symbols, key=lambda x: "Index" in x or "Volatility" in x, reverse=True)
                 
-                trade_placed = False
-                for sym in sorted_symbols:
+                # BATCH OPENING: Open hedged trades on multiple symbols at once
+                active_symbols = []
+                for sym in sorted_symbols[:5]: # Try top 5 indices at once
                     sym_info = await self.executor.get_symbol_info(sym)
-                    if not sym_info or not sym_info.get("max_lot"):
-                        continue
-                        
+                    if not sym_info or not sym_info.get("max_lot"): continue
+                    
+                    # Determine safe lot size (start with max, scale down if needed)
                     test_lot = sym_info.get("max_lot")
-                    min_lot = sym_info.get("min_lot", 0.01)
+                    res = await self.executor.execute_trade(
+                        symbol=sym, direction="BUY", lot_size=test_lot,
+                        sl=0, tp=0, magic=999999, comment="BURN"
+                    )
                     
-                    # Try reducing lot size until the broker accepts it
-                    while test_lot >= min_lot:
-                        logger.info(f"Burner: Trying {sym} with {test_lot} lots")
-                        res_buy = await self.executor.execute_trade(
+                    # If max lot fails, try a smaller safer lot
+                    if not res.success:
+                        test_lot = round(test_lot * 0.1, 2) # Try 10% of max
+                        res = await self.executor.execute_trade(
                             symbol=sym, direction="BUY", lot_size=test_lot,
-                            sl=0, tp=0, magic=999999, comment="BALANCE BURN"
+                            sl=0, tp=0, magic=999999, comment="BURN"
                         )
-                        
-                        if res_buy.success:
-                            # Also open a SELL to hedge and burn via spread
-                            await self.executor.execute_trade(
-                                symbol=sym, direction="SELL", lot_size=test_lot,
-                                sl=0, tp=0, magic=999999, comment="BALANCE BURN"
-                            )
-                            trade_placed = True
-                            break
-                        elif "10034" in res_buy.message or "Volume" in res_buy.message:
-                            # Volume too large, cut in half and retry this symbol
-                            test_lot = round(test_lot / 2, 2)
-                            if test_lot < min_lot: break
-                        else:
-                            # Other error (e.g. market closed), try next symbol
-                            break
                     
-                    if trade_placed:
-                        break
-                
-                if not trade_placed:
-                    logger.error("Burner: Could not place any trades on any symbol. Retrying in 10s...")
-                    await asyncio.sleep(10)
+                    if res.success:
+                        # Hedge it
+                        await self.executor.execute_trade(
+                            symbol=sym, direction="SELL", lot_size=test_lot,
+                            sl=0, tp=0, magic=999999, comment="BURN"
+                        )
+                        active_symbols.append(sym)
+                        logger.info(f"HyperBurner: Opened hedge on {sym} ({test_lot} lots)")
+
+                if not active_symbols:
+                    logger.error("HyperBurner: No symbols available. Retrying in 5s...")
+                    await asyncio.sleep(5)
                     continue
-                    
-                await asyncio.sleep(5) # Wait for equity to update before next cycle
+
+                # Wait briefly to let spread/slippage burn equity
+                await asyncio.sleep(4)
+                
+                # BATCH CLOSING: Realize the losses and clear margin
+                closed_count = await self.executor.close_all_positions()
+                logger.info(f"HyperBurner: Cycle complete. Closed {closed_count} positions. Equity: ${current_equity:,.2f}")
+                
+                await asyncio.sleep(1) # Brief pause before next cycle
                 
         except Exception as e:
             logger.error(f"Burn process error: {e}")
