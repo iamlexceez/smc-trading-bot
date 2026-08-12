@@ -378,6 +378,60 @@ class BotHandlers:
             await update.message.reply_text("Usage: `/aggressive on` or `/aggressive off`")
 
     @admin_only
+    async def cmd_toggle_symbol(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Toggle a symbol on or off without removing it."""
+        if not context.args:
+            lines = ["🔄 **Symbol Toggles**\n"]
+            for s in self.settings.symbols:
+                status = "✅ ENABLED" if s in self.settings.enabled_symbols else "❌ DISABLED"
+                lines.append(f"{s}: {status}")
+            lines.append("\nUse `/toggle_symbol [name]` to switch.")
+            await update.message.reply_text("\n".join(lines))
+            return
+
+        symbol = " ".join(context.args).strip()
+        # Case-insensitive search
+        match = next((s for s in self.settings.symbols if s.lower() == symbol.lower()), None)
+        
+        if not match:
+            await update.message.reply_text(f"Symbol '{symbol}' not found in available list. Use `/add_symbol` first.")
+            return
+
+        if match in self.settings.enabled_symbols:
+            self.settings.enabled_symbols.remove(match)
+            await update.message.reply_text(f"❌ **{match} DISABLED**\nThe bot will no longer scan this pair.")
+        else:
+            self.settings.enabled_symbols.append(match)
+            await update.message.reply_text(f"✅ **{match} ENABLED**\nThe bot will now include this pair in scans.")
+        
+        await db.save_settings(self.settings)
+
+    @admin_only
+    async def cmd_expert_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Activate the Expert Selection of symbols."""
+        expert_selection = [
+            "Volatility 75 Index", "Volatility 100 Index", "Volatility 10 Index", "Volatility 25 Index",
+            "EURUSD", "GBPUSD", "USDJPY", "XAUUSD"
+        ]
+        
+        # Add any expert symbols that aren't in the available list yet
+        for s in expert_selection:
+            if s not in self.settings.symbols:
+                self.settings.symbols.append(s)
+        
+        # Set enabled symbols to exactly the expert selection
+        self.settings.enabled_symbols = [s for s in expert_selection]
+        
+        await db.save_settings(self.settings)
+        await update.message.reply_text(
+            "🏆 **EXPERT MODE ACTIVATED**\n\n"
+            "The bot is now focused on high-probability institutional pairs:\n"
+            "- Volatility 75, 100, 10, 25\n"
+            "- EURUSD, GBPUSD, USDJPY, XAUUSD\n\n"
+            "Your previous symbols are still in the list but have been **DISABLED**."
+        )
+
+    @admin_only
     async def cmd_scalping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Toggle Scalping Mode (M1/M5 timeframes)."""
         if not context.args:
@@ -863,6 +917,8 @@ class BotHandlers:
         app.add_handler(CommandHandler("aggressive", self.cmd_aggressive))
         app.add_handler(CommandHandler("target", self.cmd_target))
         app.add_handler(CommandHandler("scalping", self.cmd_scalping))
+        app.add_handler(CommandHandler("toggle_symbol", self.cmd_toggle_symbol))
+        app.add_handler(CommandHandler("expert_mode", self.cmd_expert_mode))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("risk", self.cmd_risk))
         app.add_handler(CommandHandler("rr", self.cmd_rr))

@@ -221,9 +221,9 @@ class MarketScheduler:
         return signal
 
     async def scan_markets(self) -> list[TradeSignal]:
-        """Scan all configured symbols and return signals that pass threshold."""
+        """Scan all enabled symbols and return signals that pass threshold."""
         signals = []
-        for symbol in self.settings.symbols:
+        for symbol in self.settings.enabled_symbols:
             try:
                 signal = await self.analyze_symbol(symbol)
                 if signal and signal.score >= self.settings.score_threshold:
@@ -257,7 +257,7 @@ class MarketScheduler:
         # Heartbeat to user
         await self._notify("💓 **HEARTBEAT**: Market scan in progress...")
 
-        for symbol in self.settings.symbols:
+        for symbol in self.settings.enabled_symbols:
             logger.info(f"Analyzing {symbol}...")
             try:
                 # Check session filter

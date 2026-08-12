@@ -74,6 +74,10 @@ class TradeSettings:
         "EURUSD", "GBPUSD", "USDJPY", "XAUUSD",
         "Volatility 75 Index", "Boom 500 Index", "Crash 500 Index",
     ])
+    enabled_symbols: list[str] = field(default_factory=lambda: [
+        "EURUSD", "GBPUSD", "USDJPY", "XAUUSD",
+        "Volatility 75 Index", "Boom 500 Index", "Crash 500 Index",
+    ])
     timeframes: list[str] = field(default_factory=lambda: ["M15", "H1", "H4"])
     htf_timeframes: list[str] = field(default_factory=lambda: ["H1", "H4", "D1"])
 
@@ -104,7 +108,7 @@ class TradeSettings:
     def to_dict(self) -> dict:
         d = asdict(self)
         # Lists → comma strings for SQLite storage
-        for key in ("symbols", "timeframes", "htf_timeframes", "enabled_sessions", "news_impact_levels"):
+        for key in ("symbols", "enabled_symbols", "timeframes", "htf_timeframes", "enabled_sessions", "news_impact_levels"):
             if isinstance(d.get(key), list):
                 d[key] = ",".join(d[key])
         return d
@@ -136,6 +140,7 @@ class TradeSettings:
             auto_trade=parse_bool(d.get("auto_trade", "false")),
             is_paused=parse_bool(d.get("is_paused", "false")),
             symbols=parse_list(d.get("symbols")),
+            enabled_symbols=parse_list(d.get("enabled_symbols"), d.get("symbols")),
             timeframes=parse_list(d.get("timeframes")),
             htf_timeframes=parse_list(d.get("htf_timeframes")),
             trading_mode=d.get("trading_mode", "demo"),
@@ -171,6 +176,7 @@ class TradeSettings:
             auto_trade=os.getenv("AUTO_TRADE", "false").lower() == "true",
             is_paused=False,
             symbols=[s.strip() for s in os.getenv("SYMBOLS", "EURUSD,GBPUSD,USDJPY,XAUUSD,Volatility 75 Index,Boom 500 Index,Crash 500 Index").split(",")],
+            enabled_symbols=[s.strip() for s in os.getenv("ENABLED_SYMBOLS", os.getenv("SYMBOLS", "EURUSD,GBPUSD,USDJPY,XAUUSD,Volatility 75 Index,Boom 500 Index,Crash 500 Index")).split(",")],
             timeframes=[s.strip() for s in os.getenv("TIMEFRAMES", "M15,H1,H4").split(",")],
             htf_timeframes=[s.strip() for s in os.getenv("HTF_TIMEFRAMES", "H1,H4,D1").split(",")],
             trading_mode=get_trading_mode(),
