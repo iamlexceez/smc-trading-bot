@@ -413,15 +413,17 @@ class MarketScheduler:
         """Main loop: scan markets, check risk gates, execute trades."""
         await self._reload_settings()
 
+        # ─── ACTIVE TRADE MANAGEMENT ──────────────────────
+        # We manage positions even if auto_trade is OFF (to protect existing trades)
+        if not self.settings.is_paused:
+            try:
+                await self.manage_open_positions()
+            except Exception as e:
+                logger.error(f"Error managing positions: {e}")
+
         if not self.settings.auto_trade or self.settings.is_paused:
             logger.debug("Auto-trade disabled or paused — skipping scan")
             return
-            
-        # ─── ACTIVE TRADE MANAGEMENT ──────────────────────
-        try:
-            await self.manage_open_positions()
-        except Exception as e:
-            logger.error(f"Error managing positions: {e}")
             
         # Check Cycle Target
         if self.settings.target_balance:
