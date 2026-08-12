@@ -210,6 +210,15 @@ class MT5Executor(BaseExecutor):
 
         price = tick.ask if direction == "BUY" else tick.bid
 
+        # Determine filling mode dynamically based on symbol properties
+        filling_mode = mt5.ORDER_FILLING_IOC
+        if info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+            filling_mode = mt5.ORDER_FILLING_FOK
+        elif info.filling_mode & mt5.SYMBOL_FILLING_IOC:
+            filling_mode = mt5.ORDER_FILLING_IOC
+        else:
+            filling_mode = mt5.ORDER_FILLING_RETURN
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -222,7 +231,7 @@ class MT5Executor(BaseExecutor):
             "magic": magic,
             "comment": comment or "SMC Bot",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": filling_mode,
         }
 
         result = mt5.order_send(request)
@@ -267,6 +276,15 @@ class MT5Executor(BaseExecutor):
         opposite_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
         price = tick.bid if opposite_type == mt5.ORDER_TYPE_SELL else tick.ask
 
+        # Determine filling mode dynamically
+        filling_mode = mt5.ORDER_FILLING_IOC
+        if info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+            filling_mode = mt5.ORDER_FILLING_FOK
+        elif info.filling_mode & mt5.SYMBOL_FILLING_IOC:
+            filling_mode = mt5.ORDER_FILLING_IOC
+        else:
+            filling_mode = mt5.ORDER_FILLING_RETURN
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -278,7 +296,7 @@ class MT5Executor(BaseExecutor):
             "magic": pos.magic,
             "comment": "SMC Bot Close",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": filling_mode,
         }
 
         result = mt5.order_send(request)
