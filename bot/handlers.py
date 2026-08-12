@@ -70,10 +70,17 @@ class BotHandlers:
 
     def __init__(self, settings: TradeSettings, executor, risk_manager: RiskManager, scheduler=None):
         self.settings = settings
-        self.executor = executor
+        self._executor = executor
         self.risk_manager = risk_manager
         self.scheduler = scheduler
         self.app: Optional[Application] = None
+
+    @property
+    def executor(self):
+        """Always return the active executor from the scheduler if available."""
+        if self.scheduler and hasattr(self.scheduler, 'executor'):
+            return self.scheduler.executor
+        return self._executor
 
     async def reload_settings(self):
         """Reload settings from DB."""

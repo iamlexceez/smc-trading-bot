@@ -2,7 +2,7 @@ import logging
 import asyncio
 from typing import List, Dict, Any, Optional
 from executors.mt5 import MT5Executor
-from executors.base import BaseExecutor, ExecutionResult
+from executors.base import BaseExecutor, ExecutionResult, Position
 from config import BrokerConfig, TradeSettings
 
 logger = logging.getLogger(__name__)
@@ -19,12 +19,12 @@ class MultiBrokerManager(BaseExecutor):
         for broker in self.settings.brokers:
             if broker.is_active:
                 # Create a specialized MT5Executor for this broker
-                executor = MT5Executor()
-                # Override credentials for this specific instance
-                executor.login = broker.login
-                executor.password = broker.password
-                executor.server = broker.server
-                executor.terminal_path = broker.terminal_path
+                executor = MT5Executor(
+                    login=broker.login,
+                    password=broker.password,
+                    server=broker.server,
+                    path=broker.terminal_path
+                )
                 self.executors[broker.name] = executor
                 logger.info(f"Initialized executor for broker: {broker.name}")
 
@@ -75,20 +75,25 @@ class MultiBrokerManager(BaseExecutor):
 
         return ExecutionResult(success=False, message="Invalid sync mode")
 
-    async def close_all_positions(self, symbol: str = None) -> bool:
+    async def close_all_positions(self) -> int:
         """Close positions across all brokers."""
-        success = True
+        total_closed = 0
         for executor in self.executors.values():
-            if not await executor.close_all_positions(symbol):
-                success = False
-        return success
+            total_closed += await executor.close_all_positions()
+        return total_closed
 
-    async def get_open_positions(self, symbol: str = None) -> List[Dict[str, Any]]:
+    async def get_open_positions(self) -> List[Position]:
         """Get open positions from all brokers."""
         all_positions = []
         for name, executor in self.executors.items():
-            positions = await executor.get_open_positions(symbol)
+            positions = await executor.get_open_positions()
             for p in positions:
-                p["broker"] = name
+                # Add broker name to comment or handle it in display
+                p.executor = f"mt5 ({name})"
             all_positions.extend(positions)
         return all_positions
+
+    async def disconnect(self) -> None:
+        """Disconnect all brokers."""
+        for executor in self.executors.values():
+            await executor.disconnect()

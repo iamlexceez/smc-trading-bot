@@ -100,13 +100,18 @@ class MT5Executor(BaseExecutor):
             return False
         return self._connected and mt5.terminal_info() is not None
 
+    async def _ensure_connected(self) -> bool:
+        """Helper to ensure MT5 is connected before any operation."""
+        if not await self.is_connected():
+            return await self.connect()
+        return True
+
     async def get_account_info(self) -> dict:
         if not MT5_AVAILABLE:
             return {}
         
-        # Try to reconnect if not connected
-        if not await self.is_connected():
-            await self.connect()
+        if not await self._ensure_connected():
+            return {}
 
         info = mt5.account_info()
         if info is None:
@@ -127,9 +132,7 @@ class MT5Executor(BaseExecutor):
         if not MT5_AVAILABLE:
             return {"available": False, "error": "MetaTrader5 package not installed"}
         
-        # Try to reconnect if the connection seems lost before running diagnostics
-        if not await self.is_connected():
-            await self.connect()
+        await self._ensure_connected()
 
         term_info = mt5.terminal_info()
         acc_info = mt5.account_info()
@@ -147,7 +150,7 @@ class MT5Executor(BaseExecutor):
                 "connected_to_server": term_info.connected,
                 "dll_allowed": term_info.dlls_allowed,
                 "trade_allowed": term_info.trade_allowed,
-                "trade_expert": term_info.trade_expert, # This is the "Algo Trading" button
+                "trade_expert": term_info.trade_expert,
                 "company": term_info.company,
                 "name": term_info.name,
                 "build": term_info.build,
@@ -166,6 +169,10 @@ class MT5Executor(BaseExecutor):
     async def get_symbol_price(self, symbol: str) -> tuple[float, float]:
         if not MT5_AVAILABLE:
             return (0.0, 0.0)
+        
+        if not await self._ensure_connected():
+            return (0.0, 0.0)
+
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             return (0.0, 0.0)
@@ -176,6 +183,9 @@ class MT5Executor(BaseExecutor):
         if not MT5_AVAILABLE:
             return {}
         
+        if not await self._ensure_connected():
+            return {}
+
         # Ensure symbol is selected so we get full info
         mt5.symbol_select(symbol, True)
         info = mt5.symbol_info(symbol)
@@ -201,7 +211,10 @@ class MT5Executor(BaseExecutor):
         self, symbol: str, direction: str, lot_size: float,
         sl: float, tp: float, magic: int, comment: str = ""
     ) -> ExecutionResult:
-        if not MT5_AVAILABLE or not self._connected:
+        if not MT5_AVAILABLE:
+            return ExecutionResult(success=False, message="MT5 package not available")
+        
+        if not await self._ensure_connected():
             return ExecutionResult(success=False, message="MT5 not connected")
 
         # Ensure symbol is visible
@@ -219,12 +232,10 @@ class MT5Executor(BaseExecutor):
 
         price = tick.ask if direction == "BUY" else tick.bid
 
-        # Determine filling mode dynamically based on symbol properties
-        # We use bitwise checks with fallbacks for missing attributes
+        # Determine filling mode dynamically
         filling_mode = mt5.ORDER_FILLING_IOC
         sym_filling = getattr(info, 'filling_mode', 0)
         
-        # Standard MT5 filling mode bitmasks: FOK=1, IOC=2
         if sym_filling & 1:
             filling_mode = mt5.ORDER_FILLING_FOK
         elif sym_filling & 2:
@@ -240,7 +251,7 @@ class MT5Executor(BaseExecutor):
             "price": price,
             "sl": float(sl),
             "tp": float(tp),
-            "deviation": 20,  # max slippage in points
+            "deviation": 20,
             "magic": magic,
             "comment": comment or "SMC Bot",
             "type_time": mt5.ORDER_TIME_GTC,
@@ -270,6 +281,9 @@ class MT5Executor(BaseExecutor):
 
     async def close_position(self, ticket: int) -> bool:
         if not MT5_AVAILABLE:
+            return False
+        
+        if not await self._ensure_connected():
             return False
 
         positions = mt5.positions_get(ticket=ticket)
@@ -320,6 +334,9 @@ class MT5Executor(BaseExecutor):
     async def close_all_positions(self) -> int:
         if not MT5_AVAILABLE:
             return 0
+        
+        if not await self._ensure_connected():
+            return 0
 
         positions = mt5.positions_get()
         if not positions:
@@ -333,6 +350,9 @@ class MT5Executor(BaseExecutor):
 
     async def get_open_positions(self) -> list[Position]:
         if not MT5_AVAILABLE:
+            return []
+        
+        if not await self._ensure_connected():
             return []
 
         positions = mt5.positions_get()
