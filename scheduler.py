@@ -227,6 +227,19 @@ class MarketScheduler:
         if not self.settings.auto_trade or self.settings.is_paused:
             logger.debug("Auto-trade disabled or paused — skipping scan")
             return
+            
+        # Check Cycle Target
+        if self.settings.target_balance:
+            account = await self.executor.get_account_info()
+            current_equity = account.get("equity", 0)
+            if current_equity >= self.settings.target_balance:
+                logger.info(f"🎯 CYCLE TARGET REACHED: ${current_equity:,.2f}. Stopping bot.")
+                await self.executor.close_all_positions()
+                self.settings.auto_trade = False
+                self.settings.target_balance = None
+                await db.save_settings(self.settings)
+                await self._notify(f"🏆 **CYCLE TARGET REACHED!**\nBalance: **${current_equity:,.2f}**\nAll positions closed and Auto-Trade turned OFF.")
+                return
 
         logger.info("Starting market scan...")
 
@@ -267,19 +280,32 @@ class MarketScheduler:
                 spread = sym_info.get("spread", 0) * pip
 
                 # Calculate lot size using Expert DNA
+                # If aggressive mode is ON, double the risk percentage temporarily
+                original_risk = self.settings.risk_per_trade
+                if self.settings.aggressive_mode:
+                    self.settings.risk_per_trade *= 2.5 # 2.5x risk in aggressive mode
+                
                 lot_size = self.risk_manager.calculate_position_size(
                     balance, signal.entry_price, signal.stop_loss, sym_info
                 )
+                
+                # Restore original risk for future calculations
+                self.settings.risk_per_trade = original_risk
                 
                 # Estimate required margin
                 contract = sym_info.get("contract_size", 100000)
                 leverage = account.get("leverage", 500)
                 required_margin = lot_size * contract * signal.entry_price / leverage
 
+                # In aggressive mode, lower the score threshold slightly to 50%
+                check_score = signal.score
+                if self.settings.aggressive_mode and check_score >= 50.0:
+                    check_score = self.settings.score_threshold # Fake a pass
+                
                 risk_result = await self.risk_manager.check_all(
                     symbol=symbol,
                     direction=signal.direction,
-                    score=signal.score,
+                    score=check_score,
                     rr_ratio=signal.rr_ratio,
                     spread_pips=spread / pip if pip > 0 else 0,
                     account_equity=equity,

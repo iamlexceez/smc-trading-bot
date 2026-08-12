@@ -358,6 +358,49 @@ class BotHandlers:
                 await update.message.reply_text("❌ Invalid amount. Please enter a positive number.")
 
     @admin_only
+    async def cmd_aggressive(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Toggle Aggressive Growth mode."""
+        if not context.args:
+            status = "ON" if self.settings.aggressive_mode else "OFF"
+            await update.message.reply_text(f"🚀 Aggressive Growth is currently **{status}**.\nUse `/aggressive on` or `/aggressive off` to toggle.")
+            return
+
+        arg = context.args[0].lower()
+        if arg == "on":
+            self.settings.aggressive_mode = True
+            await db.save_settings(self.settings)
+            await update.message.reply_text("🚀 **AGGRESSIVE GROWTH ACTIVATED**\nRisk per trade will be increased and the bot will hunt for more setups.")
+        elif arg == "off":
+            self.settings.aggressive_mode = False
+            await db.save_settings(self.settings)
+            await update.message.reply_text("🛡 **AGGRESSIVE GROWTH DEACTIVATED**\nReturning to standard SMC safety protocols.")
+        else:
+            await update.message.reply_text("Usage: `/aggressive on` or `/aggressive off`")
+
+    @admin_only
+    async def cmd_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set a balance target for the current cycle."""
+        if not context.args:
+            target = f"${self.settings.target_balance:,.2f}" if self.settings.target_balance else "None"
+            await update.message.reply_text(f"🎯 Current Cycle Target: **{target}**\nUse `/target [amount]` or `/target reset`.")
+            return
+
+        arg = context.args[0].lower()
+        if arg == "reset":
+            self.settings.target_balance = None
+            await db.save_settings(self.settings)
+            await update.message.reply_text("🎯 Cycle target reset. The bot will trade indefinitely.")
+        else:
+            try:
+                val = float(arg)
+                if val <= 0: raise ValueError
+                self.settings.target_balance = val
+                await db.save_settings(self.settings)
+                await update.message.reply_text(f"🎯 **CYCLE TARGET SET: ${val:,.2f}**\nThe bot will close all positions and stop trading once this balance is reached.")
+            except ValueError:
+                await update.message.reply_text("❌ Invalid amount. Please enter a positive number.")
+
+    @admin_only
     async def cmd_burn_to(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Burn demo balance down to a target amount via high-lot trades."""
         if self.settings.trading_mode != "demo":
@@ -788,6 +831,8 @@ class BotHandlers:
         app.add_handler(CommandHandler("resume", self.cmd_resume))
         app.add_handler(CommandHandler("set_balance", self.cmd_set_balance))
         app.add_handler(CommandHandler("burn_to", self.cmd_burn_to))
+        app.add_handler(CommandHandler("aggressive", self.cmd_aggressive))
+        app.add_handler(CommandHandler("target", self.cmd_target))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("risk", self.cmd_risk))
         app.add_handler(CommandHandler("rr", self.cmd_rr))
