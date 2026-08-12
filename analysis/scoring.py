@@ -24,6 +24,7 @@ from analysis.supply_demand import SupplyDemandZone, ZoneType, get_nearest_zones
 from analysis.indicators import rsi, ema, atr
 from analysis.sessions import check_trading_session, Session
 from analysis.institutional import calculate_ote_levels
+from analysis.profiler import profiler, SymbolProfile
 import pandas as pd
 import numpy as np
 
@@ -300,6 +301,7 @@ def compute_signal(
     min_rr: float = 3.0,
     timeframe: str = "M15",
     aggressive: bool = False,
+    profile: SymbolProfile = None,
 ) -> TradeSignal:
     """
     Compute the full trade signal with multi-factor scoring.
@@ -316,11 +318,23 @@ def compute_signal(
         score_ote(entry_price, ltf_structure, direction),
     ]
     
-    # Adjust weights to total 1.0 (currently 0.15+0.15+0.15+0.10+0.15+0.15+0.15+0.10+0.10 = 1.20)
-    # Let's normalize them
+    # Adaptive Weight Adjustment based on Symbol Profile
+    if profile:
+        for f in factors:
+            if f.name == "Structure Alignment" and profile.structure_respect_score > 80:
+                f.weight *= 1.2 # Trust structure more if symbol respects it
+            if f.name == "Order Block" and profile.structure_respect_score > 80:
+                f.weight *= 1.1
+            if f.name == "FVG" and profile.avg_fvg_fill_rate > 0.7:
+                f.weight *= 1.2 # Trust FVGs more for this pair
+            if f.name == "Volatility" and profile.volatility_index > 70:
+                f.weight *= 0.8 # Be more cautious if volatility is extreme
+
+    # Adjust weights to total 1.0
     total_weight = sum(f.weight for f in factors)
     for f in factors:
         f.weight = f.weight / total_weight
+        f.max_points = 100 * f.weight
 
     # Compute weighted score
     total_score = sum(f.score * f.weight for f in factors)

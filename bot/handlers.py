@@ -35,7 +35,8 @@ from telegram.ext import (
 from config import TradeSettings, get_admin_ids, get_mt5_credentials
 from bot import keyboards
 from storage import db
-from analysis.scoring import format_signal_report, TradeSignal
+from analysis.scoring import format_signal_report
+from analysis.profiler import profiler
 from risk.manager import RiskManager
 from executors.mt5 import MT5Executor
 
@@ -165,6 +166,31 @@ class BotHandlers:
         self.settings.enabled_sessions = ["all"]
         await db.save_settings(self.settings)
         await update.message.reply_text("🌍 **ALL SESSIONS ENABLED**\nThe bot will now trade 24/5.")
+
+    @admin_only
+    async def cmd_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the behavioral profile for a symbol."""
+        if not context.args:
+            await update.message.reply_text("Usage: `/profile [symbol]` (e.g., `/profile EURUSD`)")
+            return
+
+        symbol = " ".join(context.args).strip()
+        profile = profiler.profiles.get(symbol)
+        
+        if not profile:
+            await update.message.reply_text(f"No profile data for {symbol} yet. Run a `/scan` first.")
+            return
+
+        text = (
+            f"🧬 **Symbol DNA: {symbol}**\n\n"
+            f"📊 **Volatility Index**: `{profile.volatility_index}/100`\n"
+            f"🏛 **Structure Respect**: `{profile.structure_respect_score}%`\n"
+            f"🎯 **Optimal ATR Mult**: `{profile.optimal_atr_multiplier}x`\n"
+            f"⏱ **Best Timeframe**: `{profile.best_timeframe}`\n"
+            f"🔄 **Fill Rate (FVG)**: `{profile.avg_fvg_fill_rate * 100}%`\n\n"
+            f"_Last learned: {profile.last_updated.strftime('%Y-%m-%d %H:%M')}_"
+        )
+        await update.message.reply_text(text)
 
     @admin_only
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1014,6 +1040,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("toggle_symbol", self.cmd_toggle_symbol))
         app.add_handler(CommandHandler("expert_mode", self.cmd_expert_mode))
         app.add_handler(CommandHandler("focus_indices", self.cmd_focus_indices))
+        app.add_handler(CommandHandler("profile", self.cmd_profile))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("risk", self.cmd_risk))
         app.add_handler(CommandHandler("rr", self.cmd_rr))

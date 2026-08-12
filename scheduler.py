@@ -26,6 +26,7 @@ from analysis.indicators import pip_value, atr
 from analysis.sessions import check_trading_session
 from analysis.confirmation import get_confirmation
 from analysis.visuals import render_smc_chart
+from analysis.profiler import profiler
 from risk.manager import RiskManager
 from executors.base import BaseExecutor
 from data.provider import DataProvider
@@ -118,6 +119,9 @@ class MarketScheduler:
         
         # Run S/D zone detection
         zones = detect_sd_zones(df, lookback=100)
+
+        # 2.5 Adaptive Profiling
+        profile = await profiler.profile_symbol(symbol, df)
         
         # Check for new structural events (BOS/CHoCH)
         from analysis.structure import StructureEvent
@@ -170,14 +174,17 @@ class MarketScheduler:
 
         pip = pip_value(symbol)
 
+        # Calculate SL using Adaptive ATR Multiplier
+        atr_mult = profile.optimal_atr_multiplier if profile else 1.5
+        
         if direction == "BUY":
             entry = current_price
-            sl = entry - atr_val * 1.5
-            tp = entry + atr_val * 1.5 * self.settings.min_rr_ratio
+            sl = entry - atr_val * atr_mult
+            tp = entry + atr_val * atr_mult * self.settings.min_rr_ratio
         else:
             entry = current_price
-            sl = entry + atr_val * 1.5
-            tp = entry - atr_val * 1.5 * self.settings.min_rr_ratio
+            sl = entry + atr_val * atr_mult
+            tp = entry - atr_val * atr_mult * self.settings.min_rr_ratio
 
         # Entry confirmation
         nearest_zone = None
@@ -221,6 +228,7 @@ class MarketScheduler:
             min_rr=self.settings.min_rr_ratio,
             timeframe=primary_tf,
             aggressive=is_hyper_scalp,
+            profile=profile,
         )
 
         return signal
