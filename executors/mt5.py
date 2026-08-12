@@ -127,13 +127,17 @@ class MT5Executor(BaseExecutor):
         if not MT5_AVAILABLE:
             return {"available": False, "error": "MetaTrader5 package not installed"}
         
+        # Try to reconnect if the connection seems lost before running diagnostics
+        if not await self.is_connected():
+            await self.connect()
+
         term_info = mt5.terminal_info()
         acc_info = mt5.account_info()
         last_error = mt5.last_error()
         
         diag = {
             "available": True,
-            "connected": self._connected,
+            "connected": await self.is_connected(),
             "terminal_running": term_info is not None,
             "last_error": last_error,
         }
