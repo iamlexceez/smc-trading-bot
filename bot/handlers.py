@@ -407,12 +407,17 @@ class BotHandlers:
                     break
 
                 # Find the first available symbol and its max lot size
+                # Prioritize Indices for burning as they are more likely to be active
                 burn_symbol = None
                 max_lot = 1.0
                 
-                for sym in self.settings.symbols:
+                # Sort symbols to prioritize Indices
+                sorted_symbols = sorted(self.settings.symbols, key=lambda x: "Index" in x or "Volatility" in x, reverse=True)
+                
+                for sym in sorted_symbols:
                     sym_info = await self.executor.get_symbol_info(sym)
-                    if sym_info and sym_info.get("max_lot"):
+                    # Check if symbol is visible and tradeable
+                    if sym_info and sym_info.get("visible") and sym_info.get("max_lot", 0) > 0:
                         burn_symbol = sym
                         max_lot = sym_info.get("max_lot")
                         break

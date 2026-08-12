@@ -211,10 +211,14 @@ class MT5Executor(BaseExecutor):
         price = tick.ask if direction == "BUY" else tick.bid
 
         # Determine filling mode dynamically based on symbol properties
+        # We use bitwise checks with fallbacks for missing attributes
         filling_mode = mt5.ORDER_FILLING_IOC
-        if info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+        sym_filling = getattr(info, 'filling_mode', 0)
+        
+        # Standard MT5 filling mode bitmasks: FOK=1, IOC=2
+        if sym_filling & 1:
             filling_mode = mt5.ORDER_FILLING_FOK
-        elif info.filling_mode & mt5.SYMBOL_FILLING_IOC:
+        elif sym_filling & 2:
             filling_mode = mt5.ORDER_FILLING_IOC
         else:
             filling_mode = mt5.ORDER_FILLING_RETURN
@@ -278,9 +282,11 @@ class MT5Executor(BaseExecutor):
 
         # Determine filling mode dynamically
         filling_mode = mt5.ORDER_FILLING_IOC
-        if info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+        sym_filling = getattr(info, 'filling_mode', 0)
+        
+        if sym_filling & 1:
             filling_mode = mt5.ORDER_FILLING_FOK
-        elif info.filling_mode & mt5.SYMBOL_FILLING_IOC:
+        elif sym_filling & 2:
             filling_mode = mt5.ORDER_FILLING_IOC
         else:
             filling_mode = mt5.ORDER_FILLING_RETURN
