@@ -27,6 +27,7 @@ from analysis.sessions import check_trading_session
 from analysis.confirmation import get_confirmation
 from analysis.visuals import render_smc_chart
 from analysis.profiler import profiler
+from analysis.order_flow import order_flow
 from risk.manager import RiskManager
 from executors.base import BaseExecutor
 from data.provider import DataProvider
@@ -122,6 +123,9 @@ class MarketScheduler:
 
         # 2.5 Adaptive Profiling
         profile = await profiler.profile_symbol(symbol, df)
+        
+        # 2.6 Order Flow Analysis
+        of_profile = order_flow.calculate_profile(df)
         
         # Check for new structural events (BOS/CHoCH)
         from analysis.structure import StructureEvent
@@ -229,6 +233,7 @@ class MarketScheduler:
             timeframe=primary_tf,
             aggressive=is_hyper_scalp,
             profile=profile,
+            of_profile=of_profile,
         )
 
         return signal

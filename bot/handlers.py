@@ -37,6 +37,7 @@ from bot import keyboards
 from storage import db
 from analysis.scoring import format_signal_report
 from analysis.profiler import profiler
+from analysis.order_flow import order_flow
 from risk.manager import RiskManager
 from executors.mt5 import MT5Executor
 
@@ -181,8 +182,21 @@ class BotHandlers:
             await update.message.reply_text(f"No profile data for {symbol} yet. Run a `/scan` first.")
             return
 
+        # Fetch latest Order Flow profile
+        of_text = ""
+        if self.scheduler:
+            df = await self.scheduler.fetch_candles(symbol, profile.best_timeframe, 200)
+            of_profile = order_flow.calculate_profile(df)
+            if of_profile:
+                of_text = (
+                    f"🎯 **Point of Control (POC)**: `{of_profile.poc}`\n"
+                    f"📦 **Value Area**: `{of_profile.value_area_low} - {of_profile.value_area_high}`\n"
+                    f"⚡️ **Volume Intensity**: `{of_profile.delta_intensity}x`\n\n"
+                )
+
         text = (
             f"🧬 **Symbol DNA: {symbol}**\n\n"
+            f"{of_text}"
             f"📊 **Volatility Index**: `{profile.volatility_index}/100`\n"
             f"🏛 **Structure Respect**: `{profile.structure_respect_score}%`\n"
             f"🎯 **Optimal ATR Mult**: `{profile.optimal_atr_multiplier}x`\n"

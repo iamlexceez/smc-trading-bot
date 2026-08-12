@@ -25,6 +25,7 @@ from analysis.indicators import rsi, ema, atr
 from analysis.sessions import check_trading_session, Session
 from analysis.institutional import calculate_ote_levels
 from analysis.profiler import profiler, SymbolProfile
+from analysis.order_flow import order_flow, OrderFlowProfile
 import pandas as pd
 import numpy as np
 
@@ -309,6 +310,27 @@ def score_historical_backing(profile: Optional[SymbolProfile], ltf_structure: Ma
     
     return ScoreFactor(name="Historical Backing", score=score, weight=0.15, detail=detail)
 
+def score_order_flow(of_profile: Optional[OrderFlowProfile], entry_price: float, zones: list[SupplyDemandZone], direction: str) -> ScoreFactor:
+    """Factor 11: Order Flow Conviction (15%)."""
+    if not of_profile:
+        return ScoreFactor(name="Order Flow", score=50.0, weight=0.15, detail="No volume data")
+
+    # Check if entry is near POC or inside a High Volume Node
+    dist_to_poc = abs(entry_price - of_profile.poc) / entry_price
+    conviction = 0
+    
+    if dist_to_poc < 0.001: # Within 0.1% of POC
+        conviction += 60.0
+    
+    # Check if the last move had high intensity
+    if of_profile.delta_intensity > 1.5:
+        conviction += 40.0
+        
+    score = min(conviction, 100.0)
+    detail = f"Intensity: {of_profile.delta_intensity}x, POC dist: {dist_to_poc*100:.2f}%"
+    
+    return ScoreFactor(name="Order Flow", score=score, weight=0.15, detail=detail)
+
 def compute_signal(
     symbol: str,
     direction: str,
@@ -323,6 +345,7 @@ def compute_signal(
     timeframe: str = "M15",
     aggressive: bool = False,
     profile: SymbolProfile = None,
+    of_profile: OrderFlowProfile = None,
 ) -> TradeSignal:
     """
     Compute the full trade signal with multi-factor scoring.
@@ -338,6 +361,7 @@ def compute_signal(
         score_kill_zone(),
         score_ote(entry_price, ltf_structure, direction),
         score_historical_backing(profile, ltf_structure),
+        score_order_flow(of_profile, entry_price, zones, direction),
     ]
     
     # Adaptive Weight Adjustment based on Symbol Profile
