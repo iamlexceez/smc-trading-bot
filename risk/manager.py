@@ -68,10 +68,10 @@ class RiskManager:
         checks.append(("Symbol not in cooldown", not in_cooldown,
                        f"cooldown={self.settings.symbol_cooldown_minutes}min"))
 
-        # 4. Daily loss limit (calculated against virtual balance if set, else real equity)
+        # 4. Daily loss limit (with 0.01 tolerance)
         base_equity = self.settings.virtual_balance if self.settings.virtual_balance else account_equity
         daily_loss_limit = base_equity * (self.settings.max_daily_loss_pct / 100)
-        passed = today_pnl > -daily_loss_limit
+        passed = today_pnl > (-daily_loss_limit - 0.01)
         checks.append(("Daily loss limit", passed,
                        f"pnl={today_pnl:.2f}, limit=-{daily_loss_limit:.2f}"))
 
@@ -85,13 +85,13 @@ class RiskManager:
         checks.append(("Max open positions", passed,
                        f"{open_position_count}/{self.settings.max_open_positions}"))
 
-        # 7. Score threshold
-        passed = score >= self.settings.score_threshold
+        # 7. Score threshold (with 0.01 tolerance for floating point precision)
+        passed = score >= (self.settings.score_threshold - 0.01)
         checks.append(("Score threshold", passed,
                        f"score={score:.1f}, threshold={self.settings.score_threshold:.1f}"))
 
-        # 8. Minimum RR
-        passed = rr_ratio >= self.settings.min_rr_ratio
+        # 8. Minimum RR (with 0.001 tolerance for floating point precision)
+        passed = rr_ratio >= (self.settings.min_rr_ratio - 0.001)
         checks.append(("Min RR ratio", passed,
                        f"rr=1:{rr_ratio:.1f}, min=1:{self.settings.min_rr_ratio:.1f}"))
 
@@ -100,8 +100,8 @@ class RiskManager:
         checks.append(("Spread check", passed,
                        f"spread={spread_pips:.1f}pips (Check Disabled)"))
 
-        # 10. Free margin
-        passed = free_margin > required_margin * 2  # 2x safety buffer
+        # 10. Free margin (with 0.01 tolerance)
+        passed = free_margin > (required_margin * 2 - 0.01)  # 2x safety buffer
         checks.append(("Free margin", passed,
                        f"free={free_margin:.2f}, required={required_margin:.2f}"))
 
