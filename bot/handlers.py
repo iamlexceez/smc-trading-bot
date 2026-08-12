@@ -272,24 +272,54 @@ class BotHandlers:
 
     @admin_only
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show open positions."""
+        """Show open positions with management history."""
         positions = await self.executor.get_open_positions()
         if not positions:
             await update.message.reply_text("No open positions.")
             return
 
-        lines = ["📈 **Open Positions**\n"]
         total_profit = 0
         for p in positions:
             emoji = "🟢" if p.profit >= 0 else "🔴"
-            lines.append(
-                f"{emoji} #{p.ticket} | {p.direction} {p.volume} {p.symbol}\n"
-                f"   Entry: {p.entry_price:.5f} | SL: {p.sl:.5f} | TP: {p.tp:.5f}\n"
-                f"   PnL: ${p.profit:.2f}"
+            
+            # Fetch logs for this position
+            logs = await db.get_trade_logs(ticket=p.ticket)
+            log_text = ""
+            if logs:
+                log_text = "\n   🛠 **Actions taken**:\n" + "\n".join([f"   • {l['action']}: {l['details']}" for l in logs[-3:]]) # Show last 3 actions
+            else:
+                log_text = "\n   *No automated improvements yet.*"
+
+            text = (
+                f"{emoji} **#{p.ticket} | {p.direction} {p.volume} {p.symbol}**\n"
+                f"Entry: `{p.entry_price:.5f}` | SL: `{p.sl:.5f}` | TP: `{p.tp:.5f}`\n"
+                f"PnL: **${p.profit:.2f}**"
+                f"{log_text}"
             )
+            
+            # Add a "Manage" button for each position
+            keyboard = [[InlineKeyboardButton("🎯 Optimize Position", callback_data=f"manage_{p.ticket}")]]
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             total_profit += p.profit
-        lines.append(f"\n**Total PnL: ${total_profit:.2f}**")
-        await update.message.reply_text("\n".join(lines))
+
+        await update.message.reply_text(f"💰 **Total Open PnL: ${total_profit:.2f}**")
+
+    @admin_only
+    async def cmd_manage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Manually trigger position management."""
+        if not context.args:
+            await update.message.reply_text("Usage: `/manage [ticket_number]`")
+            return
+        
+        try:
+            ticket = int(context.args[0])
+            if self.scheduler:
+                msg = await self.scheduler.manual_manage_position(ticket)
+                await update.message.reply_text(msg, parse_mode="Markdown")
+            else:
+                await update.message.reply_text("❌ Scheduler not initialized.")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid ticket number.")
 
     @admin_only
     async def cmd_close_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1158,6 +1188,14 @@ class BotHandlers:
                 else:
                     await context.bot.send_message(query.message.chat_id, f"No signal for {symbol}.")
             await context.bot.send_message(query.message.chat_id, "Menu:", reply_markup=keyboards.main_menu())
+        elif data.startswith("manage_"):
+            ticket = int(data.split("_")[1])
+            await query.answer(f"Analyzing Position #{ticket}...")
+            if self.scheduler:
+                msg = await self.scheduler.manual_manage_position(ticket)
+                await query.message.reply_text(msg, parse_mode="Markdown")
+            else:
+                await query.message.reply_text("❌ Scheduler not initialized.")
         else:
             await query.edit_message_text("Unknown action.", reply_markup=keyboards.main_menu())
 
@@ -1192,6 +1230,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("add_broker", self.cmd_add_broker))
         app.add_handler(CommandHandler("optimize", self.cmd_optimize))
         app.add_handler(CommandHandler("journal", self.cmd_journal))
+        app.add_handler(CommandHandler("manage", self.cmd_manage))
         app.add_handler(CommandHandler("score", self.cmd_score))
         app.add_handler(CommandHandler("daily_limit", self.cmd_daily_limit))
         app.add_handler(CommandHandler("cooldown", self.cmd_cooldown))

@@ -55,6 +55,17 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 last_trade_time TEXT NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trade_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER,
+                ticket INTEGER,
+                timestamp TEXT NOT NULL,
+                action TEXT NOT NULL,
+                details TEXT,
+                FOREIGN KEY(trade_id) REFERENCES trades(id)
+            )
+        """)
         await db.commit()
 
 
@@ -179,5 +190,30 @@ async def get_recent_trades(days: int = 7, db_path: str = DB_PATH) -> list[dict]
         cursor = await db.execute(
             "SELECT * FROM trades WHERE timestamp >= ?", (since,)
         )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def log_trade_action(ticket: int, action: str, details: str = "", trade_id: int = None, db_path: str = DB_PATH) -> None:
+    """Record a management action for a specific trade."""
+    async with aiosqlite.connect(db_path) as db:
+        now = datetime.utcnow().isoformat()
+        await db.execute(
+            "INSERT INTO trade_logs (trade_id, ticket, timestamp, action, details) VALUES (?, ?, ?, ?, ?)",
+            (trade_id, ticket, now, action, details)
+        )
+        await db.commit()
+
+
+async def get_trade_logs(ticket: int = None, trade_id: int = None, db_path: str = DB_PATH) -> list[dict]:
+    """Retrieve all logs for a specific trade ticket or internal ID."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        if ticket:
+            cursor = await db.execute("SELECT * FROM trade_logs WHERE ticket = ? ORDER BY timestamp ASC", (ticket,))
+        elif trade_id:
+            cursor = await db.execute("SELECT * FROM trade_logs WHERE trade_id = ? ORDER BY timestamp ASC", (trade_id,))
+        else:
+            return []
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]

@@ -130,6 +130,7 @@ async def main():
         BotCommand("account", "Show MT5 account info"),
         BotCommand("optimize", "Trigger AI Weight Tuning"),
         BotCommand("journal", "Daily Institutional AI Journal"),
+        BotCommand("manage", "Optimize Specific Position"),
         BotCommand("settings", "Adjust bot settings"),
         BotCommand("aggressive", "Toggle High-Growth Mode"),
         BotCommand("scalping", "Toggle Scalping mode"),

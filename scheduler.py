@@ -590,9 +590,72 @@ class MarketScheduler:
                     success = await self.executor.modify_position(p.ticket, sl=new_sl, tp=p.tp)
                     if success:
                         logger.info(f"🛡 Modified {symbol} #{p.ticket}: New SL {new_sl:.5f}")
-                        await self._notify(f"🛡 **TRADE MODIFIED: {symbol}**\nTicket: `#{p.ticket}`\nAction: `SL Adjusted (Active Management)`\nNew SL: `{new_sl:.5f}`")
+                        action_type = "Trailing Stop" if current_profit_dist >= risk_dist * 2 else "Breakeven"
+                        await db.log_trade_action(p.ticket, action_type, f"SL moved to {new_sl:.5f} based on ATR and structure.")
+                        await self._notify(f"🛡 **TRADE MODIFIED: {symbol}**\nTicket: `#{p.ticket}`\nAction: `{action_type} Adjusted`\nNew SL: `{new_sl:.5f}`")
         except Exception as e:
             logger.error(f"Error in manage_open_positions: {e}", exc_info=True)
+
+    async def manual_manage_position(self, ticket: int) -> str:
+        """Manually trigger analysis and modification for a specific ticket."""
+        positions = await self.executor.get_open_positions()
+        pos = next((p for p in positions if p.ticket == ticket), None)
+        
+        if not pos:
+            return f"❌ Ticket `#{ticket}` not found in open positions."
+
+        symbol = pos.symbol
+        df = await self.fetch_candles(symbol, "M5", 200)
+        if df.empty:
+            return f"❌ Could not fetch data for {symbol}."
+
+        current_price = df.iloc[-1]["close"]
+        atr_val = atr(df, 14).iloc[-1]
+        
+        # Institutional Analysis for SL/TP
+        # We look for the nearest S/D zone or structural pivot
+        struct = analyze_structure(df)
+        zones = detect_sd_zones(df)
+        
+        new_sl = None
+        new_tp = None
+        
+        if pos.direction == "BUY":
+            # SL below recent swing low or demand zone
+            swing_low = df["low"].tail(20).min()
+            demand = next((z.price_low for z in zones if z.type == ZoneType.DEMAND and z.price_high < current_price), None)
+            new_sl = min(swing_low, demand) if demand else swing_low
+            new_sl -= atr_val * 0.5 # Buffer
+            
+            # TP at next supply zone or swing high
+            swing_high = df["high"].tail(50).max()
+            supply = next((z.price_high for z in zones if z.type == ZoneType.SUPPLY and z.price_low > current_price), None)
+            new_tp = max(swing_high, supply) if supply else swing_high
+        else:
+            # SL above recent swing high or supply zone
+            swing_high = df["high"].tail(20).max()
+            supply = next((z.price_high for z in zones if z.type == ZoneType.SUPPLY and z.price_low > current_price), None)
+            new_sl = max(swing_high, supply) if supply else swing_high
+            new_sl += atr_val * 0.5 # Buffer
+            
+            # TP at next demand zone or swing low
+            swing_low = df["low"].tail(50).min()
+            demand = next((z.price_low for z in zones if z.type == ZoneType.DEMAND and z.price_high < current_price), None)
+            new_tp = min(swing_low, demand) if demand else swing_low
+
+        # Apply modification
+        success = await self.executor.modify_position(ticket, sl=new_sl, tp=new_tp)
+        if success:
+            await db.log_trade_action(ticket, "Manual Optimization", f"Re-analyzed structure. SL: {new_sl:.5f}, TP: {new_tp:.5f}")
+            return (
+                f"✅ **Position #{ticket} Optimized**\n"
+                f"Symbol: `{symbol}`\n"
+                f"New SL: `{new_sl:.5f}`\n"
+                f"New TP: `{new_tp:.5f}`\n\n"
+                f"Analysis: Based on recent M5 swing points and detected S/D zones."
+            )
+        else:
+            return f"❌ Failed to modify position #{ticket}. Check MT5 logs."
 
     async def _reload_settings(self):
         """Reload settings from DB."""
