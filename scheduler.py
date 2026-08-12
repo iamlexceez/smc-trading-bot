@@ -29,7 +29,7 @@ from analysis.visuals import render_smc_chart
 from analysis.profiler import profiler
 from analysis.order_flow import order_flow
 from risk.manager import RiskManager
-from executors.base import BaseExecutor
+from executors.base import BaseExecutor, ExecutionResult
 from data.provider import DataProvider
 from news.filter import NewsFilter
 
@@ -250,6 +250,128 @@ class MarketScheduler:
                 logger.error(f"Error analyzing {symbol}: {e}")
         return signals
 
+    async def execute_signal(self, signal: TradeSignal, df: pd.DataFrame = None) -> bool:
+        """Run risk checks and execute a signal if valid."""
+        symbol = signal.symbol
+        try:
+            # Run risk checks
+            account = await self.executor.get_account_info()
+            equity = account.get("equity", account.get("balance", 0))
+            free_margin = account.get("free_margin", 0)
+            balance = account.get("balance", 10000)
+            today_pnl = await db.get_today_pnl()
+            today_count = await db.get_today_trade_count()
+            open_positions = await self.executor.get_open_positions()
+
+            sym_info = await self.executor.get_symbol_info(symbol)
+            pip = sym_info.get("pip_size", pip_value(symbol))
+            contract = sym_info.get("contract_size", 100000)
+            spread = sym_info.get("spread", 0) * pip
+
+            # Calculate lot size using Dynamic Suggested Risk
+            risk_pct = signal.suggested_risk
+            if self.settings.aggressive_mode:
+                risk_pct = max(risk_pct, self.settings.risk_per_trade * 2.5)
+            
+            risk_pct = min(risk_pct, 10.0)
+            
+            original_risk = self.settings.risk_per_trade
+            self.settings.risk_per_trade = risk_pct
+            
+            lot_size = self.risk_manager.calculate_position_size(
+                balance, signal.entry_price, signal.stop_loss, sym_info
+            )
+            
+            self.settings.risk_per_trade = original_risk
+            
+            leverage = account.get("leverage", 500)
+            required_margin = lot_size * contract * signal.entry_price / leverage
+
+            check_score = signal.score
+            if self.settings.aggressive_mode and check_score >= 50.0:
+                check_score = self.settings.score_threshold
+            
+            risk_result = await self.risk_manager.check_all(
+                symbol=symbol,
+                direction=signal.direction,
+                score=check_score,
+                rr_ratio=signal.rr_ratio,
+                spread_pips=spread / pip if pip > 0 else 0,
+                account_equity=equity,
+                free_margin=free_margin,
+                required_margin=required_margin,
+                today_pnl=today_pnl,
+                today_trade_count=today_count,
+                open_position_count=len(open_positions),
+            )
+
+            if not risk_result.passed:
+                logger.info(f"Signal rejected for {symbol}: {risk_result.reason}")
+                signal.passed = False
+                signal.rejection_reason = risk_result.reason
+                await self._notify(format_signal_report(signal))
+                return False
+
+            # EXPERT LAYERING
+            layers = self.risk_manager.get_layering_plan(
+                lot_size, signal.entry_price, signal.stop_loss, sym_info
+            )
+            
+            results = []
+            for layer in layers:
+                res = await self.executor.execute_trade(
+                    symbol=symbol,
+                    direction=signal.direction,
+                    lot_size=layer["lot"],
+                    sl=signal.stop_loss,
+                    tp=signal.take_profit,
+                    magic=self.settings.magic_number,
+                    comment=layer["comment"],
+                )
+                results.append(res)
+            
+            result = results[0] if results else ExecutionResult(success=False, message="No layers executed")
+
+            if result.success:
+                await db.record_trade(
+                    symbol=symbol,
+                    direction=signal.direction,
+                    entry_price=result.entry_price,
+                    sl_price=result.sl,
+                    tp_price=result.tp,
+                    lot_size=result.lot_size,
+                    score=signal.score,
+                    rr_ratio=signal.rr_ratio,
+                    executor=self.executor.name,
+                    raw_signal=json.dumps({
+                        "factors": [{"name": f.name, "score": f.score, "detail": f.detail}
+                                   for f in signal.factors],
+                    }),
+                )
+                await db.set_symbol_cooldown(symbol)
+                signal.passed = True
+                
+                # Render chart for executed trade if df is provided
+                photo = None
+                if df is not None:
+                    # Detect structure and zones for chart
+                    from analysis.structure import detect_market_structure
+                    from analysis.supply_demand import detect_sd_zones
+                    structure = detect_market_structure(df)
+                    zones = detect_sd_zones(df)
+                    photo = render_smc_chart(df, symbol, structure, zones, signal=signal)
+                
+                await self._notify(f"✅ **TRADE EXECUTED**\n\n{format_signal_report(signal)}", photo=photo)
+                logger.info(f"Trade executed: {symbol} {signal.direction} score={signal.score:.1f}")
+                return True
+            else:
+                await self._notify(f"❌ Trade execution failed for {symbol}: {result.message}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error executing signal for {symbol}: {e}", exc_info=True)
+            return False
+
     async def scan_and_execute(self):
         """Main loop: scan markets, check risk gates, execute trades."""
         await self._reload_settings()
@@ -297,6 +419,7 @@ class MarketScheduler:
                         logger.info(f"News blackout for {symbol}: {news_result.reason}")
                         continue
 
+                # For the background loop, we analyze and execute
                 signal = await self.analyze_symbol(symbol)
                 if not signal or signal.score < self.settings.score_threshold:
                     continue
@@ -304,117 +427,12 @@ class MarketScheduler:
                 # Notify potential setup found
                 await self._notify(f"🔍 **POTENTIAL SETUP FOUND: {symbol}**\nDirection: `{signal.direction}`\nScore: `{signal.score:.1f}%`\nAnalyzing risk gates...")
 
-                # Run risk checks
-                account = await self.executor.get_account_info()
-                equity = account.get("equity", account.get("balance", 0))
-                free_margin = account.get("free_margin", 0)
-                balance = account.get("balance", 10000)
-                today_pnl = await db.get_today_pnl()
-                today_count = await db.get_today_trade_count()
-                open_positions = await self.executor.get_open_positions()
-
-                sym_info = await self.executor.get_symbol_info(symbol)
-                pip = sym_info.get("pip_size", pip_value(symbol))
-                contract = sym_info.get("contract_size", 100000)
-                spread = sym_info.get("spread", 0) * pip
-
-                # Calculate lot size using Dynamic Suggested Risk
-                # If aggressive mode is ON, we use the higher of (user setting * 2.5) or (suggested risk)
-                risk_pct = signal.suggested_risk
-                if self.settings.aggressive_mode:
-                    risk_pct = max(risk_pct, self.settings.risk_per_trade * 2.5)
+                # Fetch data for the chart if signal passed
+                primary_tf = "M1" if self.settings.aggressive_mode else "M15"
+                df = await self.fetch_candles(symbol, primary_tf, 500)
                 
-                # Cap risk at 10% as requested by user
-                risk_pct = min(risk_pct, 10.0)
-                
-                # Temporarily override risk for calculation
-                original_risk = self.settings.risk_per_trade
-                self.settings.risk_per_trade = risk_pct
-                
-                lot_size = self.risk_manager.calculate_position_size(
-                    balance, signal.entry_price, signal.stop_loss, sym_info
-                )
-                
-                # Restore original risk
-                self.settings.risk_per_trade = original_risk
-                
-                # Estimate required margin
-                contract = sym_info.get("contract_size", 100000)
-                leverage = account.get("leverage", 500)
-                required_margin = lot_size * contract * signal.entry_price / leverage
-
-                # In aggressive mode, lower the score threshold slightly to 50%
-                check_score = signal.score
-                if self.settings.aggressive_mode and check_score >= 50.0:
-                    check_score = self.settings.score_threshold # Fake a pass
-                
-                risk_result = await self.risk_manager.check_all(
-                    symbol=symbol,
-                    direction=signal.direction,
-                    score=check_score,
-                    rr_ratio=signal.rr_ratio,
-                    spread_pips=spread / pip if pip > 0 else 0,
-                    account_equity=equity,
-                    free_margin=free_margin,
-                    required_margin=required_margin,
-                    today_pnl=today_pnl,
-                    today_trade_count=today_count,
-                    open_position_count=len(open_positions),
-                )
-
-                if not risk_result.passed:
-                    logger.info(f"Signal rejected for {symbol}: {risk_result.reason}")
-                    signal.passed = False
-                    signal.rejection_reason = risk_result.reason
-                    await self._notify(format_signal_report(signal))
-                    continue
-
-                # EXPERT LAYERING: Split the trade into 3 entries
-                layers = self.risk_manager.get_layering_plan(
-                    lot_size, signal.entry_price, signal.stop_loss, sym_info
-                )
-                
-                results = []
-                for layer in layers:
-                    res = await self.executor.execute_trade(
-                        symbol=symbol,
-                        direction=signal.direction,
-                        lot_size=layer["lot"],
-                        sl=signal.stop_loss,
-                        tp=signal.take_profit,
-                        magic=self.settings.magic_number,
-                        comment=layer["comment"],
-                    )
-                    results.append(res)
-                
-                # Use the first successful result for reporting
-                result = results[0] if results else ExecutionResult(success=False, message="No layers executed")
-
-                if result.success:
-                    await db.record_trade(
-                        symbol=symbol,
-                        direction=signal.direction,
-                        entry_price=result.entry_price,
-                        sl_price=result.sl,
-                        tp_price=result.tp,
-                        lot_size=result.lot_size,
-                        score=signal.score,
-                        rr_ratio=signal.rr_ratio,
-                        executor=self.executor.name,
-                        raw_signal=json.dumps({
-                            "factors": [{"name": f.name, "score": f.score, "detail": f.detail}
-                                       for f in signal.factors],
-                        }),
-                    )
-                    await db.set_symbol_cooldown(symbol)
-                    signal.passed = True
-                    
-                    # Render chart for executed trade
-                    chart = render_smc_chart(df, symbol, structure, zones, signal=signal)
-                    await self._notify(f"✅ **TRADE EXECUTED**\n\n{format_signal_report(signal)}", photo=chart)
-                    logger.info(f"Trade executed: {symbol} {signal.direction} score={signal.score:.1f}")
-                else:
-                    await self._notify(f"❌ Trade execution failed for {symbol}: {result.message}")
+                # Execute
+                await self.execute_signal(signal, df)
 
             except Exception as e:
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)

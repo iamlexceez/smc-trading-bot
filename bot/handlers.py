@@ -209,16 +209,33 @@ class BotHandlers:
 
     @admin_only
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Trigger a market scan."""
+        """Trigger a market scan and auto-execute valid signals."""
         if self.scheduler:
-            await update.message.reply_text("🔍 **MANUAL SCAN INITIATED**\n_Note: This command is for analysis only. The background scheduler handles actual execution._")
-            results = await self.scheduler.scan_markets()
-            if not results:
+            await update.message.reply_text("🔍 **MANUAL SCAN & EXECUTION INITIATED**\n_Scanning for high-probability setups..._")
+            
+            # Use the existing scan logic
+            signals = []
+            for symbol in self.scheduler.settings.enabled_symbols:
+                try:
+                    # 1. Fetch data
+                    primary_tf = "M1" if self.scheduler.settings.aggressive_mode else "M15"
+                    df = await self.scheduler.fetch_candles(symbol, primary_tf, 500)
+                    if df.empty: continue
+                    
+                    # 2. Analyze
+                    signal = await self.scheduler.analyze_symbol(symbol)
+                    if not signal or signal.score < self.scheduler.settings.score_threshold:
+                        continue
+                    
+                    # 3. Auto-Execute
+                    await self.scheduler.execute_signal(signal, df)
+                    signals.append(signal)
+                    
+                except Exception as e:
+                    logger.error(f"Error in manual scan for {symbol}: {e}")
+
+            if not signals:
                 await update.message.reply_text("No tradeable setups found at this time.")
-            else:
-                for signal in results:
-                    signal.rejection_reason = "Manual Scan (No Execution)"
-                    await update.message.reply_text(format_signal_report(signal))
         else:
             await update.message.reply_text("Scheduler not initialized.")
 
