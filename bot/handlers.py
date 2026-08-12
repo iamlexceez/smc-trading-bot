@@ -432,6 +432,35 @@ class BotHandlers:
         )
 
     @admin_only
+    async def cmd_focus_indices(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Toggle Index Focus Mode."""
+        if not context.args:
+            status = "ON" if self.settings.index_focus else "OFF"
+            await update.message.reply_text(f"📊 Index Focus Mode is currently **{status}**.\nUse `/focus_indices on` or `/focus_indices off` to toggle.")
+            return
+
+        arg = context.args[0].lower()
+        if arg == "on":
+            self.settings.index_focus = True
+            # Move all Volatility indices to the front of enabled_symbols
+            indices = [s for s in self.settings.enabled_symbols if "Volatility" in s]
+            others = [s for s in self.settings.enabled_symbols if "Volatility" not in s]
+            self.settings.enabled_symbols = indices + others
+            
+            await db.save_settings(self.settings)
+            await update.message.reply_text(
+                "🎯 **INDEX FOCUS ACTIVATED**\n\n"
+                "The bot will now prioritize **Volatility Indices** for scans and execution.\n"
+                "This is recommended for smaller accounts ($200) to pass margin checks."
+            )
+        elif arg == "off":
+            self.settings.index_focus = False
+            await db.save_settings(self.settings)
+            await update.message.reply_text("🛡 **INDEX FOCUS DEACTIVATED**\nReturning to standard symbol priority.")
+        else:
+            await update.message.reply_text("Usage: `/focus_indices on` or `/focus_indices off`")
+
+    @admin_only
     async def cmd_scalping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Toggle Scalping Mode (M1/M5 timeframes)."""
         if not context.args:
@@ -919,6 +948,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("scalping", self.cmd_scalping))
         app.add_handler(CommandHandler("toggle_symbol", self.cmd_toggle_symbol))
         app.add_handler(CommandHandler("expert_mode", self.cmd_expert_mode))
+        app.add_handler(CommandHandler("focus_indices", self.cmd_focus_indices))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("risk", self.cmd_risk))
         app.add_handler(CommandHandler("rr", self.cmd_rr))
