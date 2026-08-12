@@ -121,6 +121,22 @@ async def main():
     )
     handlers.setup(app)
 
+    # Set bot commands menu
+    from telegram import BotCommand
+    commands = [
+        BotCommand("start", "Show main menu"),
+        BotCommand("scan", "Scan enabled symbols for signals"),
+        BotCommand("account", "Show MT5 account info"),
+        BotCommand("positions", "Show open positions"),
+        BotCommand("settings", "Adjust bot settings"),
+        BotCommand("debug_mt5", "Run MT5 health check"),
+        BotCommand("aggressive", "Toggle Aggressive Growth mode"),
+        BotCommand("scalping", "Toggle M1/M5 Scalping mode"),
+        BotCommand("expert_mode", "Activate institutional expert pairs"),
+        BotCommand("help", "Show all commands"),
+    ]
+    await app.bot.set_my_commands(commands)
+
     # Start scheduler
     await scheduler.start(interval_seconds=300)  # 5 minute scan interval
 

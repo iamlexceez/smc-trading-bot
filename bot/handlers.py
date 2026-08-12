@@ -113,41 +113,58 @@ class BotHandlers:
             f"🤖 **SMC Trading Bot**\n\n"
             f"Mode: `{self.settings.trading_mode.upper()}`\n"
             f"Auto-Trade: {'✅ ON' if self.settings.auto_trade else '❌ OFF'}\n"
-            f"Paused: {'⏸ YES' if self.settings.is_paused else '▶️ NO'}\n\n"
+            f"Paused: {'⏸ YES' if self.settings.is_paused else '▶️ NO'}\n"
+            f"Aggressive: {'🔥 YES' if self.settings.aggressive_mode else '🛡 NO'}\n\n"
             f"Risk/trade: {self.settings.risk_per_trade}%\n"
             f"Min RR: 1:{self.settings.min_rr_ratio}\n"
             f"Score threshold: {self.settings.score_threshold}%\n\n"
-            f"Symbols: {', '.join(self.settings.symbols[:5])}{'...' if len(self.settings.symbols) > 5 else ''}\n"
+            f"Enabled Symbols: {', '.join(self.settings.enabled_symbols[:5])}{'...' if len(self.settings.enabled_symbols) > 5 else ''}\n"
             f"Timeframes: {', '.join(self.settings.timeframes)}\n\n"
             f"Choose an option below 👇"
         )
-        await update.message.reply_text(text, reply_markup=keyboards.main_menu())
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=keyboards.main_menu())
+        else:
+            await update.message.reply_text(text, reply_markup=keyboards.main_menu())
 
     @admin_only
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help message."""
         help_text = (
             "🤖 **SMC Trading Bot Commands**\n\n"
+            "**Core Commands:**\n"
             "/start - Show main menu\n"
-            "/scan - Scan all symbols for signals\n"
-            "/analyze [symbol] - Deep analysis of a symbol\n"
+            "/scan - Scan enabled symbols for signals\n"
+            "/account - Show MT5 account info\n"
             "/positions - Show open positions\n"
             "/close_all - Close all open positions\n"
             "/settings - Adjust bot settings\n"
-            "/account - Show MT5 account info\n"
-            "/debug_mt5 - Run MT5 health & permission check\n"
-            "/history - Show recent trade history\n"
-            "/pause - Pause auto-trading\n"
-            "/resume - Resume auto-trading\n"
-            "/mode [demo|live] - Switch execution mode\n"
-            "/risk [pct] - Set risk per trade (e.g. /risk 1.0)\n"
-            "/rr [ratio] - Set min RR ratio (e.g. /rr 3.0)\n"
-            "/score [val] - Set score threshold (e.g. /score 60)\n"
-            "/backtest [symbol] [tf] [days] - Run a backtest\n"
+            "/debug_mt5 - Run MT5 health & permission check\n\n"
+            "**Pro Features:**\n"
+            "/aggressive [on|off] - Toggle Aggressive Growth mode\n"
+            "/scalping [on|off] - Toggle M1/M5 Scalping mode\n"
+            "/target [amount] - Set cycle target balance\n"
+            "/burn_to [amount] - Burn demo balance to target\n"
+            "/set_balance [amount] - Set virtual risk balance\n\n"
+            "**Symbol Management:**\n"
+            "/expert_mode - Activate institutional expert pairs\n"
+            "/focus_indices [on|off] - Prioritize Volatility Indices\n"
+            "/toggle_symbol [name] - Enable/Disable a specific pair\n\n"
+            "**Advanced:**\n"
             "/sessions - Check trading session status\n"
-            "/news - Check news filter status"
+            "/sessions_all - Enable all-session trading\n"
+            "/news - Check news filter status\n"
+            "/history - Show recent trade history\n"
+            "/backtest [symbol] [tf] [days] - Run a backtest"
         )
         await update.message.reply_text(help_text)
+
+    @admin_only
+    async def cmd_sessions_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enable all trading sessions."""
+        self.settings.enabled_sessions = ["all"]
+        await db.save_settings(self.settings)
+        await update.message.reply_text("🌍 **ALL SESSIONS ENABLED**\nThe bot will now trade 24/5.")
 
     @admin_only
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -732,12 +749,14 @@ class BotHandlers:
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard callbacks."""
         query = update.callback_query
+        # Always answer to stop the loading spinner
         await query.answer()
         data = query.data
 
         if data == "main":
             await self.cmd_start(update, context)
-            await query.message.delete()
+        elif data == "cancel":
+            await query.edit_message_text("Action cancelled.", reply_markup=keyboards.main_menu())
         elif data == "scan":
             await self.cmd_scan(update, context)
         elif data == "positions":
@@ -746,6 +765,8 @@ class BotHandlers:
             await self.cmd_settings(update, context)
         elif data == "account":
             await self.cmd_account(update, context)
+        elif data == "debug_mt5":
+            await self.cmd_debug_mt5(update, context)
         elif data == "history":
             await self.cmd_history(update, context)
         elif data == "analyze":
@@ -758,7 +779,7 @@ class BotHandlers:
             await self.cmd_close_all(update, context)
         elif data == "confirm_close_all":
             closed = await self.executor.close_all_positions()
-            await query.edit_message_text(f"✅ Closed {closed} positions.")
+            await query.edit_message_text(f"✅ Closed {closed} positions.", reply_markup=keyboards.main_menu())
         elif data == "set_autotrade":
             await query.edit_message_text(
                 f"Auto-Trade is currently {'ON ✅' if self.settings.auto_trade else 'OFF ❌'}",
@@ -810,6 +831,50 @@ class BotHandlers:
                 await query.edit_message_text("⚠️ LIVE mode enabled. Real trades will execute.", reply_markup=keyboards.settings_menu())
             else:
                 await query.edit_message_text("❌ Failed to connect to Live account. Check .env.", reply_markup=keyboards.settings_menu())
+        elif data == "toggle_aggressive":
+            self.settings.aggressive_mode = not self.settings.aggressive_mode
+            await db.save_settings(self.settings)
+            status = "ON 🔥" if self.settings.aggressive_mode else "OFF 🛡"
+            await query.edit_message_text(f"Aggressive Growth is now **{status}**.", reply_markup=keyboards.settings_menu())
+        elif data == "toggle_scalping":
+            is_scalping = "M1" in self.settings.timeframes
+            if is_scalping:
+                self.settings.timeframes = [tf for tf in self.settings.timeframes if tf not in ["M1", "M5"]]
+                if not self.settings.timeframes: self.settings.timeframes = ["M15", "H1", "H4"]
+                status = "OFF 🛡"
+            else:
+                new_tfs = ["M1", "M5"]
+                for tf in self.settings.timeframes:
+                    if tf not in new_tfs: new_tfs.append(tf)
+                self.settings.timeframes = new_tfs
+                status = "ON ⏱"
+            await db.save_settings(self.settings)
+            await query.edit_message_text(f"Scalping Mode is now **{status}**.", reply_markup=keyboards.settings_menu())
+        elif data == "toggle_index_focus":
+            self.settings.index_focus = not self.settings.index_focus
+            if self.settings.index_focus:
+                indices = [s for s in self.settings.enabled_symbols if "Volatility" in s]
+                others = [s for s in self.settings.enabled_symbols if "Volatility" not in s]
+                self.settings.enabled_symbols = indices + others
+            await db.save_settings(self.settings)
+            status = "ON 🎯" if self.settings.index_focus else "OFF 🛡"
+            await query.edit_message_text(f"Index Focus is now **{status}**.", reply_markup=keyboards.settings_menu())
+        elif data == "confirm_expert_mode":
+            await query.edit_message_text(
+                "⚠️ Activate Expert Mode? This will focus on high-probability institutional pairs.",
+                reply_markup=keyboards.confirm_keyboard("expert_mode")
+            )
+        elif data == "confirm_confirm_expert_mode":
+            expert_selection = ["Volatility 75 Index", "Volatility 100 Index", "Volatility 10 Index", "Volatility 25 Index", "EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+            for s in expert_selection:
+                if s not in self.settings.symbols: self.settings.symbols.append(s)
+            self.settings.enabled_symbols = [s for s in expert_selection]
+            await db.save_settings(self.settings)
+            await query.edit_message_text("🏆 **EXPERT MODE ACTIVATED**", reply_markup=keyboards.settings_menu())
+        elif data == "set_target":
+            await query.edit_message_text("Use command: `/target [amount]` to set a balance goal.", reply_markup=keyboards.settings_menu())
+        elif data == "set_virtual_balance":
+            await query.edit_message_text("Use command: `/set_balance [amount]` to set a virtual balance for risk.", reply_markup=keyboards.settings_menu())
         elif data == "set_risk":
             await query.edit_message_text(
                 f"Current risk per trade: {self.settings.risk_per_trade}%\nUse command: /risk 1.5\n(Range: 0.1% - 10%)",
@@ -873,15 +938,15 @@ class BotHandlers:
                 "Crash 500 Index", "Crash 1000 Index",
             ]
             await query.edit_message_text(
-                "Toggle symbols (✅ = active):",
-                reply_markup=keyboards.symbol_select_keyboard(all_symbols, self.settings.symbols)
+                "Toggle symbols (✅ = enabled):",
+                reply_markup=keyboards.symbol_select_keyboard(all_symbols, self.settings.enabled_symbols)
             )
         elif data.startswith("sym_"):
             sym = data.replace("sym_", "")
-            if sym in self.settings.symbols:
-                self.settings.symbols.remove(sym)
+            if sym in self.settings.enabled_symbols:
+                self.settings.enabled_symbols.remove(sym)
             else:
-                self.settings.symbols.append(sym)
+                self.settings.enabled_symbols.append(sym)
             await db.save_settings(self.settings)
             all_symbols = [
                 "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD",
@@ -890,11 +955,11 @@ class BotHandlers:
                 "Crash 500 Index", "Crash 1000 Index",
             ]
             await query.edit_message_text(
-                "Toggle symbols (✅ = active):",
-                reply_markup=keyboards.symbol_select_keyboard(all_symbols, self.settings.symbols)
+                "Toggle symbols (✅ = enabled):",
+                reply_markup=keyboards.symbol_select_keyboard(all_symbols, self.settings.enabled_symbols)
             )
         elif data == "set_timeframes":
-            all_tfs = ["M5", "M15", "M30", "H1", "H4", "D1"]
+            all_tfs = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
             await query.edit_message_text(
                 "Toggle timeframes (✅ = active):",
                 reply_markup=keyboards.timeframe_select_keyboard(all_tfs, self.settings.timeframes)
@@ -907,7 +972,7 @@ class BotHandlers:
             else:
                 self.settings.timeframes.append(tf)
             await db.save_settings(self.settings)
-            all_tfs = ["M5", "M15", "M30", "H1", "H4", "D1"]
+            all_tfs = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
             await query.edit_message_text(
                 "Toggle timeframes (✅ = active):",
                 reply_markup=keyboards.timeframe_select_keyboard(all_tfs, self.settings.timeframes)
@@ -955,6 +1020,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("score", self.cmd_score))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))
         app.add_handler(CommandHandler("sessions", self.cmd_sessions))
+        app.add_handler(CommandHandler("sessions_all", self.cmd_sessions_all))
         app.add_handler(CommandHandler("news", self.cmd_news))
         app.add_handler(CallbackQueryHandler(self.handle_callback))
         self.app = app
