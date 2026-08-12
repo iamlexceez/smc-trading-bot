@@ -124,7 +124,16 @@ class TradeSettings:
                 return val
             if isinstance(val, str):
                 return [s.strip() for s in val.split(",") if s.strip()]
-            return default or []
+            # If default is provided, parse it too if it's a string
+            if default is not None:
+                if isinstance(default, list):
+                    return default
+                if isinstance(default, str):
+                    return [s.strip() for s in default.split(",") if s.strip()]
+            return []
+
+        # Parse master symbols first
+        symbols_list = parse_list(d.get("symbols"))
 
         return cls(
             risk_per_trade=float(d.get("risk_per_trade", 1.0)),
@@ -141,10 +150,10 @@ class TradeSettings:
             target_balance=float(d["target_balance"]) if d.get("target_balance") else None,
             auto_trade=parse_bool(d.get("auto_trade", "false")),
             is_paused=parse_bool(d.get("is_paused", "false")),
-            symbols=parse_list(d.get("symbols")),
-            enabled_symbols=parse_list(d.get("enabled_symbols"), d.get("symbols")),
-            timeframes=parse_list(d.get("timeframes")),
-            htf_timeframes=parse_list(d.get("htf_timeframes")),
+            symbols=symbols_list,
+            enabled_symbols=parse_list(d.get("enabled_symbols"), symbols_list),
+            timeframes=parse_list(d.get("timeframes"), ["M15", "H1", "H4"]),
+            htf_timeframes=parse_list(d.get("htf_timeframes"), ["H1", "H4", "D1"]),
             trading_mode=d.get("trading_mode", "demo"),
             magic_number=int(d.get("magic_number", 20260807)),
             require_zone_retest=parse_bool(d.get("require_zone_retest", "true"), True),
