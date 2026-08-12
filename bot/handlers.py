@@ -405,19 +405,38 @@ class BotHandlers:
                         )
                     break
 
-                # Open a high-lot trade to burn balance (e.g. 50 lots on a volatile pair)
-                # We use a large spread/lot to lose money quickly via spread + small movement
-                symbol = self.settings.symbols[0] if self.settings.symbols else "EURUSD"
+                # Find the first available symbol that actually works in MT5
+                burn_symbol = "EURUSD"
+                for sym in self.settings.symbols:
+                    sym_info = await self.executor.get_symbol_info(sym)
+                    if sym_info.get("visible"):
+                        burn_symbol = sym
+                        break
+                
+                # Open a high-lot trade to burn balance
+                # For Deriv, lot sizes can be large. We'll try 50 lots.
                 await self.executor.execute_trade(
-                    symbol=symbol,
+                    symbol=burn_symbol,
                     direction="BUY",
-                    lot_size=20.0,
+                    lot_size=50.0,
                     sl=0,
                     tp=0,
                     magic=999999,
                     comment="BALANCE BURN"
                 )
-                await asyncio.sleep(2) # Wait for equity to update
+                
+                # Also open a SELL to hedge and lock in the spread loss quickly
+                await self.executor.execute_trade(
+                    symbol=burn_symbol,
+                    direction="SELL",
+                    lot_size=50.0,
+                    sl=0,
+                    tp=0,
+                    magic=999999,
+                    comment="BALANCE BURN"
+                )
+                
+                await asyncio.sleep(3) # Wait for equity to update
                 
         except Exception as e:
             logger.error(f"Burn process error: {e}")
