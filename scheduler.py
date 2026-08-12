@@ -61,6 +61,7 @@ class MarketScheduler:
             impact_levels=settings.news_impact_levels,
             blackout_minutes=settings.news_blackout_minutes,
         )
+        self.last_structure_events = {}  # symbol -> last StructureEvent
 
     async def start(self, interval_seconds: int = 300):
         """Start the periodic market scanner."""
@@ -101,6 +102,14 @@ class MarketScheduler:
 
         # Run structure analysis
         structure = analyze_structure(df, lookback=3)
+        
+        # Check for new structural events (BOS/CHoCH)
+        from analysis.structure import StructureEvent
+        last_event = self.last_structure_events.get(symbol, StructureEvent.NONE)
+        if structure.last_event != StructureEvent.NONE and structure.last_event != last_event:
+            self.last_structure_events[symbol] = structure.last_event
+            event_name = structure.last_event.value.replace("_", " ").upper()
+            await self._notify(f"📢 **MARKET STRUCTURE CHANGE: {symbol}**\nEvent: `{event_name}`\nTrend: `{structure.trend.value.upper()}`\nZone: `{structure.current_zone.upper()}`")
 
         # Run S/D zone detection
         zones = detect_sd_zones(df, lookback=100)
@@ -232,6 +241,9 @@ class MarketScheduler:
                 signal = await self.analyze_symbol(symbol)
                 if not signal or signal.score < self.settings.score_threshold:
                     continue
+                
+                # Notify potential setup found
+                await self._notify(f"🔍 **POTENTIAL SETUP FOUND: {symbol}**\nDirection: `{signal.direction}`\nScore: `{signal.score:.1f}%`\nAnalyzing risk gates...")
 
                 # Run risk checks
                 account = await self.executor.get_account_info()
@@ -312,12 +324,27 @@ class MarketScheduler:
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
     async def _notify(self, message: str):
-        """Send notification to admin via Telegram."""
+        """Send notification to admin via Telegram and WhatsApp if configured."""
+        # Telegram
         if self.bot_app and self.admin_chat_id:
             try:
                 await self.bot_app.bot.send_message(self.admin_chat_id, message)
             except Exception as e:
-                logger.error(f"Failed to send notification: {e}")
+                logger.error(f"Failed to send Telegram notification: {e}")
+        
+        # WhatsApp (via CallMeBot relay)
+        wa_phone = os.getenv("WHATSAPP_PHONE")
+        wa_apikey = os.getenv("WHATSAPP_APIKEY")
+        if wa_phone and wa_apikey:
+            try:
+                import requests
+                import urllib.parse
+                clean_msg = message.replace("**", "").replace("`", "")
+                encoded_msg = urllib.parse.quote(clean_msg)
+                url = f"https://api.callmebot.com/whatsapp.php?phone={wa_phone}&text={encoded_msg}&apikey={wa_apikey}"
+                requests.get(url, timeout=10)
+            except Exception as e:
+                logger.error(f"Failed to send WhatsApp notification: {e}")
 
     async def _reload_settings(self):
         """Reload settings from DB."""

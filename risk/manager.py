@@ -68,8 +68,9 @@ class RiskManager:
         checks.append(("Symbol not in cooldown", not in_cooldown,
                        f"cooldown={self.settings.symbol_cooldown_minutes}min"))
 
-        # 4. Daily loss limit (calculated against real account equity)
-        daily_loss_limit = account_equity * (self.settings.max_daily_loss_pct / 100)
+        # 4. Daily loss limit (calculated against virtual balance if set, else real equity)
+        base_equity = self.settings.virtual_balance if self.settings.virtual_balance else account_equity
+        daily_loss_limit = base_equity * (self.settings.max_daily_loss_pct / 100)
         passed = today_pnl > -daily_loss_limit
         checks.append(("Daily loss limit", passed,
                        f"pnl={today_pnl:.2f}, limit=-{daily_loss_limit:.2f}"))
@@ -123,7 +124,8 @@ class RiskManager:
         Calculate lot size based on risk percentage.
         lot = (balance * risk%) / (SL_distance_in_pips * pip_value_per_lot)
         """
-        risk_amount = account_balance * (self.settings.risk_per_trade / 100)
+        base_balance = self.settings.virtual_balance if self.settings.virtual_balance else account_balance
+        risk_amount = base_balance * (self.settings.risk_per_trade / 100)
         sl_distance_pips = abs(entry_price - stop_loss) / pip_size
         if sl_distance_pips <= 0:
             return 0.0

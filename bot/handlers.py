@@ -334,6 +334,29 @@ class BotHandlers:
         await update.message.reply_text("▶️ Auto-trading resumed.")
 
     @admin_only
+    async def cmd_set_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set a virtual balance for risk calculations."""
+        if not context.args:
+            await update.message.reply_text("Usage: /set_balance [amount] (e.g. /set_balance 500) or /set_balance reset")
+            return
+
+        arg = context.args[0].lower()
+        if arg == "reset":
+            self.settings.virtual_balance = None
+            await db.save_settings(self.settings)
+            await update.message.reply_text("✅ Virtual balance reset. Using real MT5 balance for risk.")
+        else:
+            try:
+                val = float(arg)
+                if val <= 0:
+                    raise ValueError
+                self.settings.virtual_balance = val
+                await db.save_settings(self.settings)
+                await update.message.reply_text(f"✅ Virtual balance set to **${val:,.2f}**. Risk will be calculated from this amount.")
+            except ValueError:
+                await update.message.reply_text("❌ Invalid amount. Please enter a positive number.")
+
+    @admin_only
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Switch execution mode."""
         if context.args and context.args[0].lower() in ("demo", "live"):
@@ -663,6 +686,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("history", self.cmd_history))
         app.add_handler(CommandHandler("pause", self.cmd_pause))
         app.add_handler(CommandHandler("resume", self.cmd_resume))
+        app.add_handler(CommandHandler("set_balance", self.cmd_set_balance))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("risk", self.cmd_risk))
         app.add_handler(CommandHandler("rr", self.cmd_rr))

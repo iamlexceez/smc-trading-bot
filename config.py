@@ -61,6 +61,7 @@ class TradeSettings:
     score_threshold: float = 60.0  # Raised from 40 to 60
     max_spread_pips: float = 5.0
     symbol_cooldown_minutes: int = 30
+    virtual_balance: Optional[float] = None
 
     # Auto-trade
     auto_trade: bool = False
@@ -127,6 +128,7 @@ class TradeSettings:
             score_threshold=float(d.get("score_threshold", 60.0)),
             max_spread_pips=float(d.get("max_spread_pips", 5.0)),
             symbol_cooldown_minutes=int(d.get("symbol_cooldown_minutes", 30)),
+            virtual_balance=float(d["virtual_balance"]) if d.get("virtual_balance") else None,
             auto_trade=parse_bool(d.get("auto_trade", "false")),
             is_paused=parse_bool(d.get("is_paused", "false")),
             symbols=parse_list(d.get("symbols")),
@@ -159,6 +161,7 @@ class TradeSettings:
             score_threshold=float(os.getenv("SCORE_THRESHOLD", "60.0")),
             max_spread_pips=float(os.getenv("MAX_SPREAD_PIPS", "5.0")),
             symbol_cooldown_minutes=int(os.getenv("SYMBOL_COOLDOWN_MINUTES", "30")),
+            virtual_balance=float(os.getenv("VIRTUAL_BALANCE")) if os.getenv("VIRTUAL_BALANCE") else None,
             auto_trade=os.getenv("AUTO_TRADE", "false").lower() == "true",
             is_paused=False,
             symbols=[s.strip() for s in os.getenv("SYMBOLS", "EURUSD,GBPUSD,USDJPY,XAUUSD,Volatility 75 Index,Boom 500 Index,Crash 500 Index").split(",")],
