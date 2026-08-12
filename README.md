@@ -1,98 +1,90 @@
-# 🤖 SMC Trading Bot
+# 🤖 SMC Trading Bot: Institutional Powerhouse Edition (10/10)
 
-A Telegram-controlled trading bot that uses **APA (Advanced Price Action)** and **Supply & Demand** strategies to analyze currency pairs, synthetic indices, and gold. It scores each setup using a 7-factor system, and auto-executes trades that pass a configurable threshold with a minimum 1:3 risk-reward ratio.
-
-## ⚠️ Disclaimer
-
-This is a configurable rule engine, not a guaranteed profitable system. Trading involves substantial risk of loss. Always test in paper mode first. The authors are not responsible for any financial losses.
+A high-frequency, institutional-grade trading bot that leverages **Advanced SMC/ICT Price Action**, **Multi-Broker Arbitrage**, and **AI-Driven Self-Optimization**. Built for professional traders who demand precision, autonomy, and data-backed execution.
 
 ---
 
-## Features
+## 🏆 Institutional Features (10/10 Upgrade)
 
-- **APA Market Structure**: Swing detection, BOS/CHoCH, order blocks, FVGs, liquidity pools, premium/discount zones
-- **Supply & Demand Zones**: Rally-Base-Drop, Drop-Base-Rally patterns with freshness and strength scoring
-- **7-Factor Scoring Engine**: Structure alignment, S/D zones, order blocks, FVG, liquidity sweep, RR ratio, MTF confluence
-- **Auto-Execution**: Trades that pass the score threshold AND all risk gates execute automatically
-- **Risk Management**: Max daily loss, max trades/day, max positions, symbol cooldown, spread checks, margin checks
-- **Telegram Control**: Full settings adjustment, position management, analysis viewing — all from Telegram
-- **Paper & Live Modes**: Test safely in paper mode, switch to live MT5 execution when ready
-- **VPS Ready**: Docker support, systemd service files, Wine+MT5 guide
+### 1. 🧠 Self-Optimization AI Brain
+The bot features a self-correcting engine that analyzes every trade (win or loss). It automatically tunes its scoring weights every week based on performance, ensuring the bot adapts to changing market conditions without manual intervention.
 
-## Quick Start
+### 2. ⚡️ Multi-Broker Sync & Arbitrage
+Connect multiple MT5 terminals simultaneously. The bot monitors price lags across brokers to execute risk-free arbitrage hedges and synchronizes trades across accounts for advanced risk distribution.
+
+### 3. 🌊 AI Sentiment Analysis
+Integrated with LLM-driven sentiment analysis. The bot filters setups by scanning global news and market sentiment in real-time, ensuring it only trades when technicals align with the broader market narrative.
+
+### 4. 🧬 Symbol DNA Profiling
+Adaptive analysis that studies the unique personality of each pair. It auto-tunes ATR multipliers, SL buffers, and lot-sizing DNA for specific instruments like Volatility Indices vs. Major Forex pairs.
+
+### 5. 🏹 3-Layer Expert Execution
+Instead of single entries, the bot uses institutional layering. It splits positions into three layers with varying TP targets and dynamic breakeven triggers to lock in profits early while letting runners hit massive R:R targets.
+
+---
+
+## 🛠 Features
+
+- **Advanced SMC/ICT**: BOS/CHoCH, ICT Kill Zones, OTE Fibonacci, Fair Value Gaps (FVG), and Liquidity Sweeps.
+- **12-Factor Scoring Engine**: Multi-timeframe confluence, order flow intensity, and sentiment-weighted scoring.
+- **Hyper Burner Mode**: Specialized algorithm for demo accounts to reach specific target balances via high-frequency hedged cycling.
+- **Visual Alerting**: Matplotlib-rendered charts sent directly to Telegram for every setup and structure change.
+- **Multi-Channel Notifications**: Instant alerts via Telegram and WhatsApp (CallMeBot integration).
+
+---
+
+## 🚀 Quick Start
 
 ```bash
-# 1. Clone
-git clone https://github.com/YOUR_USERNAME/smc-trading-bot.git
-cd smc-trading-bot
+# 1. Update from GitHub
+git pull origin main
 
-# 2. Configure
-cp .env.example .env
-# Edit .env with your Telegram bot token and admin ID
-
-# 3. Install
+# 2. Install New Dependencies
 pip install -r requirements.txt
 
-# 4. Run (paper mode by default)
+# 3. Configure .env
+# Add OPENAI_API_KEY for Sentiment Analysis
+# Add Broker credentials for Multi-Broker Sync
+
+# 4. Run
 python main.py
 ```
 
-## Telegram Setup
-
-1. Create a bot: Message [@BotFather](https://t.me/BotFather) on Telegram
-2. Send `/newbot` and follow the prompts
-3. Copy the bot token to `.env` as `TELEGRAM_BOT_TOKEN`
-4. Message [@userinfobot](https://t.me/userinfobot) to get your user ID
-5. Add your ID to `TELEGRAM_ADMIN_IDS` in `.env`
-
-## Commands
+## 📋 Commands
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Main menu |
-| `/scan` | Scan all symbols for signals |
-| `/analyze [symbol]` | Deep analysis of a symbol |
-| `/positions` | Open positions |
-| `/close_all` | Close all positions |
-| `/settings` | Adjust settings via inline buttons |
-| `/account` | Account info |
-| `/history` | Trade history |
-| `/pause` / `/resume` | Pause/resume auto-trading |
-| `/mode [paper\|live]` | Switch execution mode |
-| `/risk [pct]` | Set risk per trade |
-| `/rr [ratio]` | Set min RR ratio |
-| `/score [val]` | Set score threshold |
-| `/help` | Show all commands |
+| `/start` | Main Dashboard |
+| `/scan` | Institutional Market Scan |
+| `/optimize` | Trigger AI Weight Tuning |
+| `/add_broker` | Configure Multi-Broker Sync |
+| `/focus_indices` | Prioritize Volatility Indices |
+| `/aggressive` | Toggle High-Growth Mode |
+| `/burn_to [target]` | Activate Balance Burner |
+| `/settings` | 10/10 Feature Toggles |
 
-## Scoring System
+## 📊 Scoring System (Institutional Weights)
 
 | Factor | Weight |
 |--------|--------|
-| Market Structure Alignment | 20% |
-| Supply/Demand Zone | 15% |
-| Order Block | 15% |
-| Fair Value Gap | 10% |
-| Liquidity Sweep | 15% |
-| Risk-Reward Ratio | 15% |
-| MTF Confluence | 10% |
+| Market Structure | 16% |
+| Order Blocks | 12% |
+| Liquidity Sweep | 12% |
+| RR Ratio (Min 1:3) | 12% |
+| MTF Confluence | 12% |
+| Order Flow (POC) | 10% |
+| Historical DNA | 10% |
+| S/D Zones | 8% |
+| ICT Kill Zones | 8% |
+| FVG / OTE Fib | 8% |
+| AI Sentiment | 8% |
 
-A trade executes when score ≥ threshold (default 40%) AND all risk gates pass.
+---
 
-## Supported Instruments
+## 🏗 Tech Stack
 
-- **Forex**: EURUSD, GBPUSD, USDJPY, etc.
-- **Gold**: XAUUSD
-- **Synthetic Indices**: Volatility 75, Boom 500, Crash 500 (via Deriv MT5)
+Python 3.12 · MetaTrader5 · python-telegram-bot · Matplotlib · Pandas · NumPy · AioSQLite · OpenAI API
 
-## Documentation
+## ⚠️ Disclaimer
 
-- [Full Specification](docs/SPEC.md) — Features, scoring details, architecture
-- [VPS Deployment Guide](docs/VPS_DEPLOYMENT.md) — Docker, Wine+MT5, Windows VPS
-
-## Tech Stack
-
-Python 3.11 · python-telegram-bot · APScheduler · pandas · MetaTrader5 · SQLite · Docker
-
-## License
-
-This project is for educational purposes. Use at your own risk.
+This bot is an institutional-grade tool for experienced traders. High-frequency trading involves significant risk. The "Aggressive Growth" and "Balance Burner" modes are intended for high-risk scenarios and demo testing. Use responsibly.
