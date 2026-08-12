@@ -538,46 +538,61 @@ class MarketScheduler:
 
     async def manage_open_positions(self):
         """Actively manage SL/TP of open positions based on price action."""
-        positions = await self.executor.get_open_positions()
-        if not positions:
-            return
+        try:
+            positions = await self.executor.get_open_positions()
+            if not positions:
+                return
 
-        for p in positions:
-            symbol = p.symbol
-            # Fetch current data for management
-            df = await self.fetch_candles(symbol, "M5", 100)
-            if df.empty: continue
-            
-            current_price = df.iloc[-1]["close"]
-            atr_val = atr(df, 14).iloc[-1]
-            
-            # 1. Move to Breakeven
-            # If profit hits 1:1 RR, move SL to entry + small buffer
-            risk_dist = abs(p.entry_price - p.sl)
-            current_profit_dist = (current_price - p.entry_price) if p.direction == "BUY" else (p.entry_price - current_price)
-            
-            new_sl = None
-            
-            # Breakeven Check
-            if current_profit_dist >= risk_dist and p.sl != p.entry_price:
-                buffer = atr_val * 0.1
-                new_sl = p.entry_price + (buffer if p.direction == "BUY" else -buffer)
-                logger.info(f"Management: Moving {symbol} to Breakeven")
+            logger.info(f"Managing {len(positions)} open positions...")
+
+            for p in positions:
+                symbol = p.symbol
+                # Fetch current data for management (using M5 for precision)
+                df = await self.fetch_candles(symbol, "M5", 100)
+                if df.empty: continue
                 
-            # 2. Trailing Stop (ATR-based)
-            # If profit > 2:1 RR, start trailing at 1.5x ATR
-            if current_profit_dist >= risk_dist * 2:
-                trail_sl = current_price - (atr_val * 1.5) if p.direction == "BUY" else current_price + (atr_val * 1.5)
-                # Only move SL in our favor
-                if p.direction == "BUY" and trail_sl > (new_sl or p.sl):
-                    new_sl = trail_sl
-                elif p.direction == "SELL" and (trail_sl < (new_sl or p.sl) or (new_sl is None and p.sl == 0)):
-                    new_sl = trail_sl
-            
-            if new_sl is not None:
-                success = await self.executor.modify_position(p.ticket, sl=new_sl, tp=p.tp)
-                if success:
-                    await self._notify(f"🛡 **TRADE MODIFIED: {symbol}**\nTicket: `#{p.ticket}`\nAction: `SL Adjusted (Active Management)`\nNew SL: `{new_sl:.5f}`")
+                current_price = df.iloc[-1]["close"]
+                atr_val = atr(df, 14).iloc[-1]
+                
+                # Calculate current risk and profit
+                # If SL is 0, we use a default 50 pip risk for RR calculations
+                risk_dist = abs(p.entry_price - p.sl) if p.sl > 0 else (atr_val * 3)
+                current_profit_dist = (current_price - p.entry_price) if p.direction == "BUY" else (p.entry_price - current_price)
+                
+                new_sl = None
+                
+                # 1. Breakeven Check (at 1:1 RR)
+                # Move SL to entry + small buffer if not already there
+                if current_profit_dist >= risk_dist:
+                    buffer = atr_val * 0.1
+                    be_sl = p.entry_price + (buffer if p.direction == "BUY" else -buffer)
+                    
+                    # Only update if BE is better than current SL
+                    if p.direction == "BUY" and be_sl > p.sl:
+                        new_sl = be_sl
+                    elif p.direction == "SELL" and (be_sl < p.sl or p.sl == 0):
+                        new_sl = be_sl
+
+                # 2. Trailing Stop (at 2:1 RR)
+                # Trail at 1.5x ATR distance
+                if current_profit_dist >= risk_dist * 2:
+                    trail_dist = atr_val * 1.5
+                    trail_sl = current_price - trail_dist if p.direction == "BUY" else current_price + trail_dist
+                    
+                    # Only move SL in our favor (higher for BUY, lower for SELL)
+                    if p.direction == "BUY" and trail_sl > (new_sl or p.sl):
+                        new_sl = trail_sl
+                    elif p.direction == "SELL" and (trail_sl < (new_sl or p.sl) or p.sl == 0):
+                        new_sl = trail_sl
+                
+                # 3. Apply modification if a better SL was found
+                if new_sl is not None and abs(new_sl - p.sl) > (atr_val * 0.05): # Only if significant change
+                    success = await self.executor.modify_position(p.ticket, sl=new_sl, tp=p.tp)
+                    if success:
+                        logger.info(f"🛡 Modified {symbol} #{p.ticket}: New SL {new_sl:.5f}")
+                        await self._notify(f"🛡 **TRADE MODIFIED: {symbol}**\nTicket: `#{p.ticket}`\nAction: `SL Adjusted (Active Management)`\nNew SL: `{new_sl:.5f}`")
+        except Exception as e:
+            logger.error(f"Error in manage_open_positions: {e}", exc_info=True)
 
     async def _reload_settings(self):
         """Reload settings from DB."""
