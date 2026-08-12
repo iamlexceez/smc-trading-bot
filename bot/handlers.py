@@ -769,6 +769,15 @@ class BotHandlers:
             await update.message.reply_text("❌ Scheduler not initialized.")
 
     @admin_only
+    async def cmd_journal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the daily AI journal."""
+        if self.scheduler and self.scheduler.optimizer:
+            journal = await self.scheduler.optimizer.generate_daily_journal()
+            await update.message.reply_text(journal, parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ Optimizer not initialized.")
+
+    @admin_only
     async def cmd_rr(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Set minimum RR ratio."""
         if context.args:
@@ -1182,6 +1191,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("rr", self.cmd_rr))
         app.add_handler(CommandHandler("add_broker", self.cmd_add_broker))
         app.add_handler(CommandHandler("optimize", self.cmd_optimize))
+        app.add_handler(CommandHandler("journal", self.cmd_journal))
         app.add_handler(CommandHandler("score", self.cmd_score))
         app.add_handler(CommandHandler("daily_limit", self.cmd_daily_limit))
         app.add_handler(CommandHandler("cooldown", self.cmd_cooldown))

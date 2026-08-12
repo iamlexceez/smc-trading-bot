@@ -110,6 +110,14 @@ class MarketScheduler:
             IntervalTrigger(days=self.settings.optimization_interval_days),
             id="self_optimization"
         )
+        
+        # Schedule Daily Journal (Every day at 23:55)
+        from apscheduler.triggers.cron import CronTrigger
+        self.scheduler.add_job(
+            self.send_daily_journal,
+            CronTrigger(hour=23, minute=55),
+            id="daily_journal"
+        )
 
         # Force an immediate scan on startup in a background task
         asyncio.create_task(self.scan_and_execute())
@@ -493,6 +501,12 @@ class MarketScheduler:
                 f"🧠 **SELF-OPTIMIZATION COMPLETE**\n"
                 f"The bot has analyzed recent trades and updated its scoring weights for better performance."
             )
+
+    async def send_daily_journal(self):
+        """Generate and send the daily AI journal."""
+        logger.info("Generating daily journal...")
+        journal = await self.optimizer.generate_daily_journal()
+        await self._notify(journal)
 
     async def _notify(self, message: str, photo: bytes = None):
         """Send notification to admin via Telegram and WhatsApp if configured."""
