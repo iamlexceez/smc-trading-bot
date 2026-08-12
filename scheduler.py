@@ -245,6 +245,12 @@ class MarketScheduler:
             logger.debug("Auto-trade disabled or paused — skipping scan")
             return
             
+        # ─── ACTIVE TRADE MANAGEMENT ──────────────────────
+        try:
+            await self.manage_open_positions()
+        except Exception as e:
+            logger.error(f"Error managing positions: {e}")
+            
         # Check Cycle Target
         if self.settings.target_balance:
             account = await self.executor.get_account_info()
@@ -299,17 +305,24 @@ class MarketScheduler:
                 contract = sym_info.get("contract_size", 100000)
                 spread = sym_info.get("spread", 0) * pip
 
-                # Calculate lot size using Expert DNA
-                # If aggressive mode is ON, double the risk percentage temporarily
-                original_risk = self.settings.risk_per_trade
+                # Calculate lot size using Dynamic Suggested Risk
+                # If aggressive mode is ON, we use the higher of (user setting * 2.5) or (suggested risk)
+                risk_pct = signal.suggested_risk
                 if self.settings.aggressive_mode:
-                    self.settings.risk_per_trade *= 2.5 # 2.5x risk in aggressive mode
+                    risk_pct = max(risk_pct, self.settings.risk_per_trade * 2.5)
+                
+                # Cap risk at 10% as requested by user
+                risk_pct = min(risk_pct, 10.0)
+                
+                # Temporarily override risk for calculation
+                original_risk = self.settings.risk_per_trade
+                self.settings.risk_per_trade = risk_pct
                 
                 lot_size = self.risk_manager.calculate_position_size(
                     balance, signal.entry_price, signal.stop_loss, sym_info
                 )
                 
-                # Restore original risk for future calculations
+                # Restore original risk
                 self.settings.risk_per_trade = original_risk
                 
                 # Estimate required margin
@@ -418,6 +431,49 @@ class MarketScheduler:
                 requests.get(url, timeout=10)
             except Exception as e:
                 logger.error(f"Failed to send WhatsApp notification: {e}")
+
+    async def manage_open_positions(self):
+        """Actively manage SL/TP of open positions based on price action."""
+        positions = await self.executor.get_open_positions()
+        if not positions:
+            return
+
+        for p in positions:
+            symbol = p.symbol
+            # Fetch current data for management
+            df = await self.fetch_candles(symbol, "M5", 100)
+            if df.empty: continue
+            
+            current_price = df.iloc[-1]["close"]
+            atr_val = atr(df, 14).iloc[-1]
+            
+            # 1. Move to Breakeven
+            # If profit hits 1:1 RR, move SL to entry + small buffer
+            risk_dist = abs(p.entry_price - p.sl)
+            current_profit_dist = (current_price - p.entry_price) if p.direction == "BUY" else (p.entry_price - current_price)
+            
+            new_sl = None
+            
+            # Breakeven Check
+            if current_profit_dist >= risk_dist and p.sl != p.entry_price:
+                buffer = atr_val * 0.1
+                new_sl = p.entry_price + (buffer if p.direction == "BUY" else -buffer)
+                logger.info(f"Management: Moving {symbol} to Breakeven")
+                
+            # 2. Trailing Stop (ATR-based)
+            # If profit > 2:1 RR, start trailing at 1.5x ATR
+            if current_profit_dist >= risk_dist * 2:
+                trail_sl = current_price - (atr_val * 1.5) if p.direction == "BUY" else current_price + (atr_val * 1.5)
+                # Only move SL in our favor
+                if p.direction == "BUY" and trail_sl > (new_sl or p.sl):
+                    new_sl = trail_sl
+                elif p.direction == "SELL" and (trail_sl < (new_sl or p.sl) or (new_sl is None and p.sl == 0)):
+                    new_sl = trail_sl
+            
+            if new_sl is not None:
+                success = await self.executor.modify_position(p.ticket, sl=new_sl, tp=p.tp)
+                if success:
+                    await self._notify(f"🛡 **TRADE MODIFIED: {symbol}**\nTicket: `#{p.ticket}`\nAction: `SL Adjusted (Active Management)`\nNew SL: `{new_sl:.5f}`")
 
     async def _reload_settings(self):
         """Reload settings from DB."""

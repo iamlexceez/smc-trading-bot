@@ -46,6 +46,7 @@ class TradeSignal:
     take_profit: float
     score: float  # 0-100
     rr_ratio: float
+    suggested_risk: float = 1.0  # Dynamic risk suggestion
     factors: list[ScoreFactor] = field(default_factory=list)
     structure: Optional[MarketStructure] = None
     zones: list[SupplyDemandZone] = field(default_factory=list)
@@ -325,9 +326,18 @@ def compute_signal(
     total_score = sum(f.score * f.weight for f in factors)
 
     # Compute RR
-    risk = abs(entry_price - stop_loss)
-    reward = abs(take_profit - entry_price)
-    rr = reward / risk if risk > 0 else 0.0
+    risk_dist = abs(entry_price - stop_loss)
+    reward_dist = abs(take_profit - entry_price)
+    rr = reward_dist / risk_dist if risk_dist > 0 else 0.0
+
+    # Calculate Dynamic Suggested Risk (1% to 10%)
+    # Base risk is 1% at score 60. Max risk 10% at score 95+
+    if total_score < 60:
+        suggested_risk = 0.5 # Minimum safety risk
+    else:
+        # Linear scale: 60 -> 1%, 95 -> 10%
+        suggested_risk = 1.0 + (total_score - 60) * (9.0 / 35.0)
+        suggested_risk = min(max(suggested_risk, 1.0), 10.0)
 
     return TradeSignal(
         symbol=symbol,
@@ -337,6 +347,7 @@ def compute_signal(
         take_profit=take_profit,
         score=total_score,
         rr_ratio=rr,
+        suggested_risk=round(suggested_risk, 2),
         factors=factors,
         structure=ltf_structure,
         zones=zones,
