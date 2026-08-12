@@ -406,54 +406,51 @@ class BotHandlers:
                         )
                     break
 
-                # Find the first available symbol and its max lot size
-                # Prioritize Indices for burning as they are more likely to be active
-                burn_symbol = None
-                max_lot = 1.0
-                
-                # Sort symbols to prioritize Indices
+                # Sort symbols to prioritize Indices for faster burning
                 sorted_symbols = sorted(self.settings.symbols, key=lambda x: "Index" in x or "Volatility" in x, reverse=True)
                 
+                trade_placed = False
                 for sym in sorted_symbols:
                     sym_info = await self.executor.get_symbol_info(sym)
-                    # Check if symbol is visible and tradeable
-                    if sym_info and sym_info.get("visible") and sym_info.get("max_lot", 0) > 0:
-                        burn_symbol = sym
-                        max_lot = sym_info.get("max_lot")
+                    if not sym_info or not sym_info.get("max_lot"):
+                        continue
+                        
+                    test_lot = sym_info.get("max_lot")
+                    min_lot = sym_info.get("min_lot", 0.01)
+                    
+                    # Try reducing lot size until the broker accepts it
+                    while test_lot >= min_lot:
+                        logger.info(f"Burner: Trying {sym} with {test_lot} lots")
+                        res_buy = await self.executor.execute_trade(
+                            symbol=sym, direction="BUY", lot_size=test_lot,
+                            sl=0, tp=0, magic=999999, comment="BALANCE BURN"
+                        )
+                        
+                        if res_buy.success:
+                            # Also open a SELL to hedge and burn via spread
+                            await self.executor.execute_trade(
+                                symbol=sym, direction="SELL", lot_size=test_lot,
+                                sl=0, tp=0, magic=999999, comment="BALANCE BURN"
+                            )
+                            trade_placed = True
+                            break
+                        elif "10034" in res_buy.message or "Volume" in res_buy.message:
+                            # Volume too large, cut in half and retry this symbol
+                            test_lot = round(test_lot / 2, 2)
+                            if test_lot < min_lot: break
+                        else:
+                            # Other error (e.g. market closed), try next symbol
+                            break
+                    
+                    if trade_placed:
                         break
                 
-                if not burn_symbol:
-                    logger.error("Burner: No valid symbols found to burn balance.")
-                    break
-
-                logger.info(f"Burner: Attempting to burn via {burn_symbol} with {max_lot} lots")
-                
-                # Open a high-lot trade to burn balance
-                res_buy = await self.executor.execute_trade(
-                    symbol=burn_symbol,
-                    direction="BUY",
-                    lot_size=max_lot,
-                    sl=0,
-                    tp=0,
-                    magic=999999,
-                    comment="BALANCE BURN"
-                )
-                
-                # Also open a SELL to hedge and lock in the spread loss quickly
-                res_sell = await self.executor.execute_trade(
-                    symbol=burn_symbol,
-                    direction="SELL",
-                    lot_size=max_lot,
-                    sl=0,
-                    tp=0,
-                    magic=999999,
-                    comment="BALANCE BURN"
-                )
-                
-                if not res_buy.success or not res_sell.success:
-                    logger.warning(f"Burner: Trade failed - Buy: {res_buy.message}, Sell: {res_sell.message}")
-                
-                await asyncio.sleep(5) # Wait for equity to update
+                if not trade_placed:
+                    logger.error("Burner: Could not place any trades on any symbol. Retrying in 10s...")
+                    await asyncio.sleep(10)
+                    continue
+                    
+                await asyncio.sleep(5) # Wait for equity to update before next cycle
                 
         except Exception as e:
             logger.error(f"Burn process error: {e}")
