@@ -8,6 +8,7 @@ pydantic-settings==2.5.2
 pandas==2.2.2
 numpy==2.1.1
 ta==0.11.0
+matplotlib==3.8.3
 
 # Market Data (free APIs)
 yfinance==0.2.43
@@ -20,3 +21,4 @@ aiosqlite==0.20.0
 python-dotenv==1.0.1
 tabulate==0.9.0
 structlog==24.4.0
+requests==2.31.0
