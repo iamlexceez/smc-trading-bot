@@ -39,8 +39,9 @@ def render_smc_chart(df: pd.DataFrame, symbol: str, structure, zones, signal=Non
         ax.axhspan(zone.bottom, zone.top, alpha=0.2, color=color, label=zone.zone_type.value.capitalize())
     
     # Plot Structure Events (BOS/CHoCH)
-    if structure.last_event.value != 'none':
-        event_text = structure.last_event.value.replace('_', ' ').upper()
+    from analysis.structure import StructureEventType
+    if structure.last_event.event_type != StructureEventType.NONE:
+        event_text = structure.last_event.event_type.value.replace('_', ' ').upper()
         last_idx = df.index[-1]
         last_price = df.iloc[-1]['close']
         ax.annotate(event_text, xy=(last_idx, last_price), xytext=(last_idx - 10, last_price + (last_price * 0.001)),

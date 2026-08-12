@@ -164,11 +164,11 @@ class MarketScheduler:
             sentiment = await sentiment_analyzer.get_market_sentiment(symbol)
         
         # Check for new structural events (BOS/CHoCH)
-        from analysis.structure import StructureEvent
-        last_event = self.last_structure_events.get(symbol, StructureEvent.NONE)
-        if structure.last_event != StructureEvent.NONE and structure.last_event != last_event:
-            self.last_structure_events[symbol] = structure.last_event
-            event_name = structure.last_event.value.replace("_", " ").upper()
+        from analysis.structure import StructureEventType
+        last_event_type = self.last_structure_events.get(symbol, StructureEventType.NONE)
+        if structure.last_event.event_type != StructureEventType.NONE and structure.last_event.event_type != last_event_type:
+            self.last_structure_events[symbol] = structure.last_event.event_type
+            event_name = structure.last_event.event_type.value.replace("_", " ").upper()
             
             # Render chart for structure change
             chart = render_smc_chart(df, symbol, structure, zones)

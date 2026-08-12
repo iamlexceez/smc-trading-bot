@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from analysis.structure import MarketStructure, Trend, StructureEvent
+from analysis.structure import MarketStructure, Trend, StructureEventType
 from analysis.supply_demand import SupplyDemandZone, ZoneType, get_nearest_zones
 from analysis.indicators import rsi, ema, atr
 from analysis.sessions import check_trading_session, Session
@@ -67,22 +67,25 @@ def score_structure_alignment(structure: MarketStructure, direction: str) -> Sco
     trend = structure.trend
     event = structure.last_event
 
+    # Use event_type from the StructureEvent dataclass
+    event_type = event.event_type if hasattr(event, 'event_type') else event
+
     if direction == "BUY":
         if trend == Trend.BULLISH:
-            score = 100.0 if event in (StructureEvent.BOS_BULLISH, StructureEvent.CHOCH_BULLISH) else 80.0
+            score = 100.0 if event_type in (StructureEventType.BOS_BULLISH, StructureEventType.CHOCH_BULLISH) else 80.0
         elif trend == Trend.RANGING:
             score = 40.0 if structure.current_zone == "discount" else 20.0
         else:
             score = 0.0
     else:  # SELL
         if trend == Trend.BEARISH:
-            score = 100.0 if event in (StructureEvent.BOS_BEARISH, StructureEvent.CHOCH_BEARISH) else 80.0
+            score = 100.0 if event_type in (StructureEventType.BOS_BEARISH, StructureEventType.CHOCH_BEARISH) else 80.0
         elif trend == Trend.RANGING:
             score = 40.0 if structure.current_zone == "premium" else 20.0
         else:
             score = 0.0
 
-    detail = f"Trend: {trend.value}, Zone: {structure.current_zone}, Event: {event.value}"
+    detail = f"Trend: {trend.value}, Zone: {structure.current_zone}, Event: {event_type.value}"
     return ScoreFactor(name="Structure Alignment", score=score, weight=0.20, detail=detail)
 
 
