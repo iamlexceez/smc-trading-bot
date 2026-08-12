@@ -297,10 +297,10 @@ def score_historical_backing(profile: Optional[SymbolProfile], ltf_structure: Ma
     conviction = 0
     patterns = []
     
-    if ltf_structure.order_block:
+    if ltf_structure.order_blocks:
         conviction += profile.historical_win_rate_ob
         patterns.append("OB")
-    if ltf_structure.fvg:
+    if ltf_structure.fvgs:
         conviction += profile.historical_win_rate_fvg
         patterns.append("FVG")
     
