@@ -204,6 +204,10 @@ class MarketScheduler:
                 return None
 
         # Compute signal score using real ATR
+        # Pass aggressive flag if primary TF is M1/M5 AND aggressive_mode is ON
+        is_scalping = primary_tf in ["M1", "M5"]
+        is_hyper_scalp = is_scalping and self.settings.aggressive_mode
+        
         signal = compute_signal(
             symbol=symbol,
             direction=direction,
@@ -216,6 +220,7 @@ class MarketScheduler:
             atr_val=atr_val,
             min_rr=self.settings.min_rr_ratio,
             timeframe=primary_tf,
+            aggressive=is_hyper_scalp,
         )
 
         return signal

@@ -213,7 +213,7 @@ def score_rr(entry: float, sl: float, tp: float, min_rr: float = 3.0) -> ScoreFa
     return ScoreFactor(name="RR Ratio", score=score, weight=0.15, detail=detail)
 
 
-def score_mtf_confluence(ltf_structure: MarketStructure, htf_structures: list[MarketStructure], direction: str) -> ScoreFactor:
+def score_mtf_confluence(ltf_structure: MarketStructure, htf_structures: list[MarketStructure], direction: str, aggressive: bool = False) -> ScoreFactor:
     """Factor 7: Multi-timeframe confluence (15%)."""
     if not htf_structures:
         return ScoreFactor(name="MTF Confluence", score=50.0, weight=0.15, detail="No HTF data")
@@ -222,15 +222,29 @@ def score_mtf_confluence(ltf_structure: MarketStructure, htf_structures: list[Ma
     total = len(htf_structures)
 
     for htf in htf_structures:
-        if direction == "BUY" and htf.trend in (Trend.BULLISH, Trend.RANGING):
+        is_aligned = False
+        if direction == "BUY":
+            # Normal: Needs Bullish trend OR Discount zone
             if htf.trend == Trend.BULLISH or htf.current_zone == "discount":
-                aligned += 1
-        elif direction == "SELL" and htf.trend in (Trend.BEARISH, Trend.RANGING):
+                is_aligned = True
+            # Aggressive: Accept Ranging HTF regardless of zone
+            elif aggressive and htf.trend == Trend.RANGING:
+                is_aligned = True
+        else:  # SELL
+            # Normal: Needs Bearish trend OR Premium zone
             if htf.trend == Trend.BEARISH or htf.current_zone == "premium":
-                aligned += 1
+                is_aligned = True
+            # Aggressive: Accept Ranging HTF regardless of zone
+            elif aggressive and htf.trend == Trend.RANGING:
+                is_aligned = True
+        
+        if is_aligned:
+            aligned += 1
 
     score = (aligned / total) * 100 if total > 0 else 0
     detail = f"{aligned}/{total} HTF timeframes aligned"
+    if aggressive:
+        detail += " (Hyper-Scalp active)"
 
     return ScoreFactor(name="MTF Confluence", score=score, weight=0.15, detail=detail)
 
@@ -284,6 +298,7 @@ def compute_signal(
     atr_val: float,
     min_rr: float = 3.0,
     timeframe: str = "M15",
+    aggressive: bool = False,
 ) -> TradeSignal:
     """
     Compute the full trade signal with multi-factor scoring.
@@ -295,7 +310,7 @@ def compute_signal(
         score_fvg(ltf_structure, direction, entry_price, atr_val),
         score_liquidity(ltf_structure, direction, entry_price, atr_val),
         score_rr(entry_price, stop_loss, take_profit, min_rr),
-        score_mtf_confluence(ltf_structure, htf_structures, direction),
+        score_mtf_confluence(ltf_structure, htf_structures, direction, aggressive=aggressive),
         score_kill_zone(),
         score_ote(entry_price, ltf_structure, direction),
     ]
