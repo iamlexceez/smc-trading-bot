@@ -405,20 +405,28 @@ class BotHandlers:
                         )
                     break
 
-                # Find the first available symbol that actually works in MT5
-                burn_symbol = "EURUSD"
+                # Find the first available symbol and its max lot size
+                burn_symbol = None
+                max_lot = 1.0
+                
                 for sym in self.settings.symbols:
                     sym_info = await self.executor.get_symbol_info(sym)
-                    if sym_info.get("visible"):
+                    if sym_info and sym_info.get("max_lot"):
                         burn_symbol = sym
+                        max_lot = sym_info.get("max_lot")
                         break
                 
+                if not burn_symbol:
+                    logger.error("Burner: No valid symbols found to burn balance.")
+                    break
+
+                logger.info(f"Burner: Attempting to burn via {burn_symbol} with {max_lot} lots")
+                
                 # Open a high-lot trade to burn balance
-                # For Deriv, lot sizes can be large. We'll try 50 lots.
-                await self.executor.execute_trade(
+                res_buy = await self.executor.execute_trade(
                     symbol=burn_symbol,
                     direction="BUY",
-                    lot_size=50.0,
+                    lot_size=max_lot,
                     sl=0,
                     tp=0,
                     magic=999999,
@@ -426,17 +434,20 @@ class BotHandlers:
                 )
                 
                 # Also open a SELL to hedge and lock in the spread loss quickly
-                await self.executor.execute_trade(
+                res_sell = await self.executor.execute_trade(
                     symbol=burn_symbol,
                     direction="SELL",
-                    lot_size=50.0,
+                    lot_size=max_lot,
                     sl=0,
                     tp=0,
                     magic=999999,
                     comment="BALANCE BURN"
                 )
                 
-                await asyncio.sleep(3) # Wait for equity to update
+                if not res_buy.success or not res_sell.success:
+                    logger.warning(f"Burner: Trade failed - Buy: {res_buy.message}, Sell: {res_sell.message}")
+                
+                await asyncio.sleep(5) # Wait for equity to update
                 
         except Exception as e:
             logger.error(f"Burn process error: {e}")
