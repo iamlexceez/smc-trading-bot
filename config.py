@@ -69,7 +69,7 @@ class TradeSettings:
     min_rr_ratio: float = 3.0
     score_threshold: float = 60.0
     max_spread_pips: float = 5.0
-    symbol_cooldown_minutes: int = 30
+    symbol_cooldown_minutes: int = 5
     virtual_balance: Optional[float] = None
     aggressive_mode: bool = False
     index_focus: bool = False
@@ -190,7 +190,7 @@ class TradeSettings:
             min_rr_ratio=float(d.get("min_rr_ratio", 3.0)),
             score_threshold=float(d.get("score_threshold", 60.0)),
             max_spread_pips=float(d.get("max_spread_pips", 5.0)),
-            symbol_cooldown_minutes=int(d.get("symbol_cooldown_minutes", 30)),
+            symbol_cooldown_minutes=int(d.get("symbol_cooldown_minutes", 5)),
             virtual_balance=float(d["virtual_balance"]) if d.get("virtual_balance") else None,
             aggressive_mode=parse_bool(d.get("aggressive_mode", "false")),
             index_focus=parse_bool(d.get("index_focus", "false")),
@@ -238,7 +238,7 @@ class TradeSettings:
             min_rr_ratio=float(os.getenv("MIN_RR_RATIO", "3.0")),
             score_threshold=float(os.getenv("SCORE_THRESHOLD", "60.0")),
             max_spread_pips=float(os.getenv("MAX_SPREAD_PIPS", "5.0")),
-            symbol_cooldown_minutes=int(os.getenv("SYMBOL_COOLDOWN_MINUTES", "30")),
+            symbol_cooldown_minutes=int(os.getenv("SYMBOL_COOLDOWN_MINUTES", "5")),
             virtual_balance=float(os.getenv("VIRTUAL_BALANCE")) if os.getenv("VIRTUAL_BALANCE") else None,
             aggressive_mode=os.getenv("AGGRESSIVE_MODE", "false").lower() == "true",
             index_focus=os.getenv("INDEX_FOCUS", "false").lower() == "true",
