@@ -357,6 +357,72 @@ class BotHandlers:
                 await update.message.reply_text("❌ Invalid amount. Please enter a positive number.")
 
     @admin_only
+    async def cmd_burn_to(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Burn demo balance down to a target amount via high-lot trades."""
+        if self.settings.trading_mode != "demo":
+            await update.message.reply_text("⛔ The /burn_to command is only allowed in DEMO mode for safety.")
+            return
+
+        if not context.args:
+            await update.message.reply_text("Usage: /burn_to [target_amount] (e.g. /burn_to 500)")
+            return
+
+        try:
+            target = float(context.args[0])
+            account = await self.executor.get_account_info()
+            current_balance = account.get("balance", 0)
+
+            if target >= current_balance:
+                await update.message.reply_text(f"Target ${target:,.2f} must be lower than current balance ${current_balance:,.2f}")
+                return
+
+            await update.message.reply_text(
+                f"🔥 **BALANCE BURNER ACTIVATED**\n"
+                f"Current: ${current_balance:,.2f}\n"
+                f"Target: ${target:,.2f}\n\n"
+                f"I will now open high-lot trades to reduce the balance. Please wait..."
+            )
+
+            # Start the burn process in the background
+            asyncio.create_task(self._run_balance_burn(target))
+
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+
+    async def _run_balance_burn(self, target: float):
+        """Background task to open and close trades until target is reached."""
+        try:
+            while True:
+                account = await self.executor.get_account_info()
+                current_equity = account.get("equity", 0)
+                
+                if current_equity <= target:
+                    await self.executor.close_all_positions()
+                    if self.app and self.admin_chat_id:
+                        await self.app.bot.send_message(
+                            get_admin_ids()[0], 
+                            f"✅ **BURN COMPLETE**\nTarget reached: ${current_equity:,.2f}\nAll positions closed."
+                        )
+                    break
+
+                # Open a high-lot trade to burn balance (e.g. 50 lots on a volatile pair)
+                # We use a large spread/lot to lose money quickly via spread + small movement
+                symbol = self.settings.symbols[0] if self.settings.symbols else "EURUSD"
+                await self.executor.execute_trade(
+                    symbol=symbol,
+                    direction="BUY",
+                    lot_size=20.0,
+                    sl=0,
+                    tp=0,
+                    magic=999999,
+                    comment="BALANCE BURN"
+                )
+                await asyncio.sleep(2) # Wait for equity to update
+                
+        except Exception as e:
+            logger.error(f"Burn process error: {e}")
+
+    @admin_only
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Switch execution mode."""
         if context.args and context.args[0].lower() in ("demo", "live"):
@@ -687,6 +753,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("pause", self.cmd_pause))
         app.add_handler(CommandHandler("resume", self.cmd_resume))
         app.add_handler(CommandHandler("set_balance", self.cmd_set_balance))
+        app.add_handler(CommandHandler("burn_to", self.cmd_burn_to))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("risk", self.cmd_risk))
         app.add_handler(CommandHandler("rr", self.cmd_rr))

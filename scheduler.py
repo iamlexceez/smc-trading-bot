@@ -24,6 +24,7 @@ from analysis.scoring import compute_signal, TradeSignal, format_signal_report
 from analysis.indicators import pip_value, atr
 from analysis.sessions import check_trading_session
 from analysis.confirmation import get_confirmation
+from analysis.visuals import render_smc_chart
 from risk.manager import RiskManager
 from executors.base import BaseExecutor
 from data.provider import DataProvider
@@ -109,7 +110,13 @@ class MarketScheduler:
         if structure.last_event != StructureEvent.NONE and structure.last_event != last_event:
             self.last_structure_events[symbol] = structure.last_event
             event_name = structure.last_event.value.replace("_", " ").upper()
-            await self._notify(f"📢 **MARKET STRUCTURE CHANGE: {symbol}**\nEvent: `{event_name}`\nTrend: `{structure.trend.value.upper()}`\nZone: `{structure.current_zone.upper()}`")
+            
+            # Render chart for structure change
+            chart = render_smc_chart(df, symbol, structure, zones)
+            await self._notify(
+                f"📢 **MARKET STRUCTURE CHANGE: {symbol}**\nEvent: `{event_name}`\nTrend: `{structure.trend.value.upper()}`\nZone: `{structure.current_zone.upper()}`",
+                photo=chart
+            )
 
         # Run S/D zone detection
         zones = detect_sd_zones(df, lookback=100)
@@ -315,7 +322,10 @@ class MarketScheduler:
                     )
                     await db.set_symbol_cooldown(symbol)
                     signal.passed = True
-                    await self._notify(f"✅ **TRADE EXECUTED**\n\n{format_signal_report(signal)}")
+                    
+                    # Render chart for executed trade
+                    chart = render_smc_chart(df, symbol, structure, zones, signal=signal)
+                    await self._notify(f"✅ **TRADE EXECUTED**\n\n{format_signal_report(signal)}", photo=chart)
                     logger.info(f"Trade executed: {symbol} {signal.direction} score={signal.score:.1f}")
                 else:
                     await self._notify(f"❌ Trade execution failed for {symbol}: {result.message}")
@@ -323,12 +333,15 @@ class MarketScheduler:
             except Exception as e:
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
-    async def _notify(self, message: str):
+    async def _notify(self, message: str, photo: bytes = None):
         """Send notification to admin via Telegram and WhatsApp if configured."""
         # Telegram
         if self.bot_app and self.admin_chat_id:
             try:
-                await self.bot_app.bot.send_message(self.admin_chat_id, message)
+                if photo:
+                    await self.bot_app.bot.send_photo(self.admin_chat_id, photo, caption=message)
+                else:
+                    await self.bot_app.bot.send_message(self.admin_chat_id, message)
             except Exception as e:
                 logger.error(f"Failed to send Telegram notification: {e}")
         
