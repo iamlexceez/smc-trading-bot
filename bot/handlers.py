@@ -378,6 +378,35 @@ class BotHandlers:
             await update.message.reply_text("Usage: `/aggressive on` or `/aggressive off`")
 
     @admin_only
+    async def cmd_scalping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Toggle Scalping Mode (M1/M5 timeframes)."""
+        if not context.args:
+            is_scalping = "M1" in self.settings.timeframes
+            status = "ON" if is_scalping else "OFF"
+            await update.message.reply_text(f"⏱ Scalping Mode is currently **{status}**.\nUse `/scalping on` or `/scalping off` to toggle.")
+            return
+
+        arg = context.args[0].lower()
+        if arg == "on":
+            # Add M1, M5 to the front of timeframes
+            new_tfs = ["M1", "M5"]
+            for tf in self.settings.timeframes:
+                if tf not in new_tfs:
+                    new_tfs.append(tf)
+            self.settings.timeframes = new_tfs
+            await db.save_settings(self.settings)
+            await update.message.reply_text("⏱ **SCALPING MODE ACTIVATED**\nThe bot is now hunting for snipers on M1 and M5 timeframes.")
+        elif arg == "off":
+            # Remove M1, M5
+            self.settings.timeframes = [tf for tf in self.settings.timeframes if tf not in ["M1", "M5"]]
+            if not self.settings.timeframes:
+                self.settings.timeframes = ["M15", "H1", "H4"]
+            await db.save_settings(self.settings)
+            await update.message.reply_text("🛡 **SCALPING MODE DEACTIVATED**\nReturning to standard M15+ timeframes.")
+        else:
+            await update.message.reply_text("Usage: `/scalping on` or `/scalping off`")
+
+    @admin_only
     async def cmd_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Set a balance target for the current cycle."""
         if not context.args:
@@ -833,6 +862,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("burn_to", self.cmd_burn_to))
         app.add_handler(CommandHandler("aggressive", self.cmd_aggressive))
         app.add_handler(CommandHandler("target", self.cmd_target))
+        app.add_handler(CommandHandler("scalping", self.cmd_scalping))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("risk", self.cmd_risk))
         app.add_handler(CommandHandler("rr", self.cmd_rr))

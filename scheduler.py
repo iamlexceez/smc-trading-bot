@@ -69,8 +69,11 @@ class MarketScheduler:
         """Start the periodic market scanner."""
         await self.data_provider.init()
         
-        # In aggressive mode, scan every 2 minutes
-        if self.settings.aggressive_mode:
+        # Adjust interval based on timeframe and mode
+        primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"
+        if primary_tf == "M1":
+            interval_seconds = 60
+        elif primary_tf == "M5" or self.settings.aggressive_mode:
             interval_seconds = 120
             
         self.scheduler.add_job(
