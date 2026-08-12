@@ -193,8 +193,8 @@ class MT5Executor(BaseExecutor):
             "visible": info.visible,
             "trade_mode": info.trade_mode,
             "filling_mode": getattr(info, 'filling_mode', 0),
-            "tick_size": info.tick_size,
-            "tick_value": info.tick_value,
+            "tick_size": getattr(info, 'trade_tick_size', info.point),
+            "tick_value": getattr(info, 'trade_tick_value', 1.0),
         }
 
     async def execute_trade(
