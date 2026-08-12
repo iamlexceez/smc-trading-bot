@@ -51,10 +51,11 @@ def get_current_session(utc_time: datetime | None = None) -> Session | None:
         utc_time = datetime.now(timezone.utc)
     hour = utc_time.hour
 
-    # Check overlap first (highest priority)
-    overlap_start, overlap_end = SESSION_HOURS[Session.LONDON_NY_OVERLAP]
-    if overlap_start <= hour < overlap_end:
-        return Session.LONDON_NY_OVERLAP
+    # Check Kill Zones first (highest priority for scalping)
+    for session in [Session.ICT_LONDON_KZ, Session.ICT_NY_KZ, Session.LONDON_NY_OVERLAP]:
+        start, end = SESSION_HOURS[session]
+        if start <= hour < end:
+            return session
 
     # Check other sessions
     for session in [Session.TOKYO, Session.LONDON, Session.NEW_YORK]:
@@ -91,6 +92,8 @@ def check_trading_session(
         "london": Session.LONDON,
         "new_york": Session.NEW_YORK,
         "overlap": Session.LONDON_NY_OVERLAP,
+        "ict_london_killzone": Session.ICT_LONDON_KZ,
+        "ict_ny_killzone": Session.ICT_NY_KZ,
         "all": None,  # Special case: all sessions
     }
 
@@ -128,22 +131,22 @@ def check_trading_session(
     hour = utc_time.hour
 
     # Find next enabled session
-    for session in [Session.LONDON, Session.NEW_YORK, Session.LONDON_NY_OVERLAP, Session.TOKYO]:
-        if session in enabled:
-            start, end = SESSION_HOURS[session]
-            if hour < start:
-                next_session = session
-                next_time = f"{start:02d}:00 UTC"
-                break
+    # Sort sessions by start hour to find the earliest next one
+    sorted_sessions = sorted(enabled, key=lambda s: SESSION_HOURS[s][0])
+    
+    for session in sorted_sessions:
+        start, end = SESSION_HOURS[session]
+        if hour < start:
+            next_session = session
+            next_time = f"{start:02d}:00 UTC"
+            break
 
     if not next_session:
-        # Next session is tomorrow
-        for session in [Session.TOKYO, Session.LONDON, Session.NEW_YORK]:
-            if session in enabled:
-                start, _ = SESSION_HOURS[session]
-                next_session = session
-                next_time = f"Tomorrow {start:02d}:00 UTC"
-                break
+        # Next session is tomorrow (the first one in the sorted list)
+        if sorted_sessions:
+            next_session = sorted_sessions[0]
+            start, _ = SESSION_HOURS[next_session]
+            next_time = f"Tomorrow {start:02d}:00 UTC"
 
     current_name = current.value if current else "No active session"
     return SessionInfo(

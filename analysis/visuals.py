@@ -3,6 +3,8 @@ Visual chart rendering for SMC Trading Bot.
 Uses matplotlib to generate professional charts with SMC markings.
 """
 
+import matplotlib
+matplotlib.use('Agg') # Use non-interactive backend for headless servers
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
