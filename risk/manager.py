@@ -10,7 +10,7 @@ Checks:
 6. Max open positions not exceeded
 7. Score ≥ threshold
 8. RR ≥ minimum
-9. Spread within limit
+9. Spread check (Disabled)
 10. Sufficient free margin
 """
 
@@ -95,10 +95,10 @@ class RiskManager:
         checks.append(("Min RR ratio", passed,
                        f"rr=1:{rr_ratio:.1f}, min=1:{self.settings.min_rr_ratio:.1f}"))
 
-        # 9. Spread check
-        passed = spread_pips <= self.settings.max_spread_pips
+        # 9. Spread check (DISABLED per user request)
+        passed = True
         checks.append(("Spread check", passed,
-                       f"spread={spread_pips:.1f}pips, max={self.settings.max_spread_pips:.1f}pips"))
+                       f"spread={spread_pips:.1f}pips (Check Disabled)"))
 
         # 10. Free margin
         passed = free_margin > required_margin * 2  # 2x safety buffer
