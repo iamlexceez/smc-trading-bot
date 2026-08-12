@@ -187,7 +187,8 @@ class BotHandlers:
             f"🏛 **Structure Respect**: `{profile.structure_respect_score}%`\n"
             f"🎯 **Optimal ATR Mult**: `{profile.optimal_atr_multiplier}x`\n"
             f"⏱ **Best Timeframe**: `{profile.best_timeframe}`\n"
-            f"🔄 **Fill Rate (FVG)**: `{profile.avg_fvg_fill_rate * 100}%`\n\n"
+            f"🏆 **Historical Win Rate (OB)**: `{profile.historical_win_rate_ob}%`\n"
+            f"🏆 **Historical Win Rate (FVG)**: `{profile.historical_win_rate_fvg}%`\n\n"
             f"_Last learned: {profile.last_updated.strftime('%Y-%m-%d %H:%M')}_"
         )
         await update.message.reply_text(text)

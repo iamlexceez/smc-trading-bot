@@ -288,6 +288,27 @@ def score_ote(entry: float, structure: MarketStructure, direction: str) -> Score
     return ScoreFactor(name="OTE Fibonacci", score=score, weight=0.10, detail=detail)
 
 
+def score_historical_backing(profile: Optional[SymbolProfile], ltf_structure: MarketStructure) -> ScoreFactor:
+    """Factor 10: Historical Pattern Backing (15%)."""
+    if not profile:
+        return ScoreFactor(name="Historical Backing", score=65.0, weight=0.15, detail="No profile data")
+
+    # Calculate conviction based on which patterns are present
+    conviction = 0
+    patterns = []
+    
+    if ltf_structure.order_block:
+        conviction += profile.historical_win_rate_ob
+        patterns.append("OB")
+    if ltf_structure.fvg:
+        conviction += profile.historical_win_rate_fvg
+        patterns.append("FVG")
+    
+    score = (conviction / len(patterns)) if patterns else 65.0
+    detail = f"Backing: {score:.1f}% based on {', '.join(patterns)} DNA"
+    
+    return ScoreFactor(name="Historical Backing", score=score, weight=0.15, detail=detail)
+
 def compute_signal(
     symbol: str,
     direction: str,
@@ -316,6 +337,7 @@ def compute_signal(
         score_mtf_confluence(ltf_structure, htf_structures, direction, aggressive=aggressive),
         score_kill_zone(),
         score_ote(entry_price, ltf_structure, direction),
+        score_historical_backing(profile, ltf_structure),
     ]
     
     # Adaptive Weight Adjustment based on Symbol Profile
