@@ -112,6 +112,9 @@ class MarketScheduler:
         # Run structure analysis
         structure = analyze_structure(df, lookback=3)
         
+        # Run S/D zone detection
+        zones = detect_sd_zones(df, lookback=100)
+        
         # Check for new structural events (BOS/CHoCH)
         from analysis.structure import StructureEvent
         last_event = self.last_structure_events.get(symbol, StructureEvent.NONE)
@@ -125,9 +128,6 @@ class MarketScheduler:
                 f"📢 **MARKET STRUCTURE CHANGE: {symbol}**\nEvent: `{event_name}`\nTrend: `{structure.trend.value.upper()}`\nZone: `{structure.current_zone.upper()}`",
                 photo=chart
             )
-
-        # Run S/D zone detection
-        zones = detect_sd_zones(df, lookback=100)
 
         # Fetch HTF structures for confluence
         htf_structures = []
