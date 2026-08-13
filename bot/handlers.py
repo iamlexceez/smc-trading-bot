@@ -212,24 +212,32 @@ class BotHandlers:
 
     @admin_only
     async def cmd_markets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show only currently broker-verified Deriv Synthetic Indices and Gold."""
-        if self.scheduler:
-            await self.scheduler.refresh_market_universe()
-        status_map = self.settings.symbol_status or {}
-        active = self.settings.enabled_symbols
+        """Show broker-backed accepted/rejected universe decisions and audit location."""
+        if not self.scheduler:
+            await self._render_menu(update, "💹 **BROKER UNIVERSE**\n\nScheduler is unavailable; no broker discovery audit can be produced.")
+            return
+        await self.scheduler.refresh_market_universe()
+        universe = self.scheduler.market_universe
+        accepted = universe.accepted_records
+        rejected = universe.rejected_records
+        audit_paths = self.scheduler.last_universe_audit_paths
         lines = [
-            "💹 **BROKER-VERIFIED DERIV UNIVERSE**",
-            f"Mode: `{self.settings.trading_mode.upper()}` | Active instruments: `{len(active)}`",
+            "💹 **MT5 BROKER-VERIFIED UNIVERSE**",
+            f"Mode: `{self.settings.trading_mode.upper()}` | Returned: `{len(universe.records)}` | ACCEPTED: `{len(accepted)}` | REJECTED: `{len(rejected)}`",
             "",
+            "**ACCEPTED — executable Deriv Synthetic Indices / Gold**",
+            *( [f"• `{record.symbol}` — {record.category}; `{record.trade_mode_name}`; volume `{record.volume_min}`–`{record.volume_max}` step `{record.volume_step}`" for record in accepted] or ["None. Execution remains fail-closed."] ),
+            "",
+            "**REJECTED — first 12 decisions**",
+            *( [f"• `{record.symbol}` — {record.decision_reason}" for record in rejected[:12]] or ["None."] ),
         ]
-        if active:
-            lines.append("**Active Synthetic Indices & Gold (XAUUSD / XAUUSDmicro)**")
-            for symbol in active:
-                st = status_map.get(symbol, "available")
-                lines.append(f"• `{symbol}` — `{st}`")
-        else:
-            lines.append("No broker-verified active instruments. Scanning is fail-closed until the MT5 connection exposes Deriv Synthetic Indices or Gold.")
-        lines.append("\nAll non-target forex pairs, crypto indices, and irrelevant instruments have been completely excluded and purged.")
+        if len(rejected) > 12:
+            lines.append(f"… plus `{len(rejected) - 12}` more rejected records in the full audit.")
+        if universe.last_refresh_error:
+            lines.extend(["", f"**MT5 retrieval warning:** {universe.last_refresh_error}"])
+        if audit_paths:
+            lines.extend(["", f"Complete metadata audit: `{audit_paths[1]}`", f"Machine-readable audit: `{audit_paths[0]}`"])
+        lines.extend(["", "No non-broker or guessed instrument is enabled. Forex, crypto, and all unsupported products remain rejected."])
         await self._render_menu(update, "\n".join(lines))
 
     @admin_only

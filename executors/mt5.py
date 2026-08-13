@@ -34,6 +34,8 @@ class MT5Executor(BaseExecutor):
         self.server = server
         self.path = path
         self._connected = False
+        self.last_symbol_discovery_error = ""
+        self.last_symbol_discovery_count = 0
 
     async def connect(self) -> bool:
         if not MT5_AVAILABLE:
@@ -208,31 +210,62 @@ class MT5Executor(BaseExecutor):
         }
 
     async def list_symbols(self) -> list[dict]:
-        """Return the account's broker-advertised symbols and metadata.
+        """Return the complete account-advertised MT5 symbol metadata.
 
-        No symbols are selected or traded here.  The caller classifies these
-        records and allows only Deriv Synthetic Indices and the broker's Gold
-        instrument into the scanner.
+        Enumeration never selects a symbol and never makes a symbol tradeable.
+        It captures broker facts only; ``DerivMarketUniverse`` later decides
+        whether a record belongs to the allowed Deriv Synthetic Index / Gold
+        scope and whether it is currently openable.
         """
-        if not MT5_AVAILABLE or not await self._ensure_connected():
+        self.last_symbol_discovery_error = ""
+        self.last_symbol_discovery_count = 0
+        if not MT5_AVAILABLE:
+            self.last_symbol_discovery_error = "MetaTrader5 package is not installed"
+            return []
+        if not await self._ensure_connected():
+            self.last_symbol_discovery_error = f"MT5 connection is unavailable: {mt5.last_error()}"
             return []
         symbols = mt5.symbols_get()
         if symbols is None:
-            logger.error("MT5 did not return a symbol universe: %s", mt5.last_error())
+            self.last_symbol_discovery_error = f"MT5 symbols_get failed: {mt5.last_error()}"
+            logger.error(self.last_symbol_discovery_error)
             return []
 
         disabled_mode = getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)
+        long_only_mode = getattr(mt5, "SYMBOL_TRADE_MODE_LONGONLY", 1)
+        short_only_mode = getattr(mt5, "SYMBOL_TRADE_MODE_SHORTONLY", 2)
+        close_only_mode = getattr(mt5, "SYMBOL_TRADE_MODE_CLOSEONLY", 3)
+        full_mode = getattr(mt5, "SYMBOL_TRADE_MODE_FULL", 4)
+        trade_mode_names = {
+            disabled_mode: "disabled",
+            long_only_mode: "long_only",
+            short_only_mode: "short_only",
+            close_only_mode: "close_only",
+            full_mode: "full",
+        }
+        openable_modes = {long_only_mode, short_only_mode, full_mode}
         records: list[dict] = []
         for info in symbols:
-            trade_mode = getattr(info, "trade_mode", disabled_mode)
+            trade_mode = int(getattr(info, "trade_mode", disabled_mode))
             records.append({
-                "name": info.name,
-                "description": getattr(info, "description", ""),
-                "path": getattr(info, "path", ""),
+                "name": str(getattr(info, "name", "")),
+                "description": str(getattr(info, "description", "")),
+                "path": str(getattr(info, "path", "")),
+                "category": str(getattr(info, "category", "")),
+                "group": str(getattr(info, "group", "")),
+                "sector": str(getattr(info, "sector", "")),
                 "visible": bool(getattr(info, "visible", False)),
                 "trade_mode": trade_mode,
-                "available": trade_mode != disabled_mode,
+                "trade_mode_name": trade_mode_names.get(trade_mode, f"unknown_{trade_mode}"),
+                "available": trade_mode in openable_modes,
+                "contract_size": getattr(info, "trade_contract_size", None),
+                "volume_min": getattr(info, "volume_min", None),
+                "volume_max": getattr(info, "volume_max", None),
+                "volume_step": getattr(info, "volume_step", None),
             })
+        self.last_symbol_discovery_count = len(records)
+        if not records:
+            self.last_symbol_discovery_error = "MT5 returned an empty symbol list"
         return records
 
     async def get_candles(self, symbol: str, timeframe: str, count: int):

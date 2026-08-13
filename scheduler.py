@@ -68,6 +68,7 @@ class MarketScheduler:
         self._running = False
         self.data_provider = DataProvider(self.executor)
         self.market_universe = DerivMarketUniverse()
+        self.last_universe_audit_paths: tuple[str, str] | None = None
         # In-memory delivery ledger: a chart-stage alert is sent once per
         # closed candle/fingerprint and is throttled independently per symbol.
         self._chart_activity_ledger: dict[str, tuple[str, float]] = {}
@@ -134,39 +135,46 @@ class MarketScheduler:
             records = await self.market_universe.refresh(self.executor)
         except Exception as exc:
             logger.error("Deriv market-universe discovery failed: %s", exc)
+            self.market_universe.last_refresh_error = f"Unhandled refresh error: {type(exc).__name__}: {exc}"
             records = []
 
-        if not records:
-            self.settings.enabled_symbols = []
-            self.settings.available_symbols = []
-            self.settings.symbol_status = {}
-            self.settings.market_universe_updated_at = datetime.utcnow().isoformat()
-            await db.save_settings(self.settings)
-            await self._chart_activity(
-                "broker_unavailable", "SYSTEM",
-                "⚠️ **BROKER MARKET DATA UNAVAILABLE**\nDeriv MT5 exposed no eligible tradeable Synthetic Indices or Gold instruments. Scanning and execution are fail-closed until broker discovery recovers.",
-                fingerprint="no-eligible-deriv-markets", essential=True,
-            )
-            return False
+        try:
+            json_path, markdown_path = self.market_universe.write_audit_report("logs")
+            self.last_universe_audit_paths = (str(json_path), str(markdown_path))
+            logger.info("MT5 symbol discovery audit written: %s", markdown_path)
+        except Exception as exc:
+            logger.exception("Could not write MT5 symbol discovery audit: %s", exc)
+            self.last_universe_audit_paths = None
 
-        eligible = [record for record in records if record.category in {"synthetic_index", "gold"}]
-        active = sorted(record.symbol for record in eligible if record.is_tradeable)
-        self.settings.symbols = sorted(record.symbol for record in eligible)
-        self.settings.available_symbols = active
-        # Auto-enable all discovered broker-verified Deriv symbols by default
-        self.settings.enabled_symbols = active
+        active = self.market_universe.available_symbols
+        # Discovery is authoritative and fail-closed. It deliberately clears a
+        # prior universe even when MT5 returned records that were all rejected.
+        self.settings.symbols = [record.symbol for record in self.market_universe.accepted_records]
+        self.settings.available_symbols = list(active)
+        self.settings.enabled_symbols = list(active)
         self.settings.unsupported_symbols = self.market_universe.unsupported_symbols
-        self.settings.symbol_status = {record.symbol: record.status for record in records}
+        self.settings.symbol_status = {
+            record.symbol: f"{record.status}: {record.decision_reason}" for record in records
+        }
         self.settings.market_universe_updated_at = datetime.utcnow().isoformat()
         await db.save_settings(self.settings)
 
+        eligible_count = sum(1 for record in records if record.category in {"synthetic_index", "gold"})
         logger.info(
-            "Deriv market universe refreshed: %s active / %s eligible / %s unsupported",
-            len(self.settings.enabled_symbols),
-            len(eligible),
-            len(self.settings.unsupported_symbols),
+            "Deriv market universe audit: %s returned / %s accepted / %s rejected / %s scope-matched",
+            len(records), len(active), len(self.market_universe.rejected_records), eligible_count,
         )
-        return bool(self.settings.enabled_symbols)
+        if not active:
+            reason = self.market_universe.last_refresh_error or "No broker-returned symbol met the allowed Deriv Synthetic Index / Gold and trade-mode criteria"
+            await self._chart_activity(
+                "broker_unavailable", "SYSTEM",
+                "⚠️ **BROKER UNIVERSE FAIL-CLOSED**\n"
+                f"Active instruments: `0`\nReason: {reason}\n"
+                "The full accepted/rejected MT5 metadata audit was written to the VPS logs directory. No guessed symbol was enabled.",
+                fingerprint=f"no-eligible-deriv-markets:{reason}", essential=True,
+            )
+            return False
+        return True
 
     async def fetch_candles(self, symbol: str, timeframe: str, count: int = 200) -> "pd.DataFrame":
         """Fetch broker-native, closed OHLCV data for an active Deriv market."""

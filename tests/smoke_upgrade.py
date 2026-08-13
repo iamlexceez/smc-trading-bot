@@ -168,10 +168,14 @@ async def test_deriv_market_universe() -> None:
     await universe.refresh(FakeBroker())
     assert_true(universe.available_symbols == ["DEX 600 UP Index", "Jump 10 Index", "Volatility 75 Index", "XAUUSD", "XAUUSDmicro"], "eligible Deriv markets were not classified correctly")
     assert_true(universe.status_for("Crash 500 Index") == "unavailable", "unavailable broker symbol became active")
-    assert_true("UnsupportedMarket" not in [r.symbol for r in universe.records], "unsupported broker symbol was not purged from universe records")
-    assert_true("EURUSD" not in [r.symbol for r in universe.records], "forex symbol was not purged from universe records")
-    assert_true("BTCETH Arbitrage Index" not in [r.symbol for r in universe.records], "non-approved synthetic specialty product was not purged")
+    assert_true("UnsupportedMarket" in [r.symbol for r in universe.rejected_records], "unsupported broker symbol was not retained for audit")
+    assert_true("EURUSD" in [r.symbol for r in universe.rejected_records], "forex rejection was not retained for audit")
+    arbitrage = next(record for record in universe.rejected_records if record.symbol == "BTCETH Arbitrage Index")
+    assert_true("excluded non-target" in arbitrage.decision_reason, "non-approved synthetic specialty rejection lacked evidence")
     assert_true("XAUUSDmicro" in universe.available_symbols, "Gold micro variant was incorrectly excluded")
+    with tempfile.TemporaryDirectory() as directory:
+        json_path, markdown_path = universe.write_audit_report(directory)
+        assert_true(json_path.exists() and markdown_path.exists(), "complete MT5 symbol audit files were not written")
 
 
 async def test_basket_persistence() -> None:
