@@ -153,6 +153,7 @@ class MarketScheduler:
         active = sorted(record.symbol for record in eligible if record.is_tradeable)
         self.settings.symbols = sorted(record.symbol for record in eligible)
         self.settings.available_symbols = active
+        # Auto-enable all discovered broker-verified Deriv symbols by default
         self.settings.enabled_symbols = active
         self.settings.unsupported_symbols = self.market_universe.unsupported_symbols
         self.settings.symbol_status = {record.symbol: record.status for record in records}
