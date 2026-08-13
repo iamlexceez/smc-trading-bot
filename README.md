@@ -1,90 +1,116 @@
-# 🤖 SMC Trading Bot: Institutional Powerhouse Edition (10/10)
+# SMC Trading Bot
 
-A high-frequency, institutional-grade trading bot that leverages **Advanced SMC/ICT Price Action**, **Multi-Broker Arbitrage**, and **AI-Driven Self-Optimization**. Built for professional traders who demand precision, autonomy, and data-backed execution.
+A Python and MetaTrader 5 trading system for **causal Smart Money Concepts (SMC) analysis**, Telegram control, and risk-capped execution. The live scanner, trade manager, and backtest engine share the same design principle: **a setup must be valid before it is scored, and a score cannot override a hard risk gate**.
 
----
+> **Important:** This software is an execution and analysis tool, not a guarantee of profitability. Automated trading can lose capital quickly. Keep `AUTO_TRADE=false` while testing in demo mode and enable live execution only after you have independently reviewed its behaviour.
 
-## 🏆 Institutional Features (10/10 Upgrade)
+## Causal Setup Pipeline
 
-### 1. 🧠 Self-Optimization AI Brain
-The bot features a self-correcting engine that analyzes every trade (win or loss). It automatically tunes its scoring weights every week based on performance, ensuring the bot adapts to changing market conditions without manual intervention.
+The bot evaluates completed candles only. It does not manufacture a stop or target to achieve a desired reward-to-risk ratio, and it does not allow a setup-quality score to relax required conditions.
 
-### 2. ⚡️ Multi-Broker Sync & Arbitrage
-Connect multiple MT5 terminals simultaneously. The bot monitors price lags across brokers to execute risk-free arbitrage hedges and synchronizes trades across accounts for advanced risk distribution.
+| Stage | Required condition | Effect if absent |
+|---|---|---|
+| 1. Context | Higher-timeframe trend alignment or a non-conflicting confirmed reversal | No setup |
+| 2. Liquidity | A known buy-side or sell-side pool | No setup |
+| 3. Sweep | Closed-candle sweep and reclaim of that known pool | No setup |
+| 4. Displacement | Directional body and range expansion against ATR | No setup |
+| 5. Structure | Candle-close BOS or CHOCH in the intended direction | No setup |
+| 6. Location | Retracement into a fresh directional order block, FVG, or supply/demand zone | No setup |
+| 7. Risk and target | Structural stop beyond invalidation and opposing unswept liquidity target | No setup |
+| 8. Quality | Transparent quality ranking after all hard checks pass | Ranking only; no risk increase |
 
-### 3. 🌊 AI Sentiment Analysis
-Integrated with LLM-driven sentiment analysis. The bot filters setups by scanning global news and market sentiment in real-time, ensuring it only trades when technicals align with the broader market narrative.
+## Entry Modes
 
-### 4. 🧬 Symbol DNA Profiling
-Adaptive analysis that studies the unique personality of each pair. It auto-tunes ATR multipliers, SL buffers, and lot-sizing DNA for specific instruments like Volatility Indices vs. Major Forex pairs.
+| Mode | Additional condition | Intended use |
+|---|---|---|
+| `confirmed` | Lower-timeframe confirmation after the complete hard-gate sequence | Most selective mode |
+| `aggressive` | May enter before a separate candle pattern, but still requires every hard structural, liquidity, zone, risk, and target condition | Earlier but still gated execution |
+| `extreme` | Explicit opt-in, all hard gates, quality score of at least 90, and positive historical expectancy when available | Exceptional situations only |
 
-### 5. 🏹 3-Layer Expert Execution
-Instead of single entries, the bot uses institutional layering. It splits positions into three layers with varying TP targets and dynamic breakeven triggers to lock in profits early while letting runners hit massive R:R targets.
+The selected entry mode changes **timing**, not the maximum financial risk. `extreme` is disabled by default.
 
----
+## Risk and Basket Controls
 
-## 🛠 Features
+A setup receives one risk budget. Layers are portions of that original budget and are not a mechanism for averaging into a losing position.
 
-- **Advanced SMC/ICT**: BOS/CHoCH, ICT Kill Zones, OTE Fibonacci, Fair Value Gaps (FVG), and Liquidity Sweeps.
-- **12-Factor Scoring Engine**: Multi-timeframe confluence, order flow intensity, and sentiment-weighted scoring.
-- **Hyper Burner Mode**: Specialized algorithm for demo accounts to reach specific target balances via high-frequency hedged cycling.
-- **Visual Alerting**: Matplotlib-rendered charts sent directly to Telegram for every setup and structure change.
-- **Multi-Channel Notifications**: Instant alerts via Telegram and WhatsApp (CallMeBot integration).
+| Control | Default | Behaviour |
+|---|---:|---|
+| Risk per setup | 0.75% | User-adjustable but hard-capped at 1% |
+| Setup-risk cap | 1.00% | Never increased by confidence, score, or aggressive mode |
+| Total open-risk ceiling | 3.00% | Blocks new execution when protected downside would exceed it |
+| Daily loss stop | 3.00% | Halts new trading for the day |
+| Emergency loss stop | 4.00% | Independent final loss circuit breaker |
+| Daily profit stop | 10.00% | Halts new trading after a successful day |
+| Consecutive-loss breaker | 3 losses | Blocks new entries until the streak resets |
+| Max simultaneous setups | 2 | Limits concurrent independent exposure |
+| Max layers per setup | 4 | Uses `40% / 30% / 20% / 10%` planned volume by default |
 
----
+Position sizing uses the broker’s tick size, tick value, minimum volume, maximum volume, and volume step. It chooses the lower of the risk-limited and margin-limited volume, then rounds **down** to the broker’s valid step.
 
-## 🚀 Quick Start
+## Autonomous Position Management
 
-```bash
-# 1. Update from GitHub
-git pull origin main
+The bot records each bot-managed setup as a persistent basket, including its initial structural stop, fixed risk budget, planned layers, and management actions. Active management works from fresh M5 closed-candle analysis:
 
-# 2. Install New Dependencies
-pip install -r requirements.txt
+- It never widens a stop loss.
+- It moves to breakeven only after one R **and** fresh directional structure confirmation.
+- It can lock partial profit at 1.5R and one R at 2R when structure confirms.
+- It trails behind confirmed protected swings rather than a blind fixed-distance rule.
+- It may partially realize 20% at runner conditions, when enabled.
+- It may extend a target only to a new, favourable liquidity target that preserves the minimum R:R.
+- It exits an automated position when a fresh opposing structural event invalidates the thesis.
 
-# 3. Configure .env
-# Add OPENAI_API_KEY for Sentiment Analysis
-# Add Broker credentials for Multi-Broker Sync
+Manual MT5 positions remain visible in `/positions`. They can be reviewed defensively, but the bot does not create automated layers for positions without a recorded basket.
 
-# 4. Run
-python main.py
-```
-
-## 📋 Commands
+## Telegram Controls
 
 | Command | Description |
-|---------|-------------|
-| `/start` | Main Dashboard |
-| `/scan` | Institutional Market Scan |
-| `/optimize` | Trigger AI Weight Tuning |
-| `/add_broker` | Configure Multi-Broker Sync |
-| `/focus_indices` | Prioritize Volatility Indices |
-| `/aggressive` | Toggle High-Growth Mode |
-| `/burn_to [target]` | Activate Balance Burner |
-| `/settings` | 10/10 Feature Toggles |
+|---|---|
+| `/scan` | Run the causal market scanner; only valid, quality-qualified setups are considered for execution |
+| `/positions` | Show live positions, recorded bot actions, and basket status |
+| `/baskets` | Show risk budgets, active layers, and planned layers |
+| `/manage [ticket]` | Re-analyse one position and make only a safe SL/TP improvement |
+| `/safety` | Show risk caps, daily stops, open-risk ceiling, and loss-streak status |
+| `/entry_mode [confirmed\|aggressive\|extreme confirm]` | Select the setup timing model |
+| `/risk [pct]` | Set risk per setup within the hard one-percent cap |
+| `/rr [ratio]` | Set the minimum market-derived R:R |
+| `/score [pct]` | Set the minimum post-validation quality threshold |
+| `/daily_limit [pct]` | Set the daily profit stop; daily loss protection remains separate |
+| `/journal` | Show the daily performance and setup-quality journal |
+| `/backtest [symbol] [tf] [days]` | Run the causal backtest pipeline |
 
-## 📊 Scoring System (Institutional Weights)
+## Installation and VPS Update
 
-| Factor | Weight |
-|--------|--------|
-| Market Structure | 16% |
-| Order Blocks | 12% |
-| Liquidity Sweep | 12% |
-| RR Ratio (Min 1:3) | 12% |
-| MTF Confluence | 12% |
-| Order Flow (POC) | 10% |
-| Historical DNA | 10% |
-| S/D Zones | 8% |
-| ICT Kill Zones | 8% |
-| FVG / OTE Fib | 8% |
-| AI Sentiment | 8% |
+On the Windows VPS, open a terminal in the bot folder and run:
 
----
+```powershell
+git pull origin main
+py -m pip install -r requirements.txt
+py -m pip install -r requirements-mt5.txt
+```
 
-## 🏗 Tech Stack
+Copy any desired non-secret defaults from `.env.example` into the VPS `.env`. Do **not** replace existing credentials with the example values. For a conservative first restart, use:
 
-Python 3.12 · MetaTrader5 · python-telegram-bot · Matplotlib · Pandas · NumPy · AioSQLite · OpenAI API
+```env
+AUTO_TRADE=false
+ENTRY_MODE=confirmed
+RISK_PER_TRADE=0.75
+MAX_SETUP_RISK_PCT=1.0
+MAX_TOTAL_OPEN_RISK_PCT=3.0
+MAX_DAILY_LOSS_PCT=3.0
+DAILY_PROFIT_STOP_PCT=10.0
+MIN_SETUP_SCORE=75.0
+```
 
-## ⚠️ Disclaimer
+Restart with the existing `start_bot.bat`, then use `/debug_mt5`, `/safety`, and `/scan` before enabling automatic execution.
 
-This bot is an institutional-grade tool for experienced traders. High-frequency trading involves significant risk. The "Aggressive Growth" and "Balance Burner" modes are intended for high-risk scenarios and demo testing. Use responsibly.
+## Verification
+
+The repository includes deterministic local verification at `tests/smoke_upgrade.py`. It tests configuration round trips, risk caps, step-floor sizing, loss exposure after a profit-protected stop, no-widening stop behaviour, causal swing confirmation, displacement detection, basket persistence, and module imports. It does not connect to MT5 or place, modify, or close trades.
+
+```powershell
+py tests\smoke_upgrade.py
+```
+
+## Technology
+
+Python 3.12, MetaTrader5, python-telegram-bot, APScheduler, pandas, NumPy, matplotlib, aiosqlite, and aiohttp.

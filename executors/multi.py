@@ -82,6 +82,16 @@ class MultiBrokerManager(BaseExecutor):
             total_closed += await executor.close_all_positions()
         return total_closed
 
+    async def close_partial(self, ticket: int, volume: float) -> bool:
+        """Close part of a position on the broker that owns its ticket."""
+        for name, executor in self.executors.items():
+            positions = await executor.get_open_positions()
+            if any(p.ticket == ticket for p in positions):
+                logger.info(f"Partially closing position #{ticket} on broker {name}")
+                return await executor.close_partial(ticket, volume)
+        logger.warning(f"Ticket #{ticket} not found on any active broker")
+        return False
+
     async def modify_position(self, ticket: int, sl: float = None, tp: float = None) -> bool:
         """Modify position by searching all active brokers for the ticket."""
         for name, executor in self.executors.items():

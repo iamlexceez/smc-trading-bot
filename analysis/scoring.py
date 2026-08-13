@@ -17,7 +17,8 @@ AND all hard gates pass (min RR, valid SL/TP, risk limits, spread, etc.)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 
 from analysis.structure import MarketStructure, Trend, StructureEventType
 from analysis.supply_demand import SupplyDemandZone, ZoneType, get_nearest_zones
@@ -49,11 +50,19 @@ class TradeSignal:
     take_profit: float
     score: float  # 0-100
     rr_ratio: float
-    suggested_risk: float = 1.0  # Dynamic risk suggestion
+    # This is a setup/basket budget hint only. It must never be increased by score.
+    suggested_risk: float = 0.75
     factors: list[ScoreFactor] = field(default_factory=list)
     structure: Optional[MarketStructure] = None
     zones: list[SupplyDemandZone] = field(default_factory=list)
     timeframe: str = "M15"
+    entry_mode: str = "confirmed"
+    setup_type: str = ""
+    created_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    validation: Any = None
+    quality_factors: list[Any] = field(default_factory=list)
+    target_source: str = ""
     passed: bool = False
     rejection_reason: str = ""
 
@@ -369,6 +378,9 @@ def compute_signal(
     profile: SymbolProfile = None,
     of_profile: OrderFlowProfile = None,
     sentiment: Dict[str, Any] = None,
+    risk_budget_pct: float = 0.75,
+    entry_mode: str = "confirmed",
+    signal_ttl_minutes: int = 10,
 ) -> TradeSignal:
     """
     Compute the full trade signal with multi-factor scoring.
@@ -414,14 +426,12 @@ def compute_signal(
     reward_dist = abs(take_profit - entry_price)
     rr = reward_dist / risk_dist if risk_dist > 0 else 0.0
 
-    # Calculate Dynamic Suggested Risk (1% to 10%)
-    # Base risk is 1% at score 60. Max risk 10% at score 95+
-    if total_score < 60:
-        suggested_risk = 0.5 # Minimum safety risk
-    else:
-        # Linear scale: 60 -> 1%, 95 -> 10%
-        suggested_risk = 1.0 + (total_score - 60) * (9.0 / 35.0)
-        suggested_risk = min(max(suggested_risk, 1.0), 10.0)
+    # Setup quality must never increase financial risk. The caller supplies a
+    # configured basket-risk budget that is capped at 1% by this legacy signal
+    # path until the dedicated basket engine performs final sizing.
+    suggested_risk = min(max(float(risk_budget_pct), 0.0), 1.0)
+    now = datetime.utcnow()
+    expires_at = now + timedelta(minutes=max(int(signal_ttl_minutes), 1))
 
     return TradeSignal(
         symbol=symbol,
@@ -436,6 +446,9 @@ def compute_signal(
         structure=ltf_structure,
         zones=zones,
         timeframe=timeframe,
+        entry_mode=entry_mode,
+        created_at=now.isoformat(),
+        expires_at=expires_at.isoformat(),
         passed=True,
     )
 
@@ -444,22 +457,36 @@ def format_signal_report(signal: TradeSignal) -> str:
     """Format a signal into a readable Telegram message."""
     lines = [
         f"📊 **{signal.symbol}** — {signal.direction} ({signal.timeframe})",
-        f"",
-        f"**Score: {signal.score:.1f}/100**",
-        f"**RR: 1:{signal.rr_ratio:.1f}**",
-        f"",
+        "",
+        f"**Setup Quality: {signal.score:.1f}/100** | Mode: `{signal.entry_mode.upper()}`",
+        f"**Market-derived RR: 1:{signal.rr_ratio:.2f}**",
+        f"Setup: `{signal.setup_type or 'SMC validation'}` | Target: `{signal.target_source or 'structural liquidity'}`",
+        "",
         f"Entry: `{signal.entry_price:.5f}`",
         f"SL: `{signal.stop_loss:.5f}`",
         f"TP: `{signal.take_profit:.5f}`",
-        f"",
-        f"**Factor Breakdown:**",
     ]
 
-    for f in signal.factors:
-        points = f.score * f.weight
-        status = "✅" if f.score >= 50 else "❌"
-        lines.append(f"{status} {f.name}: {f.score:.0f}% × {f.weight*100:.0f}% = {points:.1f} pts")
-        lines.append(f"   _{f.detail}_")
+    if signal.validation is not None:
+        lines.extend(["", "**Mandatory Validity Checks:**"])
+        for check in signal.validation.checks:
+            status = "✅" if check.passed else "❌"
+            lines.append(f"{status} {check.name}: _{check.detail}_")
+
+    if signal.quality_factors:
+        lines.extend(["", "**Quality Ranking (does not bypass validity):**"])
+        for factor in signal.quality_factors:
+            lines.append(f"• {factor.name}: `{factor.points:.1f}/{factor.maximum:.1f}` — _{factor.detail}_")
+    else:
+        lines.extend(["", "**Legacy Factor Breakdown:**"])
+        for factor in signal.factors:
+            points = factor.score * factor.weight
+            status = "✅" if factor.score >= 50 else "❌"
+            lines.append(f"{status} {factor.name}: {factor.score:.0f}% × {factor.weight*100:.0f}% = {points:.1f} pts")
+            lines.append(f"   _{factor.detail}_")
+
+    if signal.expires_at:
+        lines.append(f"\nSignal expiry: `{signal.expires_at}` UTC")
 
     lines.append(f"")
     if signal.passed:

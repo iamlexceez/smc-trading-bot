@@ -1,5 +1,5 @@
-import logging
 import json
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from storage import db
@@ -42,19 +42,16 @@ class SelfOptimizer:
             is_win = trade.get("pnl", 0) > 0
             try:
                 raw_signal = json.loads(trade.get("raw_signal", "{}"))
-                factors = raw_signal.get("factors", [])
-                
-                for f in factors:
-                    name = f["name"]
-                    score = f["score"]
+                factors = raw_signal.get("quality_factors") or raw_signal.get("factors", [])
+                for factor in factors:
+                    name = factor.get("name", "Unknown")
+                    normalized = float(factor.get("points", factor.get("score", 0))) / float(factor.get("maximum", 100) or 100)
                     if name not in factor_success:
                         factor_success[name] = {"sum": 0, "count": 0}
-                    
-                    if score >= 60 and is_win:
-                        factor_success[name]["sum"] += 1.2
-                    elif score >= 60 and not is_win:
+                    if normalized >= 0.60 and is_win:
+                        factor_success[name]["sum"] += 1.0
+                    elif normalized >= 0.60 and not is_win:
                         factor_success[name]["sum"] -= 0.5
-                    
                     factor_success[name]["count"] += 1
             except:
                 continue
@@ -90,13 +87,16 @@ class SelfOptimizer:
         for t in trades:
             try:
                 raw = json.loads(t.get("raw_signal", "{}"))
-                factors = raw.get("factors", [])
-                for f in factors:
-                    if f["score"] >= 80:
-                        name = f["name"]
-                        if name not in pattern_stats: pattern_stats[name] = {"wins": 0, "total": 0}
+                factors = raw.get("quality_factors") or raw.get("factors", [])
+                for factor in factors:
+                    normalized = float(factor.get("points", factor.get("score", 0))) / float(factor.get("maximum", 100) or 100)
+                    if normalized >= 0.80:
+                        name = factor.get("name", "Unknown")
+                        if name not in pattern_stats:
+                            pattern_stats[name] = {"wins": 0, "total": 0}
                         pattern_stats[name]["total"] += 1
-                        if t.get("pnl", 0) > 0: pattern_stats[name]["wins"] += 1
+                        if t.get("pnl", 0) > 0:
+                            pattern_stats[name]["wins"] += 1
             except: continue
 
         top_pattern = "None"
@@ -126,12 +126,12 @@ class SelfOptimizer:
         if top_pattern != "None":
             lines.append(f"• **Pattern Insight**: My analysis shows that `{top_pattern}` was the most reliable factor today with a `{max_rate*100:.0f}%` success rate.")
         
-        lines.append(f"• **Adaptive Adjustment**: I have slightly increased the weighting for `{top_pattern}` to prioritize these setups in tomorrow's session.")
+        lines.append(f"• **Adaptive Note**: `{top_pattern}` is recorded for review, but it cannot bypass hard validity gates, fixed risk caps, or portfolio exposure limits.")
         
         lines.append(f"")
         lines.append(f"🔮 **Tomorrow's Focus**")
         lines.append(f"• I will continue to monitor `{best_sym}` DNA for similar structure retests.")
-        lines.append(f"• AI Sentiment filtering will be tightened to avoid the volatility seen in `{worst_sym}`.")
+        lines.append(f"• The next session will continue to require fresh HTF context, liquidity sweep, displacement, structure confirmation, retracement, and a market-derived target.")
 
         return "\n".join(lines)
 

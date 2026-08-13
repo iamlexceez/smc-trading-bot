@@ -23,9 +23,13 @@ from analysis.structure import analyze_structure, MarketStructure, Trend
 from analysis.supply_demand import detect_sd_zones, SupplyDemandZone, ZoneType
 from analysis.scoring import compute_signal, TradeSignal, format_signal_report
 from analysis.indicators import pip_value, atr
+from strategy.setup_scorer import score_setup_quality
+from strategy.setup_validator import EntryMode, SetupValidator
 from analysis.sessions import check_trading_session
 from analysis.confirmation import get_confirmation
+from analysis.liquidity import build_liquidity_pools, select_market_target
 from analysis.visuals import render_smc_chart
+from execution.manager import ManagementState, TradeManager
 from analysis.profiler import profiler
 from analysis.order_flow import order_flow
 from analysis.sentiment import sentiment_analyzer
@@ -206,73 +210,96 @@ class MarketScheduler:
             else:
                 return None  # No clear direction
 
-        # Calculate SL and TP
-        atr_series = atr(df, 14)
-        atr_val = atr_series.iloc[-1]
-        if atr_val <= 0 or (isinstance(atr_val, float) and atr_val != atr_val):  # NaN check
-            atr_val = current_price * 0.002  # fallback
+        # Select the permitted entry model. Earlier modes do not relax the
+        # required HTF → sweep → displacement → structure → zone → real-target
+        # chain; they only change whether an additional LTF candle confirmation
+        # is mandatory.
+        try:
+            entry_mode = EntryMode(self.settings.entry_mode.lower())
+        except (AttributeError, ValueError):
+            entry_mode = EntryMode.CONFIRMED
+        if entry_mode == EntryMode.AGGRESSIVE and not self.settings.allow_aggressive_entry:
+            entry_mode = EntryMode.CONFIRMED
+        if entry_mode == EntryMode.EXTREME and not self.settings.allow_extreme_entry:
+            entry_mode = EntryMode.AGGRESSIVE if self.settings.allow_aggressive_entry else EntryMode.CONFIRMED
 
-        pip = pip_value(symbol)
+        # Confirmed models use a lower timeframe where available. M1 is already
+        # the lowest supported timeframe, so it validates on its own closed bars.
+        ltf_df = df
+        if primary_tf not in ("M1", "M5"):
+            candidate_ltf = await self.fetch_candles(symbol, "M5", 200)
+            if not candidate_ltf.empty:
+                ltf_df = candidate_ltf
 
-        # Calculate SL using Adaptive ATR Multiplier
-        atr_mult = profile.optimal_atr_multiplier if profile else 1.5
-        
-        if direction == "BUY":
-            entry = current_price
-            sl = entry - atr_val * atr_mult
-            tp = entry + atr_val * atr_mult * self.settings.min_rr_ratio
-        else:
-            entry = current_price
-            sl = entry + atr_val * atr_mult
-            tp = entry - atr_val * atr_mult * self.settings.min_rr_ratio
+        validator = SetupValidator(
+            min_rr=self.settings.min_rr_ratio,
+            min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
+            displacement_body_ratio=self.settings.displacement_body_ratio_min,
+            displacement_range_ratio=self.settings.displacement_range_ratio_min,
+            stop_atr_buffer=self.settings.structural_stop_atr_buffer,
+            require_ltf_confirmation=self.settings.require_candle_confirmation,
+        )
+        validation = validator.validate(
+            symbol=symbol,
+            direction=direction,
+            timeframe=primary_tf,
+            df=df,
+            structure=structure,
+            htf_structures=htf_structures,
+            zones=zones,
+            entry_mode=entry_mode,
+            ltf_df=ltf_df,
+        )
+        if not validation.valid:
+            logger.debug("Invalid setup for %s: %s", symbol, validation.rejection_reason)
+            return None
 
-        # Entry confirmation
-        nearest_zone = None
-        for z in zones:
-            if direction == "BUY" and z.zone_type == ZoneType.DEMAND:
-                nearest_zone = z
-                break
-            elif direction == "SELL" and z.zone_type == ZoneType.SUPPLY:
-                nearest_zone = z
-                break
+        atr_val = atr(df, 14).iloc[-1]
+        if atr_val <= 0 or (isinstance(atr_val, float) and atr_val != atr_val):
+            atr_val = current_price * 0.002
 
-        if nearest_zone and self.settings.require_zone_retest:
-            confirmation = get_confirmation(
-                df.tail(20),
-                direction,
-                zone_top=nearest_zone.top,
-                zone_bottom=nearest_zone.bottom,
-                require_retest=self.settings.require_zone_retest,
-                require_candle=self.settings.require_candle_confirmation,
-                require_displacement=self.settings.require_displacement,
-            )
-            if not confirmation.confirmed:
-                logger.debug(f"No entry confirmation for {symbol}: {confirmation.detail}")
-                return None
+        quality = score_setup_quality(
+            validation,
+            structure,
+            min_score=self.settings.min_setup_score,
+            extreme_score=self.settings.extreme_setup_score,
+            # Historical backing ranks only; it cannot override a failed gate.
+            historical_expectancy_r=None,
+        )
+        if not quality.approved:
+            logger.debug("Valid but low-quality setup for %s: %s", symbol, quality.rejection_reason)
+            return None
 
-        # Compute signal score using real ATR
-        # Pass aggressive flag if primary TF is M1/M5 AND aggressive_mode is ON
+        # Retain the established report object/UI while replacing its legacy
+        # ATR-created prices and score-driven risk path with the validated setup.
         is_scalping = primary_tf in ["M1", "M5"]
-        is_hyper_scalp = is_scalping and self.settings.aggressive_mode
-        
         signal = compute_signal(
             symbol=symbol,
             direction=direction,
-            entry_price=entry,
-            stop_loss=sl,
-            take_profit=tp,
+            entry_price=validation.entry_price,
+            stop_loss=validation.stop_loss,
+            take_profit=validation.take_profit,
             ltf_structure=structure,
             htf_structures=htf_structures,
             zones=zones,
             atr_val=atr_val,
             min_rr=self.settings.min_rr_ratio,
             timeframe=primary_tf,
-            aggressive=is_hyper_scalp,
+            aggressive=is_scalping and self.settings.aggressive_mode,
             profile=profile,
             of_profile=of_profile,
             sentiment=sentiment,
+            risk_budget_pct=min(self.settings.risk_per_trade, self.settings.max_setup_risk_pct),
+            entry_mode=entry_mode.value,
+            signal_ttl_minutes=self.settings.max_signal_age_minutes,
         )
-
+        signal.score = quality.score
+        signal.validation = validation
+        signal.quality_factors = quality.factors
+        signal.setup_type = "Liquidity Sweep Reversal"
+        signal.target_source = validation.target_pool.kind.value if validation.target_pool else ""
+        signal.passed = quality.approved
+        signal.rejection_reason = quality.rejection_reason
         return signal
 
     async def scan_markets(self) -> list[TradeSignal]:
@@ -281,7 +308,7 @@ class MarketScheduler:
         for symbol in self.settings.enabled_symbols:
             try:
                 signal = await self.analyze_symbol(symbol)
-                if signal and signal.score >= self.settings.score_threshold:
+                if signal and signal.passed and signal.score >= self.settings.min_setup_score:
                     signals.append(signal)
             except Exception as e:
                 logger.error(f"Error analyzing {symbol}: {e}")
@@ -291,57 +318,94 @@ class MarketScheduler:
         """Run risk checks and execute a signal if valid."""
         symbol = signal.symbol
         try:
-            # Run risk checks
+            # Final revalidation immediately before any market order. A signal
+            # approval or prior scan never freezes market structure or pricing.
+            if signal.expires_at and datetime.utcnow() > datetime.fromisoformat(signal.expires_at):
+                signal.passed = False
+                signal.rejection_reason = "Signal expired before execution"
+                await self._notify(format_signal_report(signal))
+                return False
+            refreshed = await self.analyze_symbol(symbol)
+            if not refreshed or not refreshed.passed or refreshed.direction != signal.direction:
+                signal.passed = False
+                signal.rejection_reason = "Setup invalidated during final revalidation"
+                await self._notify(format_signal_report(signal))
+                return False
+            signal = refreshed
+
             account = await self.executor.get_account_info()
-            equity = account.get("equity", account.get("balance", 0))
-            free_margin = account.get("free_margin", 0)
-            balance = account.get("balance", 10000)
+            equity = float(account.get("equity", account.get("balance", 0)))
+            free_margin = float(account.get("free_margin", 0))
+            leverage = float(account.get("leverage", 1) or 1)
             today_pnl = await db.get_today_pnl()
             today_count = await db.get_today_trade_count()
+            consecutive_losses = await db.get_consecutive_losses()
             open_positions = await self.executor.get_open_positions()
-
             sym_info = await self.executor.get_symbol_info(symbol)
             pip = sym_info.get("pip_size", pip_value(symbol))
-            contract = sym_info.get("contract_size", 100000)
             spread = sym_info.get("spread", 0) * pip
 
-            # Calculate lot size using Dynamic Suggested Risk
-            risk_pct = signal.suggested_risk
-            if self.settings.aggressive_mode:
-                risk_pct = max(risk_pct, self.settings.risk_per_trade * 2.5)
-            
-            risk_pct = min(risk_pct, 10.0)
-            
-            original_risk = self.settings.risk_per_trade
-            self.settings.risk_per_trade = risk_pct
-            
-            lot_size = self.risk_manager.calculate_position_size(
-                balance, signal.entry_price, signal.stop_loss, sym_info
-            )
-            
-            self.settings.risk_per_trade = original_risk
-            
-            leverage = account.get("leverage", 500)
-            required_margin = lot_size * contract * signal.entry_price / leverage
+            # Calculate present account exposure at each position's protective SL.
+            current_open_risk = 0.0
+            for position in open_positions:
+                position_info = await self.executor.get_symbol_info(position.symbol)
+                position_risk = self.risk_manager.calculate_position_risk(position, position_info)
+                if position_risk == float("inf"):
+                    signal.passed = False
+                    signal.rejection_reason = f"Unprotected open position: {position.symbol} #{position.ticket}"
+                    await self._notify(format_signal_report(signal))
+                    return False
+                current_open_risk += position_risk
 
-            check_score = signal.score
-            if self.settings.aggressive_mode and check_score >= 50.0:
-                check_score = self.settings.score_threshold
-            
+            sizing = self.risk_manager.calculate_position_sizing(
+                account_equity=equity,
+                free_margin=free_margin,
+                entry_price=signal.entry_price,
+                stop_loss=signal.stop_loss,
+                symbol_info=sym_info,
+                leverage=leverage,
+                risk_pct=min(self.settings.risk_per_trade, self.settings.max_setup_risk_pct),
+            )
+            if not sizing.valid:
+                signal.passed = False
+                signal.rejection_reason = f"Sizing rejected: {sizing.reason}"
+                await self._notify(format_signal_report(signal))
+                return False
+
+            # Reserve risk for the planned basket now. Layers are not blindly
+            # opened together: only L1 executes; each later layer is contingent
+            # on fresh thesis confirmation and remaining basket risk.
+            layers = self.risk_manager.get_layering_plan(
+                sizing.final_volume,
+                signal.entry_price,
+                signal.stop_loss,
+                sym_info,
+                account_equity=equity,
+            )
+            if not layers:
+                signal.passed = False
+                signal.rejection_reason = "No broker-valid initial layer"
+                await self._notify(format_signal_report(signal))
+                return False
+            initial_layer = layers[0]
+
             risk_result = await self.risk_manager.check_all(
                 symbol=symbol,
                 direction=signal.direction,
-                score=check_score,
+                score=signal.score,
                 rr_ratio=signal.rr_ratio,
                 spread_pips=spread / pip if pip > 0 else 0,
                 account_equity=equity,
                 free_margin=free_margin,
-                required_margin=required_margin,
+                required_margin=sizing.required_margin,
                 today_pnl=today_pnl,
                 today_trade_count=today_count,
                 open_position_count=len(open_positions),
+                proposed_setup_risk=sizing.expected_loss,
+                current_open_risk=current_open_risk,
+                setup_valid=bool(signal.validation and signal.validation.valid),
+                consecutive_losses=consecutive_losses,
             )
-
             if not risk_result.passed:
                 logger.info(f"Signal rejected for {symbol}: {risk_result.reason}")
                 signal.passed = False
@@ -349,28 +413,37 @@ class MarketScheduler:
                 await self._notify(format_signal_report(signal))
                 return False
 
-            # EXPERT LAYERING
-            layers = self.risk_manager.get_layering_plan(
-                lot_size, signal.entry_price, signal.stop_loss, sym_info
+            result = await self.executor.execute_trade(
+                symbol=symbol,
+                direction=signal.direction,
+                lot_size=initial_layer["lot"],
+                sl=signal.stop_loss,
+                tp=signal.take_profit,
+                magic=self.settings.magic_number,
+                comment=initial_layer["comment"],
             )
-            
-            results = []
-            for layer in layers:
-                res = await self.executor.execute_trade(
-                    symbol=symbol,
-                    direction=signal.direction,
-                    lot_size=layer["lot"],
-                    sl=signal.stop_loss,
-                    tp=signal.take_profit,
-                    magic=self.settings.magic_number,
-                    comment=layer["comment"],
-                )
-                results.append(res)
-            
-            result = results[0] if results else ExecutionResult(success=False, message="No layers executed")
 
             if result.success:
-                await db.record_trade(
+                raw_signal = {
+                    "entry_mode": signal.entry_mode,
+                    "setup_type": signal.setup_type,
+                    "target_source": signal.target_source,
+                    "initial_layer": initial_layer,
+                    "planned_layers": layers,
+                    "sizing": {
+                        "ideal_volume": sizing.ideal_volume,
+                        "margin_limited_volume": sizing.margin_limited_volume,
+                        "final_volume": sizing.final_volume,
+                        "expected_loss": sizing.expected_loss,
+                        "required_margin": sizing.required_margin,
+                    },
+                    "quality_factors": [
+                        {"name": factor.name, "points": factor.points, "maximum": factor.maximum, "detail": factor.detail}
+                        for factor in signal.quality_factors
+                    ],
+                    "legacy_factors": [{"name": factor.name, "score": factor.score, "detail": factor.detail} for factor in signal.factors],
+                }
+                trade_id = await db.record_trade(
                     symbol=symbol,
                     direction=signal.direction,
                     entry_price=result.entry_price,
@@ -380,11 +453,57 @@ class MarketScheduler:
                     score=signal.score,
                     rr_ratio=signal.rr_ratio,
                     executor=self.executor.name,
-                    raw_signal=json.dumps({
-                        "factors": [{"name": f.name, "score": f.score, "detail": f.detail}
-                                   for f in signal.factors],
-                    }),
+                    raw_signal=json.dumps(raw_signal),
                 )
+                basket_id = await db.create_trade_basket(
+                    symbol=symbol,
+                    direction=signal.direction,
+                    entry_price=result.entry_price,
+                    initial_stop=result.sl,
+                    initial_target=result.tp,
+                    max_risk=sizing.risk_amount,
+                    reserved_risk=sizing.expected_loss,
+                    planned_layers=layers,
+                    metadata={
+                        "trade_id": trade_id,
+                        "entry_mode": signal.entry_mode,
+                        "setup_type": signal.setup_type,
+                        "quality_score": signal.score,
+                        "rr_ratio": signal.rr_ratio,
+                    },
+                )
+                await db.record_trade_layer(
+                    basket_id=basket_id,
+                    ticket=result.ticket,
+                    layer_number=initial_layer["number"],
+                    planned_volume=initial_layer["lot"],
+                    executed_volume=result.lot_size,
+                    entry_price=result.entry_price,
+                    stop_loss=result.sl,
+                    take_profit=result.tp,
+                    status="open",
+                    trigger_reason=initial_layer["trigger"],
+                )
+                for planned_layer in layers[1:]:
+                    await db.record_trade_layer(
+                        basket_id=basket_id,
+                        layer_number=planned_layer["number"],
+                        planned_volume=planned_layer["lot"],
+                        status="planned",
+                        trigger_reason=planned_layer["trigger"],
+                    )
+                if result.ticket is not None:
+                    await db.log_basket_action(
+                        basket_id=basket_id,
+                        ticket=result.ticket,
+                        action="Initial Layer Executed",
+                        details={
+                            "layer": initial_layer["number"],
+                            "reserved_risk": sizing.expected_loss,
+                            "remaining_reserved_risk": max(0.0, sizing.expected_loss - initial_layer["expected_loss"]),
+                        },
+                        trade_id=trade_id,
+                    )
                 await db.set_symbol_cooldown(symbol)
                 signal.passed = True
                 
@@ -392,9 +511,9 @@ class MarketScheduler:
                 photo = None
                 if df is not None:
                     # Detect structure and zones for chart
-                    from analysis.structure import detect_market_structure
+                    from analysis.structure import analyze_structure
                     from analysis.supply_demand import detect_sd_zones
-                    structure = detect_market_structure(df)
+                    structure = analyze_structure(df)
                     zones = detect_sd_zones(df)
                     photo = render_smc_chart(df, symbol, structure, zones, signal=signal)
                 
@@ -478,7 +597,7 @@ class MarketScheduler:
 
                 # For the background loop, we analyze and execute
                 signal = await self.analyze_symbol(symbol)
-                if not signal or signal.score < self.settings.score_threshold:
+                if not signal or not signal.passed or signal.score < self.settings.min_setup_score:
                     continue
                 
                 # Notify potential setup found
@@ -537,125 +656,368 @@ class MarketScheduler:
                 logger.error(f"Failed to send WhatsApp notification: {e}")
 
     async def manage_open_positions(self):
-        """Actively manage SL/TP of open positions based on price action."""
+        """Manage each open trade from fresh closed-candle structure and basket state."""
         try:
             positions = await self.executor.get_open_positions()
             if not positions:
                 return
 
-            logger.info(f"Managing {len(positions)} open positions...")
+            live_tickets = {position.ticket for position in positions}
+            logger.info("Structurally managing %s open position(s)...", len(positions))
+            manager = TradeManager(
+                breakeven_at_rr=self.settings.breakeven_at_rr,
+                profit_lock_rr=self.settings.profit_lock_rr,
+                runner_rr=self.settings.runner_rr,
+                min_rr=self.settings.min_rr_ratio,
+                stop_atr_buffer=self.settings.trailing_buffer_atr,
+                allow_partial_tp=self.settings.allow_partial_tp,
+                allow_tp_extension=self.settings.allow_tp_extension,
+            )
 
-            for p in positions:
-                symbol = p.symbol
-                # Fetch current data for management (using M5 for precision)
-                df = await self.fetch_candles(symbol, "M5", 100)
-                if df.empty: continue
-                
-                current_price = df.iloc[-1]["close"]
-                atr_val = atr(df, 14).iloc[-1]
-                
-                # Calculate current risk and profit
-                # If SL is 0, we use a default 50 pip risk for RR calculations
-                risk_dist = abs(p.entry_price - p.sl) if p.sl > 0 else (atr_val * 3)
-                current_profit_dist = (current_price - p.entry_price) if p.direction == "BUY" else (p.entry_price - current_price)
-                
-                new_sl = None
-                
-                # 1. Breakeven Check (at 1:1 RR)
-                # Move SL to entry + small buffer if not already there
-                if current_profit_dist >= risk_dist:
-                    buffer = atr_val * 0.1
-                    be_sl = p.entry_price + (buffer if p.direction == "BUY" else -buffer)
-                    
-                    # Only update if BE is better than current SL
-                    if p.direction == "BUY" and be_sl > p.sl:
-                        new_sl = be_sl
-                    elif p.direction == "SELL" and (be_sl < p.sl or p.sl == 0):
-                        new_sl = be_sl
+            for position in positions:
+                basket = await db.get_basket_for_ticket(position.ticket)
+                if basket:
+                    initial_stop = float(basket["initial_stop"])
+                    try:
+                        state = ManagementState(basket["state"])
+                    except ValueError:
+                        state = ManagementState.INITIAL
+                    partial_done = await db.basket_has_action(basket["id"], "Partial Take Profit")
+                else:
+                    # Manual positions are monitored defensively, but the bot
+                    # will not create layers without a recorded basket plan.
+                    initial_stop = position.sl
+                    state = ManagementState.INITIAL
+                    partial_done = False
 
-                # 2. Trailing Stop (at 2:1 RR)
-                # Trail at 1.5x ATR distance
-                if current_profit_dist >= risk_dist * 2:
-                    trail_dist = atr_val * 1.5
-                    trail_sl = current_price - trail_dist if p.direction == "BUY" else current_price + trail_dist
-                    
-                    # Only move SL in our favor (higher for BUY, lower for SELL)
-                    if p.direction == "BUY" and trail_sl > (new_sl or p.sl):
-                        new_sl = trail_sl
-                    elif p.direction == "SELL" and (trail_sl < (new_sl or p.sl) or p.sl == 0):
-                        new_sl = trail_sl
-                
-                # 3. Apply modification if a better SL was found
-                if new_sl is not None and abs(new_sl - p.sl) > (atr_val * 0.05): # Only if significant change
-                    success = await self.executor.modify_position(p.ticket, sl=new_sl, tp=p.tp)
+                if initial_stop <= 0:
+                    logger.warning("Skipping unprotected position #%s; no initial structural stop is known", position.ticket)
+                    continue
+
+                df = await self.fetch_candles(position.symbol, "M5", 200)
+                if df.empty or len(df) < 30:
+                    continue
+                current_price = float(df.iloc[-1]["close"])
+                atr_val = float(atr(df, 14).iloc[-1])
+                if atr_val <= 0:
+                    continue
+
+                structure = analyze_structure(df, lookback=3)
+                pools = build_liquidity_pools(df, structure.swing_highs, structure.swing_lows, "M5")
+                target_pool = select_market_target(pools, position.direction, position.entry_price)
+                structural_target = target_pool.level if target_pool else None
+                action = manager.evaluate(
+                    direction=position.direction,
+                    entry_price=position.entry_price,
+                    initial_stop=initial_stop,
+                    current_sl=position.sl,
+                    current_tp=position.tp,
+                    current_price=current_price,
+                    atr_value=atr_val,
+                    structure=structure,
+                    state=state,
+                    partial_exit_done=partial_done,
+                    structural_target=structural_target,
+                    costs_buffer=atr_val * 0.02,
+                )
+                if action.action == "none":
+                    continue
+
+                if action.action == "move_sl" and action.new_sl is not None:
+                    success = await self.executor.modify_position(position.ticket, sl=action.new_sl, tp=position.tp)
                     if success:
-                        logger.info(f"🛡 Modified {symbol} #{p.ticket}: New SL {new_sl:.5f}")
-                        action_type = "Trailing Stop" if current_profit_dist >= risk_dist * 2 else "Breakeven"
-                        await db.log_trade_action(p.ticket, action_type, f"SL moved to {new_sl:.5f} based on ATR and structure.")
-                        await self._notify(f"🛡 **TRADE MODIFIED: {symbol}**\nTicket: `#{p.ticket}`\nAction: `{action_type} Adjusted`\nNew SL: `{new_sl:.5f}`")
+                        if basket:
+                            await db.update_basket_state(basket["id"], state=action.state.value)
+                            await db.update_trade_layer(basket["layer_id"], stop_loss=action.new_sl)
+                            await db.log_basket_action(
+                                basket_id=basket["id"],
+                                ticket=position.ticket,
+                                action="SL Protected",
+                                details={"old_sl": position.sl, "new_sl": action.new_sl, "current_r": manager.current_r(position.direction, position.entry_price, initial_stop, current_price), "reason": action.reason},
+                            )
+                        else:
+                            await db.log_trade_action(position.ticket, "SL Protected", action.reason)
+                        await self._notify(f"🛡 **SL PROTECTED — {position.symbol}**\nTicket: `#{position.ticket}`\nOld SL: `{position.sl:.5f}`\nNew SL: `{action.new_sl:.5f}`\nReason: _{action.reason}_")
+
+                elif action.action == "move_tp" and action.new_tp is not None:
+                    success = await self.executor.modify_position(position.ticket, sl=position.sl, tp=action.new_tp)
+                    if success:
+                        if basket:
+                            await db.update_basket_state(basket["id"], state=action.state.value)
+                            await db.update_trade_layer(basket["layer_id"], take_profit=action.new_tp)
+                            await db.log_basket_action(
+                                basket_id=basket["id"],
+                                ticket=position.ticket,
+                                action="TP Extended",
+                                details={"old_tp": position.tp, "new_tp": action.new_tp, "reason": action.reason},
+                            )
+                        else:
+                            await db.log_trade_action(position.ticket, "TP Extended", action.reason)
+                        await self._notify(f"🎯 **TP EXTENDED — {position.symbol}**\nTicket: `#{position.ticket}`\nOld TP: `{position.tp:.5f}`\nNew TP: `{action.new_tp:.5f}`\nReason: _{action.reason}_")
+
+                elif action.action == "close_partial" and action.close_percent:
+                    sym_info = await self.executor.get_symbol_info(position.symbol)
+                    close_volume = self.risk_manager.floor_volume(position.volume * action.close_percent, sym_info)
+                    if close_volume > 0 and await self.executor.close_partial(position.ticket, close_volume):
+                        if basket:
+                            await db.update_basket_state(basket["id"], state=action.state.value)
+                            await db.log_basket_action(
+                                basket_id=basket["id"],
+                                ticket=position.ticket,
+                                action="Partial Take Profit",
+                                details={"volume": close_volume, "percent": action.close_percent, "reason": action.reason},
+                            )
+                        else:
+                            await db.log_trade_action(position.ticket, "Partial Take Profit", action.reason)
+                        await self._notify(f"💰 **PARTIAL TAKE PROFIT — {position.symbol}**\nTicket: `#{position.ticket}`\nClosed: `{close_volume}` lots\nReason: _{action.reason}_")
+
+                elif action.action == "close_full":
+                    if await self.executor.close_position(position.ticket):
+                        if basket:
+                            await db.update_basket_state(basket["id"], state=action.state.value, status="closed")
+                            await db.log_basket_action(
+                                basket_id=basket["id"],
+                                ticket=position.ticket,
+                                action="Thesis Exit",
+                                details={"reason": action.reason},
+                            )
+                        else:
+                            await db.log_trade_action(position.ticket, "Thesis Exit", action.reason)
+                        await self._notify(f"⚠️ **TRADE THESIS EXIT — {position.symbol}**\nTicket: `#{position.ticket}`\nReason: _{action.reason}_")
+
+                # A planned layer is evaluated independently after current
+                # management. The method refuses losing/duplicate/invalid adds.
+                if basket and action.action != "close_full":
+                    await self.maybe_add_confirmed_layer(basket, position, positions)
+
+            for basket in await db.get_open_baskets():
+                await db.close_basket_if_flat(basket["id"], live_tickets)
         except Exception as e:
             logger.error(f"Error in manage_open_positions: {e}", exc_info=True)
 
+    async def maybe_add_confirmed_layer(self, basket: dict, position, all_positions: list) -> bool:
+        """Add at most one planned layer after fresh confirmation, never while losing.
+
+        A layer is treated as a continuation/retest decision, not a cheaper
+        re-entry. It is blocked unless the current basket is in profit, a new
+        valid setup is present, the structural event is new, risk remains inside
+        the original setup budget, and free margin supports the reduced volume.
+        """
+        if not self.settings.auto_trade or self.settings.is_paused:
+            return False
+        layers = await db.get_basket_layers(basket["id"])
+        next_layer = next((layer for layer in layers if layer["status"] == "planned"), None)
+        if not next_layer:
+            return False
+
+        primary_ticket = min((layer["ticket"] for layer in layers if layer.get("ticket")), default=position.ticket)
+        if position.ticket != primary_ticket:
+            return False
+        initial_stop = float(basket["initial_stop"])
+        current_price_df = await self.fetch_candles(position.symbol, "M5", 200)
+        if current_price_df.empty:
+            return False
+        current_price = float(current_price_df.iloc[-1]["close"])
+        initial_risk = abs(position.entry_price - initial_stop)
+        current_r = ((current_price - position.entry_price) if position.direction == "BUY" else (position.entry_price - current_price)) / initial_risk if initial_risk > 0 else 0.0
+        if current_r <= 0:
+            return False  # Explicit anti-averaging-down rule.
+
+        refreshed = await self.analyze_symbol(position.symbol)
+        if not refreshed or not refreshed.passed or refreshed.direction != basket["direction"]:
+            return False
+        event_key = f"{refreshed.structure.last_event.event_type.value}:{refreshed.structure.last_event.index}"
+        metadata = dict(basket.get("metadata") or {})
+        if metadata.get("last_layer_event") == event_key:
+            return False  # Duplicate-layer prevention for an already-used event.
+
+        account = await self.executor.get_account_info()
+        equity = float(account.get("equity", account.get("balance", 0)))
+        free_margin = float(account.get("free_margin", 0))
+        leverage = float(account.get("leverage", 1) or 1)
+        symbol_info = await self.executor.get_symbol_info(position.symbol)
+
+        basket_tickets = {layer["ticket"] for layer in layers if layer.get("ticket")}
+        basket_current_risk = 0.0
+        total_open_risk = 0.0
+        for live_position in all_positions:
+            live_info = await self.executor.get_symbol_info(live_position.symbol)
+            risk = self.risk_manager.calculate_position_risk(live_position, live_info)
+            if risk == float("inf"):
+                return False
+            total_open_risk += risk
+            if live_position.ticket in basket_tickets:
+                basket_current_risk += risk
+
+        remaining_basket_risk = max(0.0, float(basket["max_risk"]) - basket_current_risk)
+        planned_allocation = next_layer["planned_volume"] / max(sum(layer["planned_volume"] for layer in layers), 1e-12)
+        layer_budget = min(float(basket["max_risk"]) * planned_allocation, remaining_basket_risk)
+        if layer_budget <= 0:
+            return False
+        risk_pct = layer_budget / max(equity, 1e-12) * 100
+        sizing = self.risk_manager.calculate_position_sizing(
+            account_equity=equity,
+            free_margin=free_margin,
+            entry_price=refreshed.entry_price,
+            stop_loss=refreshed.stop_loss,
+            symbol_info=symbol_info,
+            leverage=leverage,
+            risk_pct=risk_pct,
+        )
+        if not sizing.valid or sizing.expected_loss > remaining_basket_risk + 1e-6:
+            return False
+
+        today_pnl = await db.get_today_pnl()
+        today_count = await db.get_today_trade_count()
+        consecutive_losses = await db.get_consecutive_losses()
+        risk_result = await self.risk_manager.check_all(
+            symbol=position.symbol,
+            direction=refreshed.direction,
+            score=refreshed.score,
+            rr_ratio=refreshed.rr_ratio,
+            spread_pips=0.0,
+            account_equity=equity,
+            free_margin=free_margin,
+            required_margin=sizing.required_margin,
+            today_pnl=today_pnl,
+            today_trade_count=today_count,
+            open_position_count=len(all_positions),
+            proposed_setup_risk=sizing.expected_loss,
+            current_open_risk=total_open_risk,
+            setup_valid=bool(refreshed.validation and refreshed.validation.valid),
+            is_layer=True,
+            consecutive_losses=consecutive_losses,
+        )
+        if not risk_result.passed:
+            return False
+
+        result = await self.executor.execute_trade(
+            symbol=position.symbol,
+            direction=refreshed.direction,
+            lot_size=sizing.final_volume,
+            sl=refreshed.stop_loss,
+            tp=refreshed.take_profit,
+            magic=self.settings.magic_number,
+            comment=f"SMC L{next_layer['layer_number']}/{self.settings.max_layers}",
+        )
+        if not result.success:
+            return False
+
+        await db.update_trade_layer(
+            next_layer["id"],
+            status="open",
+            ticket=result.ticket,
+            executed_volume=result.lot_size,
+            stop_loss=result.sl,
+            take_profit=result.tp,
+            trigger_reason=f"{next_layer['trigger']} — {event_key}",
+        )
+        metadata["last_layer_event"] = event_key
+        await db.update_basket_state(basket["id"], state=ManagementState.CONFIRMED.value, metadata=metadata)
+        if result.ticket is not None:
+            await db.log_basket_action(
+                basket_id=basket["id"],
+                ticket=result.ticket,
+                action="Layer Added",
+                details={
+                    "layer": next_layer["layer_number"],
+                    "volume": result.lot_size,
+                    "layer_risk": sizing.expected_loss,
+                    "basket_current_risk": basket_current_risk + sizing.expected_loss,
+                    "remaining_risk": max(0.0, float(basket["max_risk"]) - basket_current_risk - sizing.expected_loss),
+                    "reason": next_layer["trigger"],
+                },
+            )
+        await self._notify(
+            f"🟢 **LAYER ADDED — {position.symbol}**\n"
+            f"Layer: `{next_layer['layer_number']}/{self.settings.max_layers}`\n"
+            f"Volume: `{result.lot_size}`\n"
+            f"Basket risk: `${basket_current_risk + sizing.expected_loss:.2f}` / `${float(basket['max_risk']):.2f}`\n"
+            f"Reason: _{next_layer['trigger']}_"
+        )
+        return True
+
     async def manual_manage_position(self, ticket: int) -> str:
-        """Manually trigger analysis and modification for a specific ticket."""
+        """Re-analyse one position using the same structural safety engine as automation."""
         positions = await self.executor.get_open_positions()
-        pos = next((p for p in positions if p.ticket == ticket), None)
-        
-        if not pos:
+        position = next((item for item in positions if item.ticket == ticket), None)
+        if not position:
             return f"❌ Ticket `#{ticket}` not found in open positions."
 
-        symbol = pos.symbol
-        df = await self.fetch_candles(symbol, "M5", 200)
-        if df.empty:
-            return f"❌ Could not fetch data for {symbol}."
+        basket = await db.get_basket_for_ticket(ticket)
+        initial_stop = float(basket["initial_stop"]) if basket else position.sl
+        if initial_stop <= 0:
+            return f"❌ Ticket `#{ticket}` has no recorded protective stop, so safe R-based management is unavailable."
 
-        current_price = df.iloc[-1]["close"]
-        atr_val = atr(df, 14).iloc[-1]
-        
-        # Institutional Analysis for SL/TP
-        # We look for the nearest S/D zone or structural pivot
-        struct = analyze_structure(df)
-        zones = detect_sd_zones(df)
-        
-        new_sl = None
-        new_tp = None
-        
-        if pos.direction == "BUY":
-            # SL below recent swing low or demand zone
-            swing_low = df["low"].tail(20).min()
-            demand = next((z.price_low for z in zones if z.type == ZoneType.DEMAND and z.price_high < current_price), None)
-            new_sl = min(swing_low, demand) if demand else swing_low
-            new_sl -= atr_val * 0.5 # Buffer
-            
-            # TP at next supply zone or swing high
-            swing_high = df["high"].tail(50).max()
-            supply = next((z.price_high for z in zones if z.type == ZoneType.SUPPLY and z.price_low > current_price), None)
-            new_tp = max(swing_high, supply) if supply else swing_high
-        else:
-            # SL above recent swing high or supply zone
-            swing_high = df["high"].tail(20).max()
-            supply = next((z.price_high for z in zones if z.type == ZoneType.SUPPLY and z.price_low > current_price), None)
-            new_sl = max(swing_high, supply) if supply else swing_high
-            new_sl += atr_val * 0.5 # Buffer
-            
-            # TP at next demand zone or swing low
-            swing_low = df["low"].tail(50).min()
-            demand = next((z.price_low for z in zones if z.type == ZoneType.DEMAND and z.price_high < current_price), None)
-            new_tp = min(swing_low, demand) if demand else swing_low
+        df = await self.fetch_candles(position.symbol, "M5", 200)
+        if df.empty or len(df) < 30:
+            return f"❌ Could not fetch sufficient closed M5 data for {position.symbol}."
+        current_price = float(df.iloc[-1]["close"])
+        atr_val = float(atr(df, 14).iloc[-1])
+        structure = analyze_structure(df, lookback=3)
+        pools = build_liquidity_pools(df, structure.swing_highs, structure.swing_lows, "M5")
+        target_pool = select_market_target(pools, position.direction, position.entry_price)
 
-        # Apply modification
-        success = await self.executor.modify_position(ticket, sl=new_sl, tp=new_tp)
-        if success:
-            await db.log_trade_action(ticket, "Manual Optimization", f"Re-analyzed structure. SL: {new_sl:.5f}, TP: {new_tp:.5f}")
-            return (
-                f"✅ **Position #{ticket} Optimized**\n"
-                f"Symbol: `{symbol}`\n"
-                f"New SL: `{new_sl:.5f}`\n"
-                f"New TP: `{new_tp:.5f}`\n\n"
-                f"Analysis: Based on recent M5 swing points and detected S/D zones."
+        try:
+            state = ManagementState(basket["state"]) if basket else ManagementState.INITIAL
+        except ValueError:
+            state = ManagementState.INITIAL
+        partial_done = await db.basket_has_action(basket["id"], "Partial Take Profit") if basket else False
+        manager = TradeManager(
+            breakeven_at_rr=self.settings.breakeven_at_rr,
+            profit_lock_rr=self.settings.profit_lock_rr,
+            runner_rr=self.settings.runner_rr,
+            min_rr=self.settings.min_rr_ratio,
+            stop_atr_buffer=self.settings.trailing_buffer_atr,
+            allow_partial_tp=self.settings.allow_partial_tp,
+            allow_tp_extension=self.settings.allow_tp_extension,
+        )
+        action = manager.evaluate(
+            direction=position.direction,
+            entry_price=position.entry_price,
+            initial_stop=initial_stop,
+            current_sl=position.sl,
+            current_tp=position.tp,
+            current_price=current_price,
+            atr_value=atr_val,
+            structure=structure,
+            state=state,
+            partial_exit_done=partial_done,
+            structural_target=target_pool.level if target_pool else None,
+            costs_buffer=atr_val * 0.02,
+        )
+        current_r = manager.current_r(position.direction, position.entry_price, initial_stop, current_price)
+        if action.action == "none":
+            return f"ℹ️ **Position #{ticket} Reviewed**\nSymbol: `{position.symbol}`\nCurrent R: `{current_r:.2f}`\nNo material structure-backed SL/TP improvement is justified."
+        if action.action == "close_full":
+            return f"⚠️ **Position #{ticket} Thesis Warning**\nSymbol: `{position.symbol}`\nCurrent R: `{current_r:.2f}`\n_{action.reason}_\n\nUse `/close {ticket}` if you want to exit manually; the autonomous manager will continue to monitor it."
+        if action.action == "close_partial":
+            return f"ℹ️ **Position #{ticket} Reviewed**\nA partial realization is eligible at `{current_r:.2f}R`, but no manual partial order was sent by this command."
+
+        new_sl = action.new_sl if action.action == "move_sl" else position.sl
+        new_tp = action.new_tp if action.action == "move_tp" else position.tp
+        if not await self.executor.modify_position(ticket, sl=new_sl, tp=new_tp):
+            return f"❌ MT5 rejected the proposed optimization for ticket `#{ticket}`. The existing SL/TP remains unchanged."
+
+        if basket:
+            await db.update_basket_state(basket["id"], state=action.state.value)
+            await db.update_trade_layer(basket["layer_id"], stop_loss=new_sl, take_profit=new_tp)
+            await db.log_basket_action(
+                basket_id=basket["id"],
+                ticket=ticket,
+                action="Manual Structural Optimization",
+                details={"old_sl": position.sl, "new_sl": new_sl, "old_tp": position.tp, "new_tp": new_tp, "current_r": current_r, "reason": action.reason},
             )
         else:
-            return f"❌ Failed to modify position #{ticket}. Check MT5 logs."
+            await db.log_trade_action(ticket, "Manual Structural Optimization", action.reason)
+        return (
+            f"✅ **Position #{ticket} Optimized**\n"
+            f"Symbol: `{position.symbol}`\n"
+            f"Current R: `{current_r:.2f}`\n"
+            f"SL: `{position.sl:.5f}` → `{new_sl:.5f}`\n"
+            f"TP: `{position.tp:.5f}` → `{new_tp:.5f}`\n\n"
+            f"Reason: _{action.reason}_"
+        )
 
     async def _reload_settings(self):
         """Reload settings from DB."""

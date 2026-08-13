@@ -28,12 +28,14 @@ import json
 import pandas as pd
 import numpy as np
 
-from analysis.structure import analyze_structure, Trend
-from analysis.supply_demand import detect_sd_zones, ZoneType
-from analysis.scoring import compute_signal, TradeSignal
-from analysis.sessions import check_trading_session, Session
-from analysis.confirmation import get_confirmation
+from analysis.structure import analyze_structure
+from analysis.supply_demand import detect_sd_zones
 from analysis.indicators import atr, pip_value
+from analysis.liquidity import build_liquidity_pools, select_market_target
+from execution.manager import ManagementState, TradeManager
+from strategy.setup_scorer import score_setup_quality
+from strategy.setup_validator import EntryMode, SetupValidator
+from analysis.sessions import check_trading_session, Session
 from config import TradeSettings
 
 logger = logging.getLogger(__name__)
@@ -48,7 +50,9 @@ class BacktestTrade:
     entry_price: float = 0.0
     exit_price: float = 0.0
     stop_loss: float = 0.0
+    initial_stop: float = 0.0
     take_profit: float = 0.0
+    management_state: str = ManagementState.INITIAL.value
     lot_size: float = 0.01
     score: float = 0.0
     rr_ratio: float = 0.0
@@ -57,6 +61,8 @@ class BacktestTrade:
     exit_reason: str = ""
     bars_held: int = 0
     partial_closed: bool = False
+    partial_percent: float = 0.0
+    partial_realized_pnl: float = 0.0
     factors: list = field(default_factory=list)
 
 
@@ -186,13 +192,9 @@ class BacktestEngine:
         self.reset()
         pip = pip_value(symbol)
 
-        # Pre-compute HTF structures (update periodically)
-        htf_structures = []
-        for htf_df in htf_dfs:
-            if len(htf_df) >= 20:
-                htf_structures.append(analyze_structure(htf_df))
-
-        # Iterate through each bar
+        # Iterate through each bar. Higher-timeframe structures are rebuilt
+        # from their own data slices at the simulated timestamp; future HTF bars
+        # are never visible to an earlier LTF decision.
         min_bars = 50  # Need at least 50 bars for analysis
 
         for i in range(min_bars, len(df)):
@@ -215,12 +217,14 @@ class BacktestEngine:
                 self.equity_curve.append(self.balance + self._unrealized_pnl(current_bar))
                 continue
 
-            # Check daily limits
+            # Check daily limits using the same asymmetric loss/profit stops as live execution.
             if self.daily_trades >= self.settings.max_trades_per_day:
                 self.equity_curve.append(self.balance)
                 continue
-
-            if self.daily_pnl < -(self.balance * self.settings.max_daily_loss_pct / 100):
+            if self.daily_pnl <= -(self.balance * self.settings.max_daily_loss_pct / 100):
+                self.equity_curve.append(self.balance)
+                continue
+            if self.daily_pnl >= self.balance * self.settings.daily_profit_stop_pct / 100:
                 self.equity_curve.append(self.balance)
                 continue
 
@@ -246,103 +250,88 @@ class BacktestEngine:
                 self.equity_curve.append(self.balance)
                 continue
 
-            # Determine direction
-            current_price = current_bar["close"]
-            if structure.trend == Trend.BULLISH:
-                direction = "BUY"
-            elif structure.trend == Trend.BEARISH:
-                direction = "SELL"
-            elif structure.current_zone == "discount":
-                direction = "BUY"
-            elif structure.current_zone == "premium":
-                direction = "SELL"
-            else:
-                self.equity_curve.append(self.balance)
-                continue
+            # Build HTF structures using only bars completed at the current LTF timestamp.
+            htf_structures = []
+            for htf_df in htf_dfs:
+                if "time" not in htf_df.columns:
+                    continue  # Cannot prove causality without timestamps.
+                htf_slice = htf_df[htf_df["time"] <= current_time]
+                if len(htf_slice) >= 20:
+                    htf_structures.append(analyze_structure(htf_slice, lookback=3))
 
-            # Calculate SL and TP
-            atr_series = atr(slice_df, 14)
-            atr_val = atr_series.iloc[-1]
-            if atr_val <= 0 or np.isnan(atr_val):
-                atr_val = current_price * 0.002
+            try:
+                entry_mode = EntryMode(self.settings.entry_mode.lower())
+            except (AttributeError, ValueError):
+                entry_mode = EntryMode.CONFIRMED
+            if entry_mode == EntryMode.AGGRESSIVE and not self.settings.allow_aggressive_entry:
+                entry_mode = EntryMode.CONFIRMED
+            if entry_mode == EntryMode.EXTREME and not self.settings.allow_extreme_entry:
+                entry_mode = EntryMode.AGGRESSIVE if self.settings.allow_aggressive_entry else EntryMode.CONFIRMED
 
-            if direction == "BUY":
-                entry = current_price
-                sl = entry - atr_val * 1.5
-                tp = entry + atr_val * 1.5 * self.settings.min_rr_ratio
-            else:
-                entry = current_price
-                sl = entry + atr_val * 1.5
-                tp = entry - atr_val * 1.5 * self.settings.min_rr_ratio
-
-            # Compute signal score using real ATR
-            signal = compute_signal(
-                symbol=symbol,
-                direction=direction,
-                entry_price=entry,
-                stop_loss=sl,
-                take_profit=tp,
-                ltf_structure=structure,
-                htf_structures=htf_structures,
-                zones=zones,
-                atr_val=atr_val,
+            validator = SetupValidator(
                 min_rr=self.settings.min_rr_ratio,
-                timeframe=timeframe,
+                min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
+                displacement_body_ratio=self.settings.displacement_body_ratio_min,
+                displacement_range_ratio=self.settings.displacement_range_ratio_min,
+                stop_atr_buffer=self.settings.structural_stop_atr_buffer,
+                require_ltf_confirmation=self.settings.require_candle_confirmation,
             )
-
-            # Check score threshold
-            if signal.score < self.settings.score_threshold:
+            candidates = []
+            for direction in ("BUY", "SELL"):
+                validation = validator.validate(
+                    symbol=symbol,
+                    direction=direction,
+                    timeframe=timeframe,
+                    df=slice_df,
+                    structure=structure,
+                    htf_structures=htf_structures,
+                    zones=zones,
+                    entry_mode=entry_mode,
+                    ltf_df=slice_df,
+                )
+                quality = score_setup_quality(
+                    validation,
+                    structure,
+                    min_score=self.settings.min_setup_score,
+                    extreme_score=self.settings.extreme_setup_score,
+                )
+                if quality.approved:
+                    candidates.append((validation, quality))
+            if not candidates:
                 self.equity_curve.append(self.balance)
                 continue
 
-            # Entry confirmation
-            nearest_zone = None
-            for z in zones:
-                if direction == "BUY" and z.zone_type == ZoneType.DEMAND:
-                    nearest_zone = z
-                    break
-                elif direction == "SELL" and z.zone_type == ZoneType.SUPPLY:
-                    nearest_zone = z
-                    break
+            validation, quality = max(candidates, key=lambda candidate: candidate[1].score)
+            direction = validation.direction
+            entry = validation.entry_price
+            sl = validation.stop_loss
+            tp = validation.take_profit
+            atr_val = float(atr(slice_df, 14).iloc[-1])
 
-            if nearest_zone:
-                confirmation = get_confirmation(
-                    slice_df.tail(20),
-                    direction,
-                    zone_top=nearest_zone.top,
-                    zone_bottom=nearest_zone.bottom,
-                    require_retest=True,
-                    require_candle=True,
-                    require_displacement=self.settings.require_displacement,
-                )
-                if not confirmation.confirmed:
-                    self.equity_curve.append(self.balance)
-                    continue
-
-            # Position sizing
-            risk_amount = self.balance * (self.settings.risk_per_trade / 100)
+            # The backtest has no broker contract specification, so it retains
+            # its explicit approximation but uses the same capped setup budget.
+            risk_amount = self.balance * min(self.settings.risk_per_trade, self.settings.max_setup_risk_pct, 1.0) / 100
             sl_distance = abs(entry - sl)
             lot_size = risk_amount / (sl_distance / pip * pip * 100000) if pip > 0 else 0.01
             lot_size = max(round(lot_size, 2), 0.01)
 
-            # Apply slippage
             if direction == "BUY":
                 entry += self.slippage_pips * pip
             else:
                 entry -= self.slippage_pips * pip
 
-            # Open trade
             trade = BacktestTrade(
                 entry_time=current_time,
                 symbol=symbol,
                 direction=direction,
                 entry_price=entry,
                 stop_loss=sl,
+                initial_stop=sl,
                 take_profit=tp,
                 lot_size=lot_size,
-                score=signal.score,
-                rr_ratio=signal.rr_ratio,
-                factors=[{"name": f.name, "score": f.score, "weight": f.weight} for f in signal.factors],
+                score=quality.score,
+                rr_ratio=validation.rr_ratio,
+                factors=[{"name": factor.name, "points": factor.points, "maximum": factor.maximum} for factor in quality.factors],
             )
             self.open_trade = trade
             self.daily_trades += 1
@@ -368,53 +357,79 @@ class BacktestEngine:
             return (trade.entry_price - bar["close"]) / pip * trade.lot_size * 100000 * pip
 
     def _manage_trade(self, df: pd.DataFrame, bar_idx: int, pip: float):
-        """Check if SL or TP has been hit."""
+        """Apply conservative intrabar exits, then structural management on the close."""
         trade = self.open_trade
         if not trade:
             return
-
         bar = df.iloc[bar_idx]
         trade.bars_held += 1
 
-        # Check SL hit
+        # Conservative OHLC convention: when both thresholds may occur within a
+        # bar, the protective stop is evaluated before the target.
         if trade.direction == "BUY" and bar["low"] <= trade.stop_loss:
             self._close_trade(trade, trade.stop_loss, "stop_loss", pip)
             return
-        elif trade.direction == "SELL" and bar["high"] >= trade.stop_loss:
+        if trade.direction == "SELL" and bar["high"] >= trade.stop_loss:
             self._close_trade(trade, trade.stop_loss, "stop_loss", pip)
             return
-
-        # Check TP hit
         if trade.direction == "BUY" and bar["high"] >= trade.take_profit:
             self._close_trade(trade, trade.take_profit, "take_profit", pip)
             return
-        elif trade.direction == "SELL" and bar["low"] <= trade.take_profit:
+        if trade.direction == "SELL" and bar["low"] <= trade.take_profit:
             self._close_trade(trade, trade.take_profit, "take_profit", pip)
             return
 
-        # Trade management: breakeven at 1R
-        risk = abs(trade.entry_price - trade.stop_loss)
-        if risk <= 0:
+        history = df.iloc[: bar_idx + 1]
+        if len(history) < 30:
             return
-
-        if trade.direction == "BUY":
-            current_rr = (bar["close"] - trade.entry_price) / risk
-            # Move to breakeven
-            if current_rr >= 1.0 and trade.stop_loss < trade.entry_price:
-                trade.stop_loss = trade.entry_price
-            # Partial close at 2R
-            if current_rr >= 2.0 and not trade.partial_closed:
-                trade.partial_closed = True
-                partial_pnl = self._calculate_pnl(trade, bar["close"], pip, percent=0.5)
-                self.balance += partial_pnl
-        else:
-            current_rr = (trade.entry_price - bar["close"]) / risk
-            if current_rr >= 1.0 and trade.stop_loss > trade.entry_price:
-                trade.stop_loss = trade.entry_price
-            if current_rr >= 2.0 and not trade.partial_closed:
-                trade.partial_closed = True
-                partial_pnl = self._calculate_pnl(trade, bar["close"], pip, percent=0.5)
-                self.balance += partial_pnl
+        structure = analyze_structure(history, lookback=3)
+        pools = build_liquidity_pools(history, structure.swing_highs, structure.swing_lows, "M5")
+        target_pool = select_market_target(pools, trade.direction, trade.entry_price)
+        atr_value = float(atr(history, 14).iloc[-1])
+        if atr_value <= 0 or np.isnan(atr_value):
+            return
+        try:
+            state = ManagementState(trade.management_state)
+        except ValueError:
+            state = ManagementState.INITIAL
+        manager = TradeManager(
+            breakeven_at_rr=self.settings.breakeven_at_rr,
+            profit_lock_rr=self.settings.profit_lock_rr,
+            runner_rr=self.settings.runner_rr,
+            min_rr=self.settings.min_rr_ratio,
+            stop_atr_buffer=self.settings.trailing_buffer_atr,
+            allow_partial_tp=self.settings.allow_partial_tp,
+            allow_tp_extension=self.settings.allow_tp_extension,
+        )
+        action = manager.evaluate(
+            direction=trade.direction,
+            entry_price=trade.entry_price,
+            initial_stop=trade.initial_stop,
+            current_sl=trade.stop_loss,
+            current_tp=trade.take_profit,
+            current_price=float(bar["close"]),
+            atr_value=atr_value,
+            structure=structure,
+            state=state,
+            partial_exit_done=trade.partial_closed,
+            structural_target=target_pool.level if target_pool else None,
+            costs_buffer=atr_value * 0.02,
+        )
+        if action.action == "move_sl" and action.new_sl is not None:
+            trade.stop_loss = action.new_sl
+            trade.management_state = action.state.value
+        elif action.action == "move_tp" and action.new_tp is not None:
+            trade.take_profit = action.new_tp
+            trade.management_state = action.state.value
+        elif action.action == "close_partial" and action.close_percent and not trade.partial_closed:
+            trade.partial_closed = True
+            trade.partial_percent = action.close_percent
+            trade.partial_realized_pnl = self._calculate_pnl(trade, float(bar["close"]), pip, percent=action.close_percent)
+            self.balance += trade.partial_realized_pnl
+            self.daily_pnl += trade.partial_realized_pnl
+            trade.management_state = action.state.value
+        elif action.action == "close_full":
+            self._close_trade(trade, float(bar["close"]), "thesis_exit", pip)
 
     def _calculate_pnl(self, trade: BacktestTrade, exit_price: float, pip: float, percent: float = 1.0) -> float:
         """Calculate P&L for a trade (or partial)."""
@@ -430,29 +445,21 @@ class BacktestEngine:
         """Close a trade and record it."""
         trade.exit_price = exit_price
         trade.exit_reason = reason
-        # Calculate P&L (account for partial close)
-        remaining_percent = 0.5 if trade.partial_closed else 1.0
+        # Calculate P&L using the original partial amount and remaining live volume.
+        remaining_percent = 1.0 - trade.partial_percent if trade.partial_closed else 1.0
         pnl = self._calculate_pnl(trade, exit_price, pip, percent=remaining_percent)
-        
-        if trade.partial_closed:
-            # Add the remaining P&L to balance (partial already added)
-            self.balance += pnl
-            # Total P&L includes both portions
-            partial_pnl = self._calculate_pnl(trade, trade.take_profit if reason == "take_profit" else exit_price, pip, percent=0.5)
-            trade.pnl = pnl + partial_pnl
-        else:
-            trade.pnl = pnl
-            self.balance += pnl
+        self.balance += pnl
+        trade.pnl = trade.partial_realized_pnl + pnl
 
-        # Actual RR
-        risk = abs(trade.entry_price - trade.stop_loss)
+        # Actual RR must use the initial structural stop, not a later protected stop.
+        risk = abs(trade.entry_price - trade.initial_stop)
         if risk > 0:
             if trade.direction == "BUY":
                 trade.rr_result = (exit_price - trade.entry_price) / risk
             else:
                 trade.rr_result = (trade.entry_price - exit_price) / risk
         
-        self.daily_pnl += trade.pnl
+        self.daily_pnl += pnl
         self.trades.append(trade)
         self.open_trade = None
 

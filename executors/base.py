@@ -76,6 +76,10 @@ class BaseExecutor(ABC):
         """Modify SL and/or TP of an open position."""
         ...
 
+    async def close_partial(self, ticket: int, volume: float) -> bool:
+        """Close part of a position. Executors without support return ``False``."""
+        return False
+
     @abstractmethod
     async def close_all_positions(self) -> int:
         """Close all open positions. Returns count closed."""

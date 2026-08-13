@@ -331,6 +331,60 @@ class MT5Executor(BaseExecutor):
         result = mt5.order_send(request)
         return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
 
+    async def close_partial(self, ticket: int, volume: float) -> bool:
+        """Close a broker-valid fraction of a live MT5 position."""
+        if not MT5_AVAILABLE or volume <= 0:
+            return False
+        if not await self._ensure_connected():
+            return False
+
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            return False
+        pos = positions[0]
+        info = mt5.symbol_info(pos.symbol)
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if info is None or tick is None:
+            return False
+
+        step = float(getattr(info, "volume_step", 0.01) or 0.01)
+        min_volume = float(getattr(info, "volume_min", step) or step)
+        close_volume = min(float(volume), float(pos.volume))
+        close_volume = int((close_volume + 1e-12) / step) * step
+        if close_volume + 1e-12 < min_volume:
+            logger.error("Partial close volume %.8f is below %s minimum %.8f", close_volume, pos.symbol, min_volume)
+            return False
+
+        opposite_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        price = tick.bid if opposite_type == mt5.ORDER_TYPE_SELL else tick.ask
+        filling_mode = mt5.ORDER_FILLING_IOC
+        sym_filling = getattr(info, "filling_mode", 0)
+        if sym_filling & 1:
+            filling_mode = mt5.ORDER_FILLING_FOK
+        elif sym_filling & 2:
+            filling_mode = mt5.ORDER_FILLING_IOC
+        else:
+            filling_mode = mt5.ORDER_FILLING_RETURN
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pos.symbol,
+            "volume": float(close_volume),
+            "type": opposite_type,
+            "position": ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": pos.magic,
+            "comment": "SMC Bot Partial Close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling_mode,
+        }
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error("Partial close failed for #%s: %s", ticket, mt5.last_error() if result is None else result.comment)
+            return False
+        return True
+
     async def modify_position(self, ticket: int, sl: float = None, tp: float = None) -> bool:
         if not MT5_AVAILABLE:
             return False

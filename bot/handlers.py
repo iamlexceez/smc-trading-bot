@@ -141,30 +141,31 @@ class BotHandlers:
         """Show help message."""
         help_text = (
             "🤖 **SMC Trading Bot Commands**\n\n"
-            "**Core Commands:**\n"
-            "/start - Show main menu\n"
-            "/scan - Scan enabled symbols for signals\n"
-            "/account - Show MT5 account info\n"
-            "/positions - Show open positions\n"
-            "/close_all - Close all open positions\n"
-            "/settings - Adjust bot settings\n"
-            "/debug_mt5 - Run MT5 health & permission check\n\n"
-            "**Pro Features:**\n"
-            "/aggressive [on|off] - Toggle Aggressive Growth mode\n"
-            "/scalping [on|off] - Toggle M1/M5 Scalping mode\n"
-            "/target [amount] - Set cycle target balance\n"
-            "/burn_to [amount] - Burn demo balance to target\n"
-            "/set_balance [amount] - Set virtual risk balance\n\n"
-            "**Symbol Management:**\n"
-            "/expert_mode - Activate institutional expert pairs\n"
-            "/focus_indices [on|off] - Prioritize Volatility Indices\n"
-            "/toggle_symbol [name] - Enable/Disable a specific pair\n\n"
-            "**Advanced:**\n"
-            "/sessions - Check trading session status\n"
-            "/sessions_all - Enable all-session trading\n"
-            "/news - Check news filter status\n"
+            "**Core Controls:**\n"
+            "/start - Show the main menu\n"
+            "/scan - Scan enabled symbols using hard validity gates\n"
+            "/positions - Show live positions and recorded bot actions\n"
+            "/baskets - Show setup risk budgets and planned layers\n"
+            "/manage [ticket] - Review one position and safely optimize its SL/TP\n"
+            "/safety - Show active limits and circuit breakers\n"
+            "/account - Show MT5 account information\n"
+            "/settings - Open the settings dashboard\n"
+            "/debug_mt5 - Run the MT5 connection and permission check\n\n"
+            "**Setup & Risk:**\n"
+            "/entry_mode [confirmed|aggressive|extreme confirm] - Select the confirmation model\n"
+            "/risk [pct] - Set risk per setup within the hard 1% cap\n"
+            "/rr [ratio] - Set the minimum market-derived RR\n"
+            "/score [pct] - Set the minimum setup-quality threshold\n"
+            "/daily_limit [pct] - Set the daily profit stop\n"
+            "/cooldown [min] - Set the symbol cooldown\n\n"
+            "**Monitoring & Analysis:**\n"
+            "/journal - View the daily learning journal\n"
+            "/optimize - Run the performance optimizer\n"
+            "/profile [symbol] - View Symbol DNA\n"
             "/history - Show recent trade history\n"
-            "/backtest [symbol] [tf] [days] - Run a backtest"
+            "/backtest [symbol] [tf] [days] - Run a backtest\n"
+            "/news - Check the news filter\n"
+            "/sessions - Check trading-session status"
         )
         await update.message.reply_text(help_text)
 
@@ -217,8 +218,9 @@ class BotHandlers:
     @admin_only
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Trigger a market scan and auto-execute valid signals."""
+        reply_target = update.callback_query.message if update.callback_query else update.message
         if self.scheduler:
-            await update.message.reply_text("🔍 **MANUAL SCAN & EXECUTION INITIATED**\n_Scanning for high-probability setups..._")
+            await reply_target.reply_text("🔍 **MANUAL SCAN & EXECUTION INITIATED**\n_Scanning for high-probability setups..._")
             
             # Use the existing scan logic
             signals = []
@@ -231,7 +233,7 @@ class BotHandlers:
                     
                     # 2. Analyze
                     signal = await self.scheduler.analyze_symbol(symbol)
-                    if not signal or signal.score < self.scheduler.settings.score_threshold:
+                    if not signal or not signal.passed or signal.score < self.scheduler.settings.min_setup_score:
                         continue
                     
                     # 3. Auto-Execute
@@ -242,67 +244,81 @@ class BotHandlers:
                     logger.error(f"Error in manual scan for {symbol}: {e}")
 
             if not signals:
-                await update.message.reply_text("No tradeable setups found at this time.")
+                await reply_target.reply_text("No tradeable setups found at this time.")
         else:
-            await update.message.reply_text("Scheduler not initialized.")
+            await reply_target.reply_text("Scheduler not initialized.")
 
     @admin_only
     async def cmd_analyze(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show analysis menu or analyze a specific symbol."""
+        reply_target = update.callback_query.message if update.callback_query else update.message
         if context.args:
             symbol = " ".join(context.args)
             await self._do_analysis(update, symbol)
         else:
-            await update.message.reply_text(
+            await reply_target.reply_text(
                 "Select a symbol to analyze:",
                 reply_markup=keyboards.analysis_menu(self.settings.symbols)
             )
 
     async def _do_analysis(self, update: Update, symbol: str):
         """Perform deep analysis on a symbol."""
+        reply_target = update.callback_query.message if update.callback_query else update.message
         if self.scheduler:
-            await update.message.reply_text(f"📊 Analyzing {symbol}...")
+            await reply_target.reply_text(f"📊 Analyzing {symbol}...")
             signal = await self.scheduler.analyze_symbol(symbol)
             if signal:
-                await update.message.reply_text(format_signal_report(signal))
+                await reply_target.reply_text(format_signal_report(signal), parse_mode="Markdown")
             else:
-                await update.message.reply_text(f"No tradeable signal for {symbol} at this time.")
+                await reply_target.reply_text(f"No tradeable signal for {symbol} at this time.")
         else:
-            await update.message.reply_text("Scheduler not initialized.")
+            await reply_target.reply_text("Scheduler not initialized.")
 
     @admin_only
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show open positions with management history."""
+        """Show live positions with basket state and recent bot management actions."""
+        reply_target = update.callback_query.message if update.callback_query else update.message
         positions = await self.executor.get_open_positions()
         if not positions:
-            await update.message.reply_text("No open positions.")
+            await reply_target.reply_text("No open positions.")
             return
 
-        total_profit = 0
-        for p in positions:
-            emoji = "🟢" if p.profit >= 0 else "🔴"
-            
-            # Fetch logs for this position
-            logs = await db.get_trade_logs(ticket=p.ticket)
-            log_text = ""
-            if logs:
-                log_text = "\n   🛠 **Actions taken**:\n" + "\n".join([f"   • {l['action']}: {l['details']}" for l in logs[-3:]]) # Show last 3 actions
+        total_profit = 0.0
+        for position in positions:
+            emoji = "🟢" if position.profit >= 0 else "🔴"
+            basket = await db.get_basket_for_ticket(position.ticket)
+            logs = await db.get_trade_logs(ticket=position.ticket)
+            if basket:
+                layers = await db.get_basket_layers(basket["id"])
+                open_layers = sum(1 for layer in layers if layer["status"] == "open")
+                planned_layers = sum(1 for layer in layers if layer["status"] == "planned")
+                basket_text = (
+                    f"\n📦 Basket `#{basket['id']}` — `{basket['state']}`\n"
+                    f"Risk: `${basket['reserved_risk']:.2f}` / `${basket['max_risk']:.2f}` | "
+                    f"Layers: `{open_layers}` open, `{planned_layers}` planned"
+                )
             else:
-                log_text = "\n   *No automated improvements yet.*"
+                basket_text = "\n📦 *Manual/untracked MT5 position — no automated layers will be added.*"
+            if logs:
+                actions = []
+                for log in logs[-3:]:
+                    detail = str(log["details"])
+                    actions.append(f"• **{log['action']}** — {detail[:160]}")
+                log_text = "\n🛠 **Recent actions:**\n" + "\n".join(actions)
+            else:
+                log_text = "\n*No bot management action recorded yet.*"
 
             text = (
-                f"{emoji} **#{p.ticket} | {p.direction} {p.volume} {p.symbol}**\n"
-                f"Entry: `{p.entry_price:.5f}` | SL: `{p.sl:.5f}` | TP: `{p.tp:.5f}`\n"
-                f"PnL: **${p.profit:.2f}**"
-                f"{log_text}"
+                f"{emoji} **#{position.ticket} | {position.direction} {position.volume} {position.symbol}**\n"
+                f"Entry: `{position.entry_price:.5f}` | SL: `{position.sl:.5f}` | TP: `{position.tp:.5f}`\n"
+                f"PnL: **${position.profit:.2f}**"
+                f"{basket_text}{log_text}"
             )
-            
-            # Add a "Manage" button for each position
-            keyboard = [[InlineKeyboardButton("🎯 Optimize Position", callback_data=f"manage_{p.ticket}")]]
-            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-            total_profit += p.profit
+            keyboard = [[InlineKeyboardButton("🎯 Review & Optimize", callback_data=f"manage_{position.ticket}")]]
+            await reply_target.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            total_profit += position.profit
 
-        await update.message.reply_text(f"💰 **Total Open PnL: ${total_profit:.2f}**")
+        await reply_target.reply_text(f"💰 **Total Open PnL: ${total_profit:.2f}**", parse_mode="Markdown")
 
     @admin_only
     async def cmd_manage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -351,12 +367,14 @@ class BotHandlers:
     def _format_settings(self) -> str:
         return (
             "⚙️ **Current Settings**\n\n"
-            f"Risk/trade: {self.settings.risk_per_trade}%\n"
-            f"Max daily loss: {self.settings.max_daily_loss_pct}%\n"
+            f"Entry mode: {self.settings.entry_mode.upper()}\n"
+            f"Risk/setup: {self.settings.risk_per_trade}% (cap {self.settings.max_setup_risk_pct}%)\n"
+            f"Open-risk ceiling: {self.settings.max_total_open_risk_pct}%\n"
+            f"Daily loss / profit stop: -{self.settings.max_daily_loss_pct}% / +{self.settings.daily_profit_stop_pct}%\n"
             f"Max trades/day: {self.settings.max_trades_per_day}\n"
-            f"Max positions: {self.settings.max_open_positions}\n"
+            f"Max positions / layers: {self.settings.max_open_positions} / {self.settings.max_layers}\n"
             f"Min RR: 1:{self.settings.min_rr_ratio}\n"
-            f"Score threshold: {self.settings.score_threshold}%\n"
+            f"Minimum setup quality: {self.settings.min_setup_score}%\n"
             f"Max spread: {self.settings.max_spread_pips} pips\n"
             f"Cooldown: {self.settings.symbol_cooldown_minutes} min\n"
             f"Auto-trade: {'ON' if self.settings.auto_trade else 'OFF'}\n"
@@ -802,13 +820,77 @@ class BotHandlers:
         if context.args:
             try:
                 val = float(context.args[0])
-                self.settings.risk_per_trade = max(0.1, min(val, 10.0))
+                self.settings.risk_per_trade = max(0.1, min(val, self.settings.max_setup_risk_pct, 1.0))
                 await db.save_settings(self.settings)
-                await update.message.reply_text(f"✅ Risk per trade set to {self.settings.risk_per_trade}%")
+                await update.message.reply_text(f"✅ Risk per setup set to {self.settings.risk_per_trade}% (hard capped at {min(self.settings.max_setup_risk_pct, 1.0)}%).")
             except ValueError:
                 await update.message.reply_text("Usage: /risk 1.0")
         else:
-            await update.message.reply_text(f"Current risk: {self.settings.risk_per_trade}%\nUsage: /risk 1.5")
+            await update.message.reply_text(f"Current risk per setup: {self.settings.risk_per_trade}% (hard cap: {min(self.settings.max_setup_risk_pct, 1.0)}%)\nUsage: /risk 0.75")
+
+    @admin_only
+    async def cmd_entry_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set the required entry-confirmation mode without changing risk caps."""
+        if not context.args:
+            await update.message.reply_text(
+                f"**Entry Mode:** `{self.settings.entry_mode}`\n\n"
+                "`/entry_mode confirmed` — requires LTF confirmation after the full setup chain.\n"
+                "`/entry_mode aggressive` — earlier entry after sweep, displacement, BOS/CHOCH, zone, and real target.\n"
+                "`/entry_mode extreme confirm` — only enabled when extreme mode is explicitly authorized and setup quality is at least 90."
+            )
+            return
+        mode = context.args[0].lower()
+        if mode not in {"confirmed", "aggressive", "extreme"}:
+            await update.message.reply_text("Usage: `/entry_mode confirmed|aggressive|extreme [confirm]`")
+            return
+        if mode == "extreme":
+            if len(context.args) < 2 or context.args[1].lower() != "confirm":
+                await update.message.reply_text("⚠️ Extreme entry still requires all hard validity gates but has a stricter 90 quality score. Use `/entry_mode extreme confirm` to enable it.")
+                return
+            self.settings.allow_extreme_entry = True
+        self.settings.entry_mode = mode
+        await db.save_settings(self.settings)
+        await update.message.reply_text(f"✅ Entry mode set to **{mode.upper()}**. Risk remains capped at `{self.settings.max_setup_risk_pct}%` per setup.")
+
+    @admin_only
+    async def cmd_safety(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the active portfolio, daily, and execution safeguards."""
+        streak = await db.get_consecutive_losses()
+        text = (
+            "🛡 **Execution Safety Dashboard**\n\n"
+            f"Entry mode: `{self.settings.entry_mode}`\n"
+            f"Risk/setup: `{self.settings.risk_per_trade}%` (hard cap `{self.settings.max_setup_risk_pct}%`)\n"
+            f"Open-risk ceiling: `{self.settings.max_total_open_risk_pct}%`\n"
+            f"Daily loss stop: `-{self.settings.max_daily_loss_pct}%`\n"
+            f"Emergency loss stop: `-{self.settings.absolute_daily_stop_pct}%`\n"
+            f"Daily profit stop: `+{self.settings.daily_profit_stop_pct}%`\n"
+            f"Loss-streak breaker: `{streak}/{self.settings.max_consecutive_losses}`\n"
+            f"Max positions: `{self.settings.max_open_positions}`\n"
+            f"Max layers/setup: `{self.settings.max_layers}`\n"
+            f"Minimum RR: `1:{self.settings.min_rr_ratio}`\n"
+            f"Minimum quality: `{self.settings.min_setup_score}` / 100\n"
+            f"Signal TTL: `{self.settings.max_signal_age_minutes} min`"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
+
+    @admin_only
+    async def cmd_baskets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show active setup baskets, reserved risk, and layer progress."""
+        baskets = await db.get_open_baskets()
+        if not baskets:
+            await update.message.reply_text("No active bot-managed baskets. Manual MT5 positions are shown in `/positions`.")
+            return
+        lines = ["📦 **Active Trade Baskets**\n"]
+        for basket in baskets:
+            layers = await db.get_basket_layers(basket["id"])
+            open_layers = sum(1 for layer in layers if layer["status"] == "open")
+            planned_layers = sum(1 for layer in layers if layer["status"] == "planned")
+            lines.append(
+                f"**#{basket['id']} {basket['direction']} {basket['symbol']}**\n"
+                f"State: `{basket['state']}` | Risk reserved: `${basket['reserved_risk']:.2f}` / `${basket['max_risk']:.2f}`\n"
+                f"Layers: `{open_layers}` open, `{planned_layers}` planned | Initial SL: `{basket['initial_stop']:.5f}`\n"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     @admin_only
     async def cmd_add_broker(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -874,13 +956,15 @@ class BotHandlers:
         if context.args:
             try:
                 val = float(context.args[0])
-                self.settings.score_threshold = max(1.0, min(val, 100.0))
+                threshold = max(50.0, min(val, 100.0))
+                self.settings.score_threshold = threshold
+                self.settings.min_setup_score = threshold
                 await db.save_settings(self.settings)
-                await update.message.reply_text(f"✅ Score threshold set to {self.settings.score_threshold}%")
+                await update.message.reply_text(f"✅ Minimum setup-quality threshold set to {threshold}%.")
             except ValueError:
                 await update.message.reply_text("Usage: /score 60")
         else:
-            await update.message.reply_text(f"Current threshold: {self.settings.score_threshold}%\nUsage: /score 60")
+            await update.message.reply_text(f"Current minimum setup quality: {self.settings.min_setup_score}%\nUsage: /score 75")
 
     @admin_only
     async def cmd_daily_limit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -888,13 +972,13 @@ class BotHandlers:
         if context.args:
             try:
                 val = float(context.args[0])
-                self.settings.daily_pnl_limit_pct = max(1.0, min(val, 100.0))
+                self.settings.daily_profit_stop_pct = max(1.0, min(val, 100.0))
                 await db.save_settings(self.settings)
-                await update.message.reply_text(f"✅ Daily PnL limit set to {self.settings.daily_pnl_limit_pct}%")
+                await update.message.reply_text(f"✅ Daily profit stop set to +{self.settings.daily_profit_stop_pct}%. Daily loss protection remains -{self.settings.max_daily_loss_pct}%.")
             except ValueError:
                 await update.message.reply_text("Usage: /daily_limit 20")
         else:
-            await update.message.reply_text(f"Current daily limit: {self.settings.daily_pnl_limit_pct}%\nUsage: /daily_limit 20")
+            await update.message.reply_text(f"Current daily profit stop: +{self.settings.daily_profit_stop_pct}%\nDaily loss stop: -{self.settings.max_daily_loss_pct}%\nUsage: /daily_limit 10")
 
     @admin_only
     async def cmd_cooldown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -984,6 +1068,33 @@ class BotHandlers:
             await self.cmd_debug_mt5(update, context)
         elif data == "history":
             await self.cmd_history(update, context)
+        elif data == "safety":
+            streak = await db.get_consecutive_losses()
+            await query.edit_message_text(
+                "🛡 **Execution Safety Dashboard**\n\n"
+                f"Entry: `{self.settings.entry_mode}` | Risk/setup: `{self.settings.risk_per_trade}%` (cap `{self.settings.max_setup_risk_pct}%`)\n"
+                f"Open-risk ceiling: `{self.settings.max_total_open_risk_pct}%`\n"
+                f"Daily stop: `-{self.settings.max_daily_loss_pct}%` / `+{self.settings.daily_profit_stop_pct}%`\n"
+                f"Loss streak: `{streak}/{self.settings.max_consecutive_losses}`\n"
+                f"Positions/layers: `{self.settings.max_open_positions}/{self.settings.max_layers}`\n"
+                f"Min RR / quality: `1:{self.settings.min_rr_ratio}` / `{self.settings.min_setup_score}`\n"
+                f"Signal TTL: `{self.settings.max_signal_age_minutes} min`",
+                reply_markup=keyboards.main_menu(),
+                parse_mode="Markdown",
+            )
+        elif data == "baskets":
+            baskets = await db.get_open_baskets()
+            if not baskets:
+                text = "📦 **Active Trade Baskets**\n\nNo active bot-managed baskets."
+            else:
+                lines = ["📦 **Active Trade Baskets**\n"]
+                for basket in baskets:
+                    layers = await db.get_basket_layers(basket["id"])
+                    open_layers = sum(1 for layer in layers if layer["status"] == "open")
+                    planned_layers = sum(1 for layer in layers if layer["status"] == "planned")
+                    lines.append(f"**#{basket['id']} {basket['direction']} {basket['symbol']}**\nState: `{basket['state']}` | Risk: `${basket['reserved_risk']:.2f}/${basket['max_risk']:.2f}`\nLayers: `{open_layers}` open, `{planned_layers}` planned\n")
+                text = "\n".join(lines)
+            await query.edit_message_text(text, reply_markup=keyboards.main_menu(), parse_mode="Markdown")
         elif data == "analyze":
             await self.cmd_analyze(update, context)
         elif data == "pause":
@@ -1121,8 +1232,17 @@ class BotHandlers:
             await query.edit_message_text("Use command: `/set_balance [amount]` to set a virtual balance for risk.", reply_markup=keyboards.settings_menu())
         elif data == "set_risk":
             await query.edit_message_text(
-                f"Current risk per trade: {self.settings.risk_per_trade}%\nUse command: /risk 1.5\n(Range: 0.1% - 10%)",
+                f"Current risk/setup: {self.settings.risk_per_trade}%\nUse command: /risk 0.75\n(Hard range: 0.1% - {min(self.settings.max_setup_risk_pct, 1.0)}%)",
                 reply_markup=keyboards.settings_menu()
+            )
+        elif data == "set_entry_mode":
+            await query.edit_message_text(
+                f"Current entry mode: **{self.settings.entry_mode.upper()}**\n\n"
+                "Use `/entry_mode confirmed` for LTF confirmation.\n"
+                "Use `/entry_mode aggressive` for earlier structure-confirmed entries.\n"
+                "Use `/entry_mode extreme confirm` only for 90+ quality setups.",
+                reply_markup=keyboards.settings_menu(),
+                parse_mode="Markdown",
             )
         elif data == "set_rr":
             await query.edit_message_text(
@@ -1173,9 +1293,9 @@ class BotHandlers:
             )
         elif data == "set_daily_limit":
             await query.edit_message_text(
-                f"Current daily PnL limit: {self.settings.daily_pnl_limit_pct}%\n"
-                f"The bot will halt if profit or loss hits this %.\n"
-                f"Use command: `/daily_limit 20` to change.",
+                f"Daily profit stop: +{self.settings.daily_profit_stop_pct}%\n"
+                f"Daily loss stop: -{self.settings.max_daily_loss_pct}%\n"
+                f"Use command: `/daily_limit 10` to set the profit stop.",
                 reply_markup=keyboards.settings_menu()
             )
         elif data == "set_symbols":
@@ -1273,6 +1393,9 @@ class BotHandlers:
         app.add_handler(CommandHandler("profile", self.cmd_profile))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("risk", self.cmd_risk))
+        app.add_handler(CommandHandler("entry_mode", self.cmd_entry_mode))
+        app.add_handler(CommandHandler("safety", self.cmd_safety))
+        app.add_handler(CommandHandler("baskets", self.cmd_baskets))
         app.add_handler(CommandHandler("rr", self.cmd_rr))
         app.add_handler(CommandHandler("add_broker", self.cmd_add_broker))
         app.add_handler(CommandHandler("optimize", self.cmd_optimize))
