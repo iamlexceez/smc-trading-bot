@@ -7,7 +7,7 @@ import os
 import aiosqlite
 import json
 from datetime import datetime, date, timedelta
-from typing import Optional
+from typing import Any, Optional
 from config import TradeSettings
 
 DB_PATH = os.getenv("DB_PATH", "smc_bot.db")
@@ -191,6 +191,45 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS capital_reduction_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_mode TEXT NOT NULL,
+                broker_login TEXT NOT NULL,
+                status TEXT NOT NULL,
+                target_equity REAL NOT NULL,
+                tolerance REAL NOT NULL,
+                initial_equity REAL NOT NULL,
+                initial_balance REAL NOT NULL,
+                current_equity REAL,
+                current_balance REAL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                paused_at TEXT,
+                error_reason TEXT,
+                capital_test_active INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS capital_reduction_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                symbol TEXT,
+                direction TEXT,
+                volume REAL,
+                entry_price REAL,
+                ticket INTEGER,
+                equity_before REAL,
+                equity_after REAL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(session_id) REFERENCES capital_reduction_sessions(id)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS symbol_cooldowns (
                 symbol TEXT PRIMARY KEY,
                 last_trade_time TEXT NOT NULL
@@ -266,6 +305,8 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_model_versions_mode_role ON model_versions(account_mode, role, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hypotheses_mode_status ON research_hypotheses(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_experiments_mode_status ON policy_experiments(account_mode, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_capital_reduction_mode_status ON capital_reduction_sessions(account_mode, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_capital_reduction_actions_session ON capital_reduction_actions(session_id, created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_layers_ticket ON trade_layers(ticket)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_baskets_status ON trade_baskets(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_baskets_mode_status ON trade_baskets(account_mode, status)")
@@ -950,7 +991,10 @@ async def get_policy_trade_outcomes(
     setup records and must never be blended into broker-realized performance.
     """
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    clauses = ["t.account_mode = ?", "t.status = 'closed'", "t.pnl_r IS NOT NULL", "t.timestamp >= ?"]
+    clauses = [
+        "t.account_mode = ?", "t.status = 'closed'", "t.pnl_r IS NOT NULL", "t.timestamp >= ?",
+        "(t.ticket IS NULL OR t.ticket NOT IN (SELECT ticket FROM capital_reduction_actions WHERE ticket IS NOT NULL AND action = 'order_filled'))",
+    ]
     values: list = [account_mode, since]
     if policy_version is not None:
         clauses.append("t.policy_version = ?")
@@ -975,7 +1019,10 @@ async def get_policy_trade_outcomes(
 
 async def get_performance_summary(account_mode: str, days: Optional[int] = None, db_path: str = DB_PATH) -> dict:
     """Compute closed-trade performance for exactly one account mode."""
-    clauses = ["status = 'closed'", "account_mode = ?"]
+    clauses = [
+        "status = 'closed'", "account_mode = ?",
+        "(ticket IS NULL OR ticket NOT IN (SELECT ticket FROM capital_reduction_actions WHERE ticket IS NOT NULL AND action = 'order_filled'))",
+    ]
     values: list = [account_mode]
     if days is not None:
         clauses.append("timestamp >= ?")
@@ -1288,3 +1335,203 @@ async def get_consecutive_losses(limit: int = 50, account_mode: str = "demo", db
         else:
             break
     return streak
+
+
+async def create_capital_reduction_session(
+    *,
+    broker_login: str,
+    target_equity: float,
+    tolerance: float,
+    initial_equity: float,
+    initial_balance: float,
+    metadata: Optional[dict] = None,
+    account_mode: str = "demo",
+    db_path: str = DB_PATH,
+) -> int:
+    """Create an isolated DEMO reduction session; it never creates a strategy trade."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            """INSERT INTO capital_reduction_sessions
+               (account_mode, broker_login, status, target_equity, tolerance, initial_equity,
+                initial_balance, current_equity, current_balance, started_at, updated_at, metadata_json)
+               VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                account_mode, str(broker_login), float(target_equity), float(tolerance),
+                float(initial_equity), float(initial_balance), float(initial_equity),
+                float(initial_balance), now, now, json.dumps(metadata or {}, sort_keys=True),
+            ),
+        )
+        await conn.commit()
+        return int(cursor.lastrowid)
+
+
+async def get_active_capital_reduction_session(
+    account_mode: str = "demo", db_path: str = DB_PATH,
+) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT * FROM capital_reduction_sessions
+               WHERE account_mode = ? AND status IN ('active', 'paused')
+               ORDER BY id DESC LIMIT 1""",
+            (account_mode,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["metadata"] = json.loads(result.pop("metadata_json") or "{}")
+    result["capital_test_active"] = bool(result.get("capital_test_active"))
+    return result
+
+
+async def get_capital_reduction_session(session_id: int, db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM capital_reduction_sessions WHERE id = ?", (session_id,))
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["metadata"] = json.loads(result.pop("metadata_json") or "{}")
+    result["capital_test_active"] = bool(result.get("capital_test_active"))
+    return result
+
+
+async def update_capital_reduction_session(
+    session_id: int,
+    *,
+    status: Optional[str] = None,
+    current_equity: Optional[float] = None,
+    current_balance: Optional[float] = None,
+    error_reason: Optional[str] = None,
+    capital_test_active: Optional[bool] = None,
+    metadata: Optional[dict] = None,
+    db_path: str = DB_PATH,
+) -> None:
+    """Update session state without writing to normal trading/learning tables."""
+    fields = ["updated_at = ?"]
+    values: list[Any] = [datetime.utcnow().isoformat()]
+    if status is not None:
+        fields.append("status = ?")
+        values.append(status)
+        if status == "paused":
+            fields.append("paused_at = ?")
+            values.append(datetime.utcnow().isoformat())
+        if status in {"completed", "cancelled", "blocked", "failed"}:
+            fields.append("completed_at = ?")
+            values.append(datetime.utcnow().isoformat())
+    if current_equity is not None:
+        fields.append("current_equity = ?")
+        values.append(float(current_equity))
+    if current_balance is not None:
+        fields.append("current_balance = ?")
+        values.append(float(current_balance))
+    if error_reason is not None:
+        fields.append("error_reason = ?")
+        values.append(str(error_reason))
+    if capital_test_active is not None:
+        fields.append("capital_test_active = ?")
+        values.append(int(bool(capital_test_active)))
+    if metadata is not None:
+        fields.append("metadata_json = ?")
+        values.append(json.dumps(metadata, sort_keys=True))
+    values.append(int(session_id))
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(f"UPDATE capital_reduction_sessions SET {', '.join(fields)} WHERE id = ?", values)
+        await conn.commit()
+
+
+async def record_capital_reduction_action(
+    *,
+    session_id: int,
+    action: str,
+    status: str,
+    symbol: Optional[str] = None,
+    direction: Optional[str] = None,
+    volume: Optional[float] = None,
+    entry_price: Optional[float] = None,
+    ticket: Optional[int] = None,
+    equity_before: Optional[float] = None,
+    equity_after: Optional[float] = None,
+    details: Optional[dict] = None,
+    db_path: str = DB_PATH,
+) -> int:
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            """INSERT INTO capital_reduction_actions
+               (session_id, created_at, action, status, symbol, direction, volume, entry_price,
+                ticket, equity_before, equity_after, details_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(session_id), now, action, status, symbol, direction, volume, entry_price,
+                ticket, equity_before, equity_after, json.dumps(details or {}, sort_keys=True),
+            ),
+        )
+        await conn.commit()
+        return int(cursor.lastrowid)
+
+
+async def get_capital_reduction_actions(
+    session_id: int, limit: int = 100, db_path: str = DB_PATH,
+) -> list[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM capital_reduction_actions WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (int(session_id), max(1, int(limit))),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    for row in rows:
+        row["details"] = json.loads(row.pop("details_json") or "{}")
+    return rows
+
+
+async def get_latest_capital_reduction_session(
+    account_mode: str = "demo", db_path: str = DB_PATH,
+) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM capital_reduction_sessions WHERE account_mode = ? ORDER BY id DESC LIMIT 1",
+            (account_mode,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["metadata"] = json.loads(result.pop("metadata_json") or "{}")
+    result["capital_test_active"] = bool(result.get("capital_test_active"))
+    return result
+
+
+async def is_capital_reduction_ticket(ticket: int, db_path: str = DB_PATH) -> bool:
+    """Identify isolated reduction tickets so telemetry never treats them as strategy evidence."""
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            "SELECT 1 FROM capital_reduction_actions WHERE ticket = ? AND action = 'order_filled' LIMIT 1",
+            (int(ticket),),
+        )
+        return await cursor.fetchone() is not None
+
+
+async def get_strategy_trade_outcomes_excluding_capital_reduction(
+    account_mode: str = "demo", days: int = 365, db_path: str = DB_PATH,
+) -> list[dict]:
+    """Return strategy outcomes while explicitly excluding capital-reduction tickets."""
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT t.* FROM trades t
+               WHERE t.account_mode = ? AND t.status = 'closed' AND t.timestamp >= ?
+                 AND (t.ticket IS NULL OR t.ticket NOT IN (
+                    SELECT ticket FROM capital_reduction_actions
+                    WHERE ticket IS NOT NULL AND action = 'order_filled'
+                 ))
+               ORDER BY t.timestamp ASC, t.id ASC""",
+            (account_mode, since),
+        )
+        return [dict(row) for row in await cursor.fetchall()]

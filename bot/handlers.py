@@ -40,6 +40,7 @@ from analysis.scoring import format_signal_report
 from analysis.profiler import profiler
 from analysis.order_flow import order_flow
 from bot.account_views import LiveAccountViews
+from bot.capital_views import capital_actions_view, capital_test_view
 from risk.manager import RiskManager
 from executors.mt5 import MT5Executor
 
@@ -186,12 +187,17 @@ class BotHandlers:
             "`/champion` — current validated policy and its evidence\n"
             "`/challengers` — independent candidates in forward DEMO\n"
             "`/research` — falsifiable hypotheses and candidate values\n"
-            "`/performance` — DEMO/LIVE-isolated statistics\n"
+            "`/performance` — fresh broker-source daily performance\n"
+            "`/capital_test` — DEMO-only capital-reduction / capital-test status\n"
+            "`/capital_target <equity> [tolerance]` — save an actual DEMO equity target\n"
+            "`/capital_start` — show the deliberate-DEMO-drawdown confirmation prompt\n"
+            "`/capital_pause`, `/capital_resume`, `/capital_cancel` — session controls\n"
+            "`/capital_activity` — isolated intentional-reduction activity\n"
             "`/backtest <symbol> <tf> <days>` — causal policy backtest\n"
             "`/activity [detailed|essential|off]` — chart-study notification mode\n"
             "`/settings` — autonomy, alerts, and explicit DEMO/LIVE controls\n"
             "`/emergency` — pause new execution and optionally close positions\n\n"
-            "Trading-policy controls are intentionally not manual commands. DEMO research evaluates risk, RR, feature combinations, layering, and management through versioned experiments. Broker validity, synchronization, and emergency controls remain mandatory.",
+            "Capital reduction is DEMO-only, requires an explicit confirmation, and uses direct MT5 broker-mode verification. Its isolated activity is excluded from strategy statistics and optimizer evidence. Trading-policy controls are intentionally not manual commands. Broker validity, synchronization, and emergency controls remain mandatory.",
         )
 
     @admin_only
@@ -604,6 +610,147 @@ class BotHandlers:
     async def cmd_health(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show fresh MT5 connection and reconciliation health."""
         await self._render_plain_menu(update, await self.account_views().health())
+
+    def capital_engine(self):
+        return getattr(self.scheduler, "capital_reduction", None) if self.scheduler else None
+
+    @admin_only
+    async def cmd_capital_test(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the isolated DEMO-only capital-reduction / capital-test state."""
+        engine = self.capital_engine()
+        account = await self.executor.get_account_info()
+        session = await engine.status() if engine else None
+        await self._render_plain_menu(
+            update,
+            capital_test_view(
+                account=account, session=session,
+                target=self.settings.capital_reduction_target,
+                tolerance=self.settings.capital_reduction_tolerance,
+            ),
+            keyboards.capital_test_menu(bool(session and session.get("status") in {"active", "paused"})),
+        )
+
+    @admin_only
+    async def cmd_capital_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Persist an operational DEMO target; no broker action is taken here."""
+        if not context.args:
+            await self._render_plain_menu(update, "Usage: /capital_target <target_equity> [tolerance]\nExample: /capital_target 500 10")
+            return
+        try:
+            target = float(context.args[0])
+            tolerance = float(context.args[1]) if len(context.args) > 1 else float(self.settings.capital_reduction_tolerance)
+        except ValueError:
+            await self._render_plain_menu(update, "Target and tolerance must be numeric values. Example: /capital_target 500 10")
+            return
+        if target <= 0 or tolerance < 0:
+            await self._render_plain_menu(update, "Target must be positive and tolerance cannot be negative.")
+            return
+        self.settings.capital_reduction_target = target
+        self.settings.capital_reduction_tolerance = tolerance
+        await db.save_settings(self.settings)
+        await self._render_plain_menu(update, f"Capital-reduction target saved: {target:,.2f} ± {tolerance:,.2f}. No broker trade was placed. Use /capital_start to request the DEMO-only confirmation prompt.", keyboards.capital_test_menu())
+
+    @admin_only
+    async def cmd_capital_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the required explicit confirmation before creating a DEMO reduction session."""
+        engine = self.capital_engine()
+        if not engine:
+            await self._render_plain_menu(update, "Capital-reduction engine is unavailable because the scheduler is not initialized.")
+            return
+        target = self.settings.capital_reduction_target
+        if target is None:
+            await self._render_plain_menu(update, "Set a target first: /capital_target <target_equity> [tolerance]")
+            return
+        account = await self.executor.get_account_info()
+        broker_mode = str((account or {}).get("broker_account_mode") or "unknown").lower()
+        equity = float((account or {}).get("equity") or 0.0)
+        if self.settings.trading_mode != "demo" or broker_mode != "demo":
+            await self._render_plain_menu(update, f"CAPITAL REDUCTION BLOCKED\nConfigured mode: {self.settings.trading_mode.upper()} | MT5 broker mode: {broker_mode.upper()}\nThis operation is DEMO-only.")
+            return
+        if not account or target >= equity:
+            await self._render_plain_menu(update, f"CAPITAL REDUCTION BLOCKED\nTarget must be below current actual DEMO equity. Current equity: {equity:,.2f}; target: {target:,.2f}.")
+            return
+        text = "\n".join([
+            "⚠️ DELIBERATE DEMO DRAWDOWN",
+            f"You are requesting deliberate reduction of the actual DEMO account toward {target:,.2f} ± {self.settings.capital_reduction_tolerance:,.2f}.",
+            f"Current actual MT5 equity: {equity:,.2f}",
+            f"Maximum intended reduction before tolerance: approximately {equity - target:,.2f}",
+            "This is DEMO-only. LIVE activation is blocked by both local mode and direct MT5 broker-mode verification.",
+            "Continue?",
+        ])
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=keyboards.confirm_keyboard("capital_reduction"), parse_mode=None)
+        else:
+            await update.message.reply_text(text, reply_markup=keyboards.confirm_keyboard("capital_reduction"), parse_mode=None)
+
+    @admin_only
+    async def cmd_capital_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start the isolated session only after the explicit Telegram confirmation button."""
+        engine = self.capital_engine()
+        if not engine or self.settings.capital_reduction_target is None:
+            await self._render_plain_menu(update, "Capital reduction cannot start: scheduler or target is unavailable.")
+            return
+        result = await engine.start(self.settings.capital_reduction_target, self.settings.capital_reduction_tolerance)
+        if not result.get("ok"):
+            await self._render_plain_menu(update, f"CAPITAL REDUCTION NOT STARTED\n{result.get('reason', 'Unknown error')}", keyboards.capital_test_menu())
+            return
+        await self._render_plain_menu(update, "\n".join([
+            "🔥 CAPITAL REDUCTION MODE ACTIVE",
+            f"Session: #{result['session_id']}",
+            f"Initial actual DEMO equity: {result['initial_equity']:,.2f}",
+            f"Target equity: {result['target_equity']:,.2f} ± {result['tolerance']:,.2f}",
+            "The scheduler will use only broker-verified DEMO data and isolated CAPITAL_REDUCTION activity records. These actions are excluded from strategy learning.",
+        ]), keyboards.capital_test_menu(True))
+
+    @admin_only
+    async def cmd_capital_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        engine = self.capital_engine()
+        result = await engine.pause() if engine else {"ok": False, "reason": "Scheduler unavailable"}
+        await self._render_plain_menu(update, "Capital reduction paused." if result.get("ok") else f"Capital reduction not paused: {result.get('reason')}", keyboards.capital_test_menu())
+
+    @admin_only
+    async def cmd_capital_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        engine = self.capital_engine()
+        result = await engine.resume() if engine else {"ok": False, "reason": "Scheduler unavailable"}
+        await self._render_plain_menu(update, "Capital reduction resumed." if result.get("ok") else f"Capital reduction not resumed: {result.get('reason')}", keyboards.capital_test_menu())
+
+    @admin_only
+    async def cmd_capital_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        engine = self.capital_engine()
+        result = await engine.cancel() if engine else {"ok": False, "reason": "Scheduler unavailable"}
+        await self._render_plain_menu(update, "Capital reduction cancelled. No further reduction order will be generated." if result.get("ok") else f"Capital reduction not cancelled: {result.get('reason')}", keyboards.capital_test_menu())
+
+    @admin_only
+    async def cmd_capital_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.cmd_capital_test(update, context)
+
+    @admin_only
+    async def cmd_capital_enter_test(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Report the automatic post-reduction transition; it never creates a broker order."""
+        engine = self.capital_engine()
+        session = await engine.status() if engine else None
+        if not session or session.get("status") != "completed" or not session.get("capital_test_active"):
+            await self._render_plain_menu(update, "CAPITAL-TEST MODE NOT READY\nComplete a DEMO capital-reduction session to the configured target first.", keyboards.capital_test_menu())
+            return
+        account = await self.executor.get_account_info()
+        currency = str((account or {}).get("currency") or "USD")
+        await self._render_plain_menu(update, "\n".join([
+            "🎯 CAPITAL TEST READY",
+            f"Starting DEMO equity: {session.get('initial_equity', 0.0):,.2f}",
+            f"Target equity: {session.get('target_equity', 0.0):,.2f}",
+            f"Actual current equity: {float((account or {}).get('equity') or 0.0):,.2f} {currency}",
+            f"Actual current balance: {float((account or {}).get('balance') or 0.0):,.2f} {currency}",
+            f"Current free margin: {float((account or {}).get('free_margin') or 0.0):,.2f} {currency}",
+            f"Current margin level: {float((account or {}).get('margin_level') or 0.0):.1f}%",
+            "Capital reduction is complete. Normal DEMO research now uses the actual broker account capital; no virtual balance is substituted.",
+        ]), keyboards.capital_test_menu())
+
+    @admin_only
+    async def cmd_capital_activity(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        engine = self.capital_engine()
+        session = await engine.status() if engine else None
+        currency = str((await self.executor.get_account_info() or {}).get("currency") or "USD")
+        await self._render_plain_menu(update, capital_actions_view(session, currency), keyboards.capital_test_menu(bool(session and session.get("status") in {"active", "paused"})))
 
     @admin_only
     async def cmd_manage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1294,6 +1441,24 @@ class BotHandlers:
             await self.cmd_exposure(update, context)
         elif data == "health":
             await self.cmd_health(update, context)
+        elif data in {"capital_test", "capital_status"}:
+            await self.cmd_capital_test(update, context)
+        elif data == "capital_set_target":
+            await self._render_plain_menu(update, "Set a target with: /capital_target <target_equity> [tolerance]\nExample: /capital_target 500 10", keyboards.capital_test_menu())
+        elif data == "capital_start":
+            await self.cmd_capital_start(update, context)
+        elif data == "confirm_capital_reduction":
+            await self.cmd_capital_confirm(update, context)
+        elif data == "capital_pause":
+            await self.cmd_capital_pause(update, context)
+        elif data == "capital_resume":
+            await self.cmd_capital_resume(update, context)
+        elif data == "capital_cancel":
+            await self.cmd_capital_cancel(update, context)
+        elif data == "capital_activity":
+            await self.cmd_capital_activity(update, context)
+        elif data == "capital_enter_test":
+            await self.cmd_capital_enter_test(update, context)
         elif data == "markets":
             await self.cmd_markets(update, context)
         elif data == "learning":
@@ -1676,6 +1841,15 @@ class BotHandlers:
         app.add_handler(CommandHandler("history", self.cmd_history))
         app.add_handler(CommandHandler("exposure", self.cmd_exposure))
         app.add_handler(CommandHandler("health", self.cmd_health))
+        app.add_handler(CommandHandler("capital_test", self.cmd_capital_test))
+        app.add_handler(CommandHandler("capital_target", self.cmd_capital_target))
+        app.add_handler(CommandHandler("capital_start", self.cmd_capital_start))
+        app.add_handler(CommandHandler("capital_pause", self.cmd_capital_pause))
+        app.add_handler(CommandHandler("capital_resume", self.cmd_capital_resume))
+        app.add_handler(CommandHandler("capital_cancel", self.cmd_capital_cancel))
+        app.add_handler(CommandHandler("capital_status", self.cmd_capital_status))
+        app.add_handler(CommandHandler("capital_activity", self.cmd_capital_activity))
+        app.add_handler(CommandHandler("capital_enter_test", self.cmd_capital_enter_test))
         app.add_handler(CommandHandler("learning", self.cmd_learning))
         app.add_handler(CommandHandler("experiments", self.cmd_experiments))
         app.add_handler(CommandHandler("champion", self.cmd_champion))

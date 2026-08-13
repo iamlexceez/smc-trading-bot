@@ -13,7 +13,7 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚠️ Exposure", callback_data="exposure"), InlineKeyboardButton("🩺 Account Health", callback_data="health")],
         [InlineKeyboardButton("📜 History", callback_data="history"), InlineKeyboardButton("📈 Performance", callback_data="performance")],
         [InlineKeyboardButton("💹 Markets", callback_data="markets"), InlineKeyboardButton("🧠 Learning", callback_data="learning")],
-        [InlineKeyboardButton("🧪 Experiments", callback_data="experiments"), InlineKeyboardButton("🔬 Research", callback_data="research")],
+        [InlineKeyboardButton("🧪 Experiments", callback_data="experiments"), InlineKeyboardButton("🎯 Capital Test", callback_data="capital_test")],
         [InlineKeyboardButton("🏆 Champion", callback_data="champion"), InlineKeyboardButton("⚔️ Challengers", callback_data="challengers")],
         [InlineKeyboardButton("⚙️ Settings / DEMO-LIVE", callback_data="settings"), InlineKeyboardButton("🚨 Emergency Stop", callback_data="emergency")],
     ])
@@ -53,6 +53,19 @@ def mode_menu(current_mode: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"{'✅' if current_mode == 'live' else '⬜'} LIVE — confirmation required", callback_data="mode_live")],
         [InlineKeyboardButton("⬅️ Settings", callback_data="settings")],
     ])
+
+
+def capital_test_menu(has_active_session: bool = False) -> InlineKeyboardMarkup:
+    """Operational controls for the isolated DEMO capital-reduction workflow."""
+    rows = [
+        [InlineKeyboardButton("Set Target (use /capital_target)", callback_data="capital_set_target")],
+        [InlineKeyboardButton("Start Reduction", callback_data="capital_start"), InlineKeyboardButton("View Progress", callback_data="capital_status")],
+        [InlineKeyboardButton("Pause", callback_data="capital_pause"), InlineKeyboardButton("Resume", callback_data="capital_resume")],
+        [InlineKeyboardButton("Cancel", callback_data="capital_cancel"), InlineKeyboardButton("View Activity", callback_data="capital_activity")],
+        [InlineKeyboardButton("Enter Capital-Test Mode", callback_data="capital_enter_test")],
+        [InlineKeyboardButton("Account", callback_data="account"), InlineKeyboardButton("⬅️ Dashboard", callback_data="dashboard")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def confirm_keyboard(action: str) -> InlineKeyboardMarkup:

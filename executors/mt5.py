@@ -119,6 +119,12 @@ class MT5Executor(BaseExecutor):
         info = mt5.account_info()
         if info is None:
             return {}
+        account_trade_mode = int(getattr(info, "trade_mode", -1))
+        account_mode_names = {
+            getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0): "demo",
+            getattr(mt5, "ACCOUNT_TRADE_MODE_CONTEST", 1): "contest",
+            getattr(mt5, "ACCOUNT_TRADE_MODE_REAL", 2): "live",
+        }
         return {
             "balance": info.balance,
             "equity": info.equity,
@@ -132,6 +138,8 @@ class MT5Executor(BaseExecutor):
             "login": info.login,
             "server": info.server,
             "company": getattr(info, "company", ""),
+            "broker_trade_mode": account_trade_mode,
+            "broker_account_mode": account_mode_names.get(account_trade_mode, "unknown"),
         }
 
     @staticmethod
@@ -323,6 +331,7 @@ class MT5Executor(BaseExecutor):
         if info is None:
             return {}
             
+        tick = mt5.symbol_info_tick(symbol)
         return {
             "pip_size": info.point,
             "min_lot": info.volume_min,
@@ -336,6 +345,8 @@ class MT5Executor(BaseExecutor):
             "filling_mode": getattr(info, 'filling_mode', 0),
             "tick_size": getattr(info, 'trade_tick_size', info.point),
             "tick_value": getattr(info, 'trade_tick_value', 1.0),
+            "last_tick_time": int(getattr(tick, 'time', 0) or 0) if tick else 0,
+            "last_tick_time_msc": int(getattr(tick, 'time_msc', 0) or 0) if tick else 0,
         }
 
     async def list_symbols(self) -> list[dict]:

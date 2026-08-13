@@ -30,6 +30,7 @@ from data.provider import DataProvider
 from analysis.optimizer import SelfOptimizer
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 from analysis.account_monitor import summarize_history, exposure_summary
+from execution.capital_reduction import CapitalReductionEngine
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
 from bot.handlers import BotHandlers  # noqa: F401 — validates Telegram control imports.
 
@@ -371,6 +372,34 @@ async def test_chart_activity_notifications() -> None:
     assert_true(app.bot.messages[-1] == "essential", "essential event was not delivered")
 
 
+async def test_capital_reduction_isolation() -> None:
+    class LiveModeExecutor:
+        async def get_account_info(self):
+            return {"broker_account_mode": "live", "equity": 10_000.0, "balance": 10_000.0}
+
+    blocked_engine = CapitalReductionEngine(TradeSettings.defaults(), LiveModeExecutor())
+    account, reason = await blocked_engine._live_account()
+    assert_true(account is None and "not DEMO" in reason, "capital reduction did not hard-block a broker-reported LIVE account")
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "capital_reduction.db")
+        await db.init_db(path)
+        session_id = await db.create_capital_reduction_session(
+            broker_login="123456", target_equity=500.0, tolerance=10.0,
+            initial_equity=10_000.0, initial_balance=10_000.0, db_path=path,
+        )
+        active = await db.get_active_capital_reduction_session("demo", path)
+        assert_true(active and active["id"] == session_id and active["status"] == "active", "capital reduction session was not isolated and persisted")
+        strategy_trade = await db.record_trade("Volatility 75 Index", "BUY", 100.0, 99.0, 102.0, 0.1, 0.0, 2.0, "mt5", "{}", ticket=777, db_path=path)
+        await db.close_trade(strategy_trade, -3.0, path)
+        await db.record_capital_reduction_action(session_id=session_id, action="order_filled", status="open", ticket=777, symbol="Volatility 75 Index", direction="BUY", volume=0.1, db_path=path)
+        outcomes = await db.get_strategy_trade_outcomes_excluding_capital_reduction(db_path=path)
+        assert_true(not outcomes, "capital-reduction ticket contaminated strategy-learning outcomes")
+        await db.update_capital_reduction_session(session_id, status="completed", current_equity=505.0, current_balance=505.0, capital_test_active=True, db_path=path)
+        completed = await db.get_capital_reduction_session(session_id, path)
+        assert_true(completed and completed["capital_test_active"] and completed["status"] == "completed", "capital-test transition was not persisted")
+
+
 async def test_demo_live_partitioning() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "modes.db")
@@ -402,6 +431,7 @@ def run() -> None:
     asyncio.run(test_model_governance_persistence())
     asyncio.run(test_experiment_engine_persistence())
     asyncio.run(test_chart_activity_notifications())
+    asyncio.run(test_capital_reduction_isolation())
     asyncio.run(test_demo_live_partitioning())
     print("PASS: upgrade smoke tests")
 

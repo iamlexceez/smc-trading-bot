@@ -87,6 +87,11 @@ class TradeSettings:
     index_focus: bool = False
     target_balance: Optional[float] = None
 
+    # DEMO capital-reduction controls. These are operational session inputs,
+    # never optimizer parameters and never used for normal strategy sizing.
+    capital_reduction_target: Optional[float] = None
+    capital_reduction_tolerance: float = 10.0
+
     # Position/layer controls
     max_layers: int = 4
     layer_allocation: list[float] = field(default_factory=lambda: [0.40, 0.30, 0.20, 0.10])
@@ -276,6 +281,8 @@ class TradeSettings:
             aggressive_mode=parse_bool(d.get("aggressive_mode", "true"), True),
             index_focus=parse_bool(d.get("index_focus", "false")),
             target_balance=float(d["target_balance"]) if d.get("target_balance") else None,
+            capital_reduction_target=float(d["capital_reduction_target"]) if d.get("capital_reduction_target") else None,
+            capital_reduction_tolerance=max(0.0, float(d.get("capital_reduction_tolerance", 10.0))),
             max_layers=int(d.get("max_layers", 4)),
             layer_allocation=[float(value) for value in parse_list(d.get("layer_allocation"), ["0.40", "0.30", "0.20", "0.10"])],
             entry_mode=d.get("entry_mode", "aggressive"),

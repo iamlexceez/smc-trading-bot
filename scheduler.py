@@ -32,6 +32,7 @@ from analysis.confirmation import get_confirmation
 from analysis.liquidity import build_liquidity_pools, select_market_target
 from analysis.visuals import render_smc_chart
 from execution.manager import ManagementState, TradeManager
+from execution.capital_reduction import CapitalReductionEngine
 from analysis.profiler import profiler
 from risk.manager import RiskManager
 from executors.base import BaseExecutor, ExecutionResult
@@ -77,6 +78,7 @@ class MarketScheduler:
         self.optimizer = SelfOptimizer(self.settings)
         self.account_reconciliation = AccountReconciliationEngine(self.executor, self.settings.trading_mode)
         self.last_account_reconciliation: dict = {}
+        self.capital_reduction = CapitalReductionEngine(self.settings, self.executor)
 
     async def start(self, interval_seconds: int = 300):
         """Start the periodic market scanner after broker-market discovery."""
@@ -101,6 +103,12 @@ class MarketScheduler:
             self.reconcile_account_state,
             IntervalTrigger(minutes=5),
             id="account_reconciliation",
+            replace_existing=True,
+        )
+        self.scheduler.add_job(
+            self.run_capital_reduction,
+            IntervalTrigger(seconds=15),
+            id="capital_reduction",
             replace_existing=True,
         )
         self.scheduler.start()
@@ -140,6 +148,21 @@ class MarketScheduler:
             logger.warning("Account reconciliation found %s discrepancy(s): %s", len(result["discrepancies"]), result["discrepancies"][:3])
         else:
             logger.info("Account reconciliation is synchronized: %s MT5 positions", result.get("broker_open_positions", 0))
+        return result
+
+    async def run_capital_reduction(self) -> dict:
+        """Advance the isolated DEMO reduction engine; it never feeds the optimizer."""
+        self.capital_reduction.settings = self.settings
+        self.capital_reduction.executor = self.executor
+        result = await self.capital_reduction.run_once()
+        if result.get("state") in {"completed", "blocked", "failed", "paused"}:
+            session_id = result.get("session_id", "?")
+            await self._chart_activity(
+                "capital_reduction_state", "SYSTEM",
+                f"🔥 **CAPITAL REDUCTION UPDATE**\nSession: `#{session_id}` | State: `{result.get('state', 'unknown').upper()}`\n{result.get('reason', '')}",
+                fingerprint=f"capital:{session_id}:{result.get('state')}:{result.get('reason', '')}",
+                essential=True,
+            )
         return result
 
     async def activate_and_scan_now(self) -> bool:
@@ -890,6 +913,11 @@ class MarketScheduler:
                 await self.manage_open_positions()
             except Exception as e:
                 logger.error(f"Error managing positions: {e}")
+
+        capital_session = await db.get_active_capital_reduction_session("demo")
+        if capital_session:
+            logger.info("Capital reduction session #%s is %s — normal strategy scanning is suspended", capital_session["id"], capital_session["status"])
+            return
 
         if not self.settings.auto_trade or self.settings.is_paused:
             logger.debug("Auto-trade disabled or paused — skipping scan")
