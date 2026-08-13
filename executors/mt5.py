@@ -11,6 +11,7 @@ If MT5 is not available, the bot logs a clear error and exits in live mode.
 from __future__ import annotations
 
 import logging
+from decimal import Decimal, ROUND_FLOOR, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -319,6 +320,102 @@ class MT5Executor(BaseExecutor):
         if tick is None:
             return (0.0, 0.0)
         return (tick.bid, tick.ask)
+
+    @staticmethod
+    def _normalise_broker_volume(requested: object, minimum: object, maximum: object, step: object) -> float | None:
+        """Floor and clamp a volume with Decimal precision against broker steps."""
+        try:
+            requested_d = Decimal(str(requested))
+            minimum_d = Decimal(str(minimum))
+            maximum_d = Decimal(str(maximum))
+            step_d = Decimal(str(step))
+            if minimum_d <= 0 or maximum_d < minimum_d or step_d <= 0:
+                return None
+            floored = (requested_d / step_d).to_integral_value(rounding=ROUND_FLOOR) * step_d
+            normalised = max(minimum_d, min(maximum_d, floored))
+            # A broker's advertised minimum itself is always admissible.  This
+            # branch preserves it where a non-integral minimum/step convention
+            # is used by the broker.
+            if normalised < minimum_d:
+                normalised = minimum_d
+            return float(normalised)
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+
+    async def get_symbol_execution_metadata(self, symbol: str, direction: str = "BUY") -> dict:
+        """Return raw broker metadata and a read-only minimum-volume margin calculation.
+
+        This method never sends an order.  It selects the named broker symbol (the
+        same harmless MT5 operation used for data access), obtains a fresh quote,
+        and asks MT5 to calculate the broker's required margin for its minimum
+        valid volume.  Leverage remains an account property and is not invented
+        as a symbol requirement.
+        """
+        result: dict = {"symbol": symbol, "selected": False, "margin_required": None, "margin_source": None}
+        if not MT5_AVAILABLE:
+            result["error"] = "MetaTrader5 package not installed"
+            return result
+        if not await self._ensure_connected():
+            result["error"] = f"MT5 connection unavailable: {mt5.last_error()}"
+            return result
+        selected = bool(mt5.symbol_select(symbol, True))
+        result["selected"] = selected
+        if not selected:
+            result["error"] = f"MT5 symbol_select failed: {mt5.last_error()}"
+            return result
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            result["error"] = f"MT5 symbol_info returned no data: {mt5.last_error()}"
+            return result
+        tick = mt5.symbol_info_tick(symbol)
+        bid = getattr(tick, "bid", None) if tick else None
+        ask = getattr(tick, "ask", None) if tick else None
+        last = getattr(tick, "last", None) if tick else None
+        volume_min = getattr(info, "volume_min", None)
+        volume_max = getattr(info, "volume_max", None)
+        volume_step = getattr(info, "volume_step", None)
+        normalized_volume = self._normalise_broker_volume(volume_min, volume_min, volume_max, volume_step)
+        result.update({
+            "visible": bool(getattr(info, "visible", False)),
+            "trade_mode": getattr(info, "trade_mode", None),
+            "order_mode": getattr(info, "order_mode", None),
+            "bid": bid, "ask": ask, "last": last,
+            "point": getattr(info, "point", None),
+            "digits": getattr(info, "digits", None),
+            "tick_size": getattr(info, "trade_tick_size", getattr(info, "point", None)),
+            "tick_value": getattr(info, "trade_tick_value", None),
+            "volume_min": volume_min,
+            "volume_max": volume_max,
+            "volume_step": volume_step,
+            "normalized_volume": normalized_volume,
+            "contract_size": getattr(info, "contract_size", None),
+            "trade_contract_size": getattr(info, "trade_contract_size", None),
+            "initial_margin": getattr(info, "margin_initial", None),
+            "maintenance_margin": getattr(info, "margin_maintenance", None),
+            "margin_initial": getattr(info, "margin_initial", None),
+            "margin_maintenance": getattr(info, "margin_maintenance", None),
+            "currency_base": getattr(info, "currency_base", None),
+            "currency_profit": getattr(info, "currency_profit", None),
+            "currency_margin": getattr(info, "currency_margin", None),
+            "tick_available": tick is not None,
+        })
+        try:
+            buy = str(direction).upper() != "SELL"
+            order_type = getattr(mt5, "ORDER_TYPE_BUY", 0) if buy else getattr(mt5, "ORDER_TYPE_SELL", 1)
+            preferred = ask if buy else bid
+            price = preferred if isinstance(preferred, (int, float)) and preferred > 0 else (bid or ask or last)
+            volume = float(normalized_volume) if normalized_volume is not None else 0.0
+            if price is None or float(price) <= 0 or volume <= 0:
+                result["margin_error"] = "No positive executable price or minimum volume for margin calculation"
+            else:
+                margin = mt5.order_calc_margin(order_type, symbol, volume, float(price))
+                result["margin_required"] = margin
+                result["margin_source"] = "order_calc_margin"
+                if margin is None:
+                    result["margin_error"] = f"MT5 order_calc_margin returned no data: {mt5.last_error()}"
+        except Exception as exc:
+            result["margin_error"] = f"MT5 order_calc_margin raised {type(exc).__name__}: {exc}"
+        return result
 
     async def get_symbol_info(self, symbol: str) -> dict:
         """Get detailed 'Symbol DNA' for precise lot and pip calculations."""

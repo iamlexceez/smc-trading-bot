@@ -145,6 +145,7 @@ async def main():
         BotCommand("demo_session", "Broker-verified reset-separated DEMO session report"),
         BotCommand("demo_auto_resume", "Set verified DEMO reset auto-resume on or off"),
         BotCommand("markets", "Broker-verified Deriv universe"),
+        BotCommand("brokercheck", "Read-only MT5 price, volume, contract, and margin audit"),
         BotCommand("learning", "Measured learning status"),
         BotCommand("experiments", "Policy experiment lifecycle"),
         BotCommand("champion", "Current validated champion policy"),
@@ -160,7 +161,7 @@ async def main():
     await app.bot.set_my_commands(commands)
 
     # Start scheduler
-    await scheduler.start(interval_seconds=60)  # closed-candle universe check every minute; no heartbeat notifications
+    await scheduler.start(interval_seconds=60)  # closed-candle scan every minute; broker-validation heartbeat every 10 minutes
 
     # Notify admin
     if admin_ids:

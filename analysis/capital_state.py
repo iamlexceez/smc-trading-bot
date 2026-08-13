@@ -1,16 +1,21 @@
-"""Broker-authoritative DEMO capital state machine.
+"""Broker-authoritative DEMO capital availability and executable-market validation.
 
 This module is the sole decision-maker for account-capital availability. It
-uses fresh MT5 account data and broker symbol specifications; views, risk
-checks, and the scheduler consume its state rather than inventing separate
-balance thresholds.
+uses fresh MT5 account data and broker-calculated margin. It never submits an
+order while validating a symbol, and it does not infer a symbol-level leverage
+value when MT5 exposes account leverage or direct margin calculation instead.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import time
+from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from config import TradeSettings
@@ -39,9 +44,10 @@ class MinimumOperatingCapital:
 
 
 class CapitalStateService:
-    """Evaluate the real account's ability to open a minimum valid broker trade."""
+    """Evaluate whether one broker-valid minimum order is demonstrably feasible."""
 
-    SPEC_CACHE_SECONDS = 300  # Limits broker-spec enumeration; not a trading threshold.
+    # Fresh price and margin facts are required for account-state decisions.
+    SPEC_CACHE_SECONDS = 0
 
     def __init__(self, settings: TradeSettings, executor: Any, db_path: Optional[str] = None) -> None:
         self.settings = settings
@@ -51,38 +57,249 @@ class CapitalStateService:
         self._minimum_cache: Optional[MinimumOperatingCapital] = None
         self._minimum_cache_at = 0.0
         self.last_result: dict[str, Any] = {}
+        self.last_metadata_audit: dict[str, Any] = {}
 
     @staticmethod
-    def _num(value: Any, default: float = 0.0) -> float:
+    def _number(value: Any) -> Optional[float]:
         try:
-            return float(value)
+            parsed = float(value)
         except (TypeError, ValueError):
-            return default
+            return None
+        return parsed if math.isfinite(parsed) else None
 
-    async def minimum_operating_capital(self, account: dict) -> MinimumOperatingCapital:
-        """Derive minimum viable free margin from actual enabled broker symbols."""
-        now = time.monotonic()
-        if self._minimum_cache and now - self._minimum_cache_at < self.SPEC_CACHE_SECONDS:
-            return self._minimum_cache
-        leverage = max(1.0, self._num(account.get("leverage"), 1.0))
-        candidates: list[tuple[float, str]] = []
-        for symbol in list(self.settings.enabled_symbols):
+    @classmethod
+    def _num(cls, value: Any, default: float = 0.0) -> float:
+        parsed = cls._number(value)
+        return default if parsed is None else parsed
+
+    @classmethod
+    def _field_status(cls, value: Any, *, positive: bool = False, nonnegative: bool = False) -> str:
+        parsed = cls._number(value)
+        if value is None:
+            return "NOT_EXPOSED"
+        if parsed is None:
+            return "INVALID"
+        if positive and parsed <= 0:
+            return "INVALID"
+        if nonnegative and parsed < 0:
+            return "INVALID"
+        return "VALID"
+
+    @staticmethod
+    def _as_json(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(key): CapitalStateService._as_json(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [CapitalStateService._as_json(item) for item in value]
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    @staticmethod
+    def _normalise_reason(value: str) -> str:
+        return str(value or "Unknown broker metadata validation failure")
+
+    async def _probe_symbol(self, symbol: str) -> dict[str, Any]:
+        """Obtain a read-only broker probe, with a compatibility fallback for tests."""
+        probe_method = getattr(self.executor, "get_symbol_execution_metadata", None)
+        if callable(probe_method):
+            try:
+                data = await probe_method(symbol)
+                if isinstance(data, dict):
+                    return data
+            except Exception as exc:
+                return {"symbol": symbol, "error": f"Broker metadata probe raised {type(exc).__name__}: {exc}"}
+        try:
             info = await self.executor.get_symbol_info(symbol)
             bid, ask = await self.executor.get_symbol_price(symbol)
-            price = self._num(ask) or self._num(bid)
-            minimum_volume = self._num(info.get("min_lot"))
-            contract_size = self._num(info.get("contract_size"))
-            if price <= 0 or minimum_volume <= 0 or contract_size <= 0:
-                continue
-            margin = abs(price * contract_size * minimum_volume / leverage)
-            if margin > 0:
-                candidates.append((margin, symbol))
+        except Exception as exc:
+            return {"symbol": symbol, "error": f"Broker symbol lookup raised {type(exc).__name__}: {exc}"}
+        return {
+            "symbol": symbol,
+            "selected": None,
+            "bid": bid,
+            "ask": ask,
+            "last": None,
+            "volume_min": (info or {}).get("volume_min", (info or {}).get("min_lot")),
+            "volume_max": (info or {}).get("volume_max", (info or {}).get("max_lot")),
+            "volume_step": (info or {}).get("volume_step", (info or {}).get("step_lot")),
+            "contract_size": (info or {}).get("contract_size"),
+            "trade_contract_size": (info or {}).get("trade_contract_size", (info or {}).get("contract_size")),
+            "margin_required": (info or {}).get("margin_required"),
+            "margin_source": (info or {}).get("margin_source"),
+            "error": "Executor does not expose the MT5 order_calc_margin metadata probe" if not info else None,
+        }
+
+    def _validate_probe(self, symbol: str, probe: dict[str, Any], free_margin: Optional[float]) -> dict[str, Any]:
+        """Classify one target symbol without assuming leverage is a symbol field."""
+        bid = self._number(probe.get("bid"))
+        ask = self._number(probe.get("ask"))
+        last = self._number(probe.get("last"))
+        valid_prices = [value for value in (ask, bid, last) if value is not None and value > 0]
+        price_status = "VALID" if valid_prices else (
+            "NOT_EXPOSED" if all(probe.get(field) is None for field in ("bid", "ask", "last")) else "INVALID"
+        )
+        executable_price = valid_prices[0] if valid_prices else None
+
+        volume_min = self._number(probe.get("volume_min"))
+        volume_max = self._number(probe.get("volume_max"))
+        volume_step = self._number(probe.get("volume_step"))
+        if volume_min is None or volume_max is None or volume_step is None:
+            volume_status = "NOT_EXPOSED"
+        elif volume_min <= 0 or volume_max < volume_min or volume_step <= 0:
+            volume_status = "INVALID"
+        else:
+            volume_status = "VALID"
+
+        contract_values = (probe.get("trade_contract_size"), probe.get("contract_size"))
+        contract_status = "VALID" if any(self._field_status(value, positive=True) == "VALID" for value in contract_values) else (
+            "NOT_EXPOSED" if all(value is None for value in contract_values) else "INVALID"
+        )
+
+        margin_required = self._number(probe.get("margin_required"))
+        margin_status = self._field_status(probe.get("margin_required"), positive=True)
+        # SYMBOL_MARGIN_INITIAL is a broker-native per-lot margin specification.
+        # It is only used if the primary MT5 order_calc_margin call did not yield a
+        # result; no leverage estimate is manufactured.
+        if margin_status != "VALID" and volume_status == "VALID":
+            initial = self._number(probe.get("margin_initial", probe.get("initial_margin")))
+            if initial is not None and initial > 0 and volume_min is not None:
+                margin_required = initial * volume_min
+                margin_status = "VALID" if margin_required > 0 else "INVALID"
+                if margin_status == "VALID":
+                    probe["margin_required"] = margin_required
+                    probe["margin_source"] = "symbol_margin_initial"
+        margin_valid = margin_status == "VALID"
+        margin_feasible = margin_valid and free_margin is not None and margin_required is not None and margin_required <= free_margin
+        if margin_valid and free_margin is None:
+            margin_feasibility = "ACCOUNT_MARGIN_UNAVAILABLE"
+        elif margin_valid and not margin_feasible:
+            margin_feasibility = "INSUFFICIENT_FREE_MARGIN"
+        else:
+            margin_feasibility = "FEASIBLE" if margin_valid else margin_status
+
+        # The MT5 API reports leverage at account level. It is observational only;
+        # direct order_calc_margin (or broker initial margin) decides feasibility.
+        leverage_status = "NOT_EXPOSED"
+        errors: list[str] = []
+        if probe.get("error"):
+            errors.append(str(probe["error"]))
+        if price_status != "VALID":
+            errors.append(f"price {price_status.lower()}")
+        if volume_status != "VALID":
+            errors.append(f"volume {volume_status.lower()}")
+        if contract_status != "VALID" and not margin_valid:
+            errors.append(f"contract {contract_status.lower()} and no valid broker margin calculation")
+        if not margin_valid:
+            errors.append(f"margin {margin_status.lower()}")
+        elif margin_feasibility != "FEASIBLE":
+            errors.append(f"margin {margin_feasibility.lower()}")
+
+        # A broker margin calculation is sufficient contract/margin evidence even
+        # if contract-size fields are absent.  ``specification_valid`` answers
+        # whether the account state can be determined; ``usable`` additionally
+        # answers whether current free margin can fund that order.
+        specification_valid = price_status == "VALID" and volume_status == "VALID" and margin_valid and (contract_status == "VALID" or margin_valid)
+        usable = specification_valid and margin_feasible
+        reason = "Broker-valid executable minimum-volume margin calculation" if usable else "; ".join(errors or ["Broker metadata is not sufficient to prove execution feasibility"])
+        return self._as_json({
+            "symbol": symbol,
+            "metadata": probe,
+            "checks": {
+                "price": price_status,
+                "volume": volume_status,
+                "contract": contract_status,
+                "margin": margin_status,
+                "margin_feasibility": margin_feasibility,
+                "leverage": leverage_status,
+            },
+            "price": executable_price,
+            "minimum_volume": volume_min,
+            "margin_required": margin_required,
+            "margin_source": probe.get("margin_source"),
+            "specification_valid": specification_valid,
+            "usable": usable,
+            "reason": reason,
+        })
+
+    async def broker_metadata_audit(self, account: Optional[dict] = None) -> dict[str, Any]:
+        """Audit every currently enabled broker-approved target symbol read-only."""
+        account = account or {}
+        free_margin = self._number(account.get("free_margin"))
+        symbols = sorted({str(symbol).strip() for symbol in self.settings.enabled_symbols if str(symbol).strip()})
+        records = []
+        for symbol in symbols:
+            records.append(self._validate_probe(symbol, await self._probe_symbol(symbol), free_margin))
+        usable = [record for record in records if record["usable"]]
+        invalid = [record for record in records if not record["usable"]]
+        failures = Counter(record["reason"] for record in invalid if record.get("reason"))
+        audit = self._as_json({
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "target_symbols": symbols,
+            "target_count": len(symbols),
+            "usable_symbols": [record["symbol"] for record in usable],
+            "usable_count": len(usable),
+            "invalid_symbols": [{"symbol": record["symbol"], "reason": record["reason"], "checks": record["checks"]} for record in invalid],
+            "invalid_count": len(invalid),
+            "top_failure": failures.most_common(1)[0][0] if failures else "None",
+            "symbols": records,
+        })
+        self.last_metadata_audit = audit
+        return audit
+
+    def write_metadata_audit(self, directory: str | Path = "logs", audit: Optional[dict] = None, account: Optional[dict] = None) -> tuple[Path, Path]:
+        """Persist a complete read-only broker metadata audit for diagnosis."""
+        audit = audit or self.last_metadata_audit or {}
+        target = Path(directory)
+        target.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        payload = self._as_json({"account": account or {}, "audit": audit})
+        json_path = target / f"mt5_broker_metadata_{timestamp}.json"
+        markdown_path = target / f"mt5_broker_metadata_{timestamp}.md"
+        json_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        lines = [
+            "# MT5 Broker Metadata Audit", "",
+            f"Generated: `{audit.get('generated_at', '')}`", "",
+            f"Target symbols: `{audit.get('target_count', 0)}` | Usable: `{audit.get('usable_count', 0)}` | Invalid: `{audit.get('invalid_count', 0)}`", "",
+            "| Symbol | Price | Volume | Contract | Margin | Leverage | Status | Reason |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for record in audit.get("symbols", []):
+            checks = record.get("checks", {})
+            lines.append("| {symbol} | {price} | {volume} | {contract} | {margin} | {leverage} | {status} | {reason} |".format(
+                symbol=str(record.get("symbol", "")).replace("|", "/"),
+                price=checks.get("price", "NOT_EXPOSED"), volume=checks.get("volume", "NOT_EXPOSED"),
+                contract=checks.get("contract", "NOT_EXPOSED"), margin=checks.get("margin", "NOT_EXPOSED"),
+                leverage=checks.get("leverage", "NOT_EXPOSED"),
+                status="USABLE" if record.get("usable") else "INVALID",
+                reason=str(record.get("reason", "")).replace("|", "/"),
+            ))
+        markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return json_path, markdown_path
+
+    async def minimum_operating_capital(self, account: dict, audit: Optional[dict] = None) -> MinimumOperatingCapital:
+        """Return the smallest fresh, broker-calculated required margin among usable symbols."""
+        now = time.monotonic()
+        if self.SPEC_CACHE_SECONDS and self._minimum_cache and now - self._minimum_cache_at < self.SPEC_CACHE_SECONDS:
+            return self._minimum_cache
+        audit = audit or await self.broker_metadata_audit(account)
+        candidates = [
+            (self._num(record.get("margin_required")), str(record.get("symbol")))
+            for record in audit.get("symbols", []) if record.get("specification_valid") and self._num(record.get("margin_required")) > 0
+        ]
         if not candidates:
-            result = MinimumOperatingCapital(0.0, 0.0, (), "No enabled broker symbol has valid price, minimum volume, contract, and leverage data")
+            reason = "No enabled broker target has valid price, volume, and broker-calculated minimum-order margin"
+            if audit.get("invalid_count"):
+                reason += f"; top failure: {audit.get('top_failure')}"
+            result = MinimumOperatingCapital(0.0, 0.0, (), reason)
         else:
             minimum = min(value for value, _ in candidates)
-            executable = tuple(sorted(symbol for value, symbol in candidates if value <= minimum * (1 + 1e-9)))
-            result = MinimumOperatingCapital(minimum, minimum, executable, "Derived from broker minimum volume and current required margin")
+            result = MinimumOperatingCapital(
+                minimum, minimum, tuple(sorted(symbol for _, symbol in candidates)),
+                "Derived from fresh MT5 order_calc_margin or broker initial-margin data for enabled target symbols",
+            )
         self._minimum_cache = result
         self._minimum_cache_at = now
         return result
@@ -95,9 +312,6 @@ class CapitalStateService:
 
     async def _session_for_account(self, account: dict, previous: Optional[dict], *, reset: bool = False) -> int:
         login = str(account.get("login") or "")
-        # Reuse the session identified by the authoritative account-state row
-        # until a broker-observed reset is verified. This prevents repeated
-        # exhausted-account polls from creating artificial new sessions.
         previous_session_id = (previous or {}).get("active_demo_session_id")
         if previous_session_id and not reset:
             previous_session = await db.get_demo_session(int(previous_session_id), self.db_path)
@@ -111,7 +325,7 @@ class CapitalStateService:
                 active["id"], status="reset",
                 balance=self._num((previous or {}).get("last_balance"), self._num(account.get("balance"))),
                 equity=self._num((previous or {}).get("last_equity"), self._num(account.get("equity"))),
-                reset_detected_at=__import__("datetime").datetime.utcnow().isoformat(), db_path=self.db_path,
+                reset_detected_at=datetime.now(timezone.utc).isoformat(), db_path=self.db_path,
             )
         reduction = await db.get_active_capital_reduction_session("demo", self.db_path)
         latest_reduction = await db.get_latest_capital_reduction_session("demo", self.db_path)
@@ -123,7 +337,7 @@ class CapitalStateService:
         )
 
     async def evaluate(self, *, allow_awaiting_resume: bool = False) -> dict[str, Any]:
-        """Read fresh MT5 facts, classify functional capital state, and persist transitions."""
+        """Read fresh MT5 facts, validate enabled symbols, classify, and persist transitions."""
         async with self._lock:
             previous = await db.get_account_state("demo", self.db_path)
             snapshot_getter = getattr(self.executor, "get_live_account_snapshot", None)
@@ -139,23 +353,26 @@ class CapitalStateService:
                 self.last_result = result
                 return result
 
+            missing_account_fields = [field for field in ("balance", "equity", "free_margin") if self._number(account.get(field)) is None]
+            if missing_account_fields:
+                result = await self._persist_unknown(previous, "MT5 account data missing or invalid: " + ", ".join(missing_account_fields))
+                self.last_result = result
+                return result
+
             balance = self._num(account.get("balance"))
             equity = self._num(account.get("equity"))
             free_margin = self._num(account.get("free_margin"))
             margin_level = self._num(account.get("margin_level"))
-            minimum = await self.minimum_operating_capital(account)
+            audit = await self.broker_metadata_audit(account)
+            minimum = await self.minimum_operating_capital(account, audit)
             broker_login = str(account.get("login") or "")
             previous_balance = self._num((previous or {}).get("last_balance"))
             previous_equity = self._num((previous or {}).get("last_equity"))
             prior_state = str((previous or {}).get("state") or "")
 
-            # A reset is broker-observed only: an exhausted account's balance
-            # must increase by at least one current broker-minimum operating unit
-            # and remain a valid DEMO account. No user assertion is trusted.
             reset_detected = (
                 prior_state in {AccountCapitalState.CAPITAL_EXHAUSTED, AccountCapitalState.TRADING_HALTED}
-                and minimum.amount > 0
-                and balance >= previous_balance + minimum.amount
+                and minimum.amount > 0 and balance >= previous_balance + minimum.amount
                 and equity > 0 and free_margin >= minimum.amount
             )
             session_id = await self._session_for_account(account, previous, reset=reset_detected)
@@ -176,35 +393,39 @@ class CapitalStateService:
                     await db.update_demo_session_equity(session_id, balance=balance, equity=equity, capital_test_active=True, db_path=self.db_path)
 
             changed = not previous or previous.get("state") != state
-            event_type = "state_changed" if changed else "state_observed"
-            if reset_detected:
-                event_type = "demo_reset_detected"
+            event_type = "demo_reset_detected" if reset_detected else ("state_changed" if changed else "state_observed")
+            metadata_summary = {
+                "minimum_reason": minimum.reason,
+                "executable_symbols": list(minimum.executable_symbols),
+                "capacity_count": self._capacity_count(free_margin, minimum.amount),
+                "snapshot_time": snapshot.get("retrieved_at"),
+                "broker_metadata": {
+                    "target_count": audit.get("target_count", 0), "usable_count": audit.get("usable_count", 0),
+                    "invalid_count": audit.get("invalid_count", 0), "top_failure": audit.get("top_failure", "None"),
+                    "invalid_symbols": audit.get("invalid_symbols", []),
+                },
+            }
             if changed:
                 await db.record_account_state_event(
                     account_mode="demo", broker_login=broker_login, demo_session_id=session_id,
                     event_type=event_type, state=state, balance=balance, equity=equity,
-                    free_margin=free_margin, margin_level=margin_level,
-                    minimum_operating_capital=minimum.amount,
-                    details={"reason": reason, "minimum_reason": minimum.reason, "previous_state": prior_state}, db_path=self.db_path,
+                    free_margin=free_margin, margin_level=margin_level, minimum_operating_capital=minimum.amount,
+                    details={"reason": reason, "minimum_reason": minimum.reason, "previous_state": prior_state, **metadata_summary}, db_path=self.db_path,
                 )
             await db.upsert_account_state(
-                account_mode="demo", broker_login=broker_login, state=state,
-                balance=balance, equity=equity, free_margin=free_margin,
-                margin_level=margin_level, minimum_operating_capital=minimum.amount,
+                account_mode="demo", broker_login=broker_login, state=state, balance=balance, equity=equity,
+                free_margin=free_margin, margin_level=margin_level, minimum_operating_capital=minimum.amount,
                 active_demo_session_id=session_id, exhaustion_reason=reason if state in AccountCapitalState.BLOCKING else None,
                 reset_previous_balance=previous_balance if reset_detected else None,
                 reset_previous_equity=previous_equity if reset_detected else None,
-                reset_detected_at=__import__("datetime").datetime.utcnow().isoformat() if reset_detected else None,
-                notification_key=f"{state}:{session_id}" if changed else (previous or {}).get("notification_key"),
-                metadata={"minimum_reason": minimum.reason, "executable_symbols": list(minimum.executable_symbols), "capacity_count": self._capacity_count(free_margin, minimum.amount), "snapshot_time": snapshot.get("retrieved_at")}, db_path=self.db_path,
+                reset_detected_at=datetime.now(timezone.utc).isoformat() if reset_detected else None,
+                notification_key=f"{state}:{session_id}" if changed else (previous or {}).get("notification_key"), metadata=metadata_summary, db_path=self.db_path,
             )
             result = {
-                "current": True, "state": state, "reason": reason, "changed": changed,
-                "reset_detected": reset_detected, "account": account, "demo_session_id": session_id,
-                "minimum_operating_capital": minimum.amount, "minimum_reason": minimum.reason,
-                "executable_symbols": list(minimum.executable_symbols),
-                "capacity_count": self._capacity_count(free_margin, minimum.amount),
-                "previous": previous,
+                "current": True, "state": state, "reason": reason, "changed": changed, "reset_detected": reset_detected,
+                "account": account, "demo_session_id": session_id, "minimum_operating_capital": minimum.amount,
+                "minimum_reason": minimum.reason, "executable_symbols": list(minimum.executable_symbols),
+                "capacity_count": self._capacity_count(free_margin, minimum.amount), "broker_metadata": audit, "previous": previous,
             }
             self.last_result = result
             return result
@@ -235,16 +456,14 @@ class CapitalStateService:
         session_id = (previous or {}).get("active_demo_session_id")
         if changed:
             await db.record_account_state_event(
-                account_mode="demo", broker_login=(previous or {}).get("broker_login"),
-                demo_session_id=session_id, event_type="account_state_unavailable",
-                state=AccountCapitalState.ACCOUNT_STATE_UNKNOWN, balance=None, equity=None,
-                free_margin=None, margin_level=None, minimum_operating_capital=None,
+                account_mode="demo", broker_login=(previous or {}).get("broker_login"), demo_session_id=session_id,
+                event_type="account_state_unavailable", state=AccountCapitalState.ACCOUNT_STATE_UNKNOWN,
+                balance=None, equity=None, free_margin=None, margin_level=None, minimum_operating_capital=None,
                 details={"reason": reason}, db_path=self.db_path,
             )
         await db.upsert_account_state(
-            account_mode="demo", broker_login=(previous or {}).get("broker_login"),
-            state=AccountCapitalState.ACCOUNT_STATE_UNKNOWN, balance=None, equity=None,
-            free_margin=None, margin_level=None, minimum_operating_capital=None,
+            account_mode="demo", broker_login=(previous or {}).get("broker_login"), state=AccountCapitalState.ACCOUNT_STATE_UNKNOWN,
+            balance=None, equity=None, free_margin=None, margin_level=None, minimum_operating_capital=None,
             active_demo_session_id=session_id, exhaustion_reason=reason,
             notification_key=f"{AccountCapitalState.ACCOUNT_STATE_UNKNOWN}:{session_id}" if changed else (previous or {}).get("notification_key"),
             metadata={"reason": reason}, db_path=self.db_path,
@@ -254,7 +473,7 @@ class CapitalStateService:
     async def verify_resume(self) -> dict[str, Any]:
         """Allow explicit resume only after a current viable broker-state evaluation."""
         result = await self.evaluate(allow_awaiting_resume=True)
-        if result.get("state") in {AccountCapitalState.NORMAL, AccountCapitalState.LOW_CAPITAL, AccountCapitalState.CRITICAL_CAPITAL}:
+        if result.get("state") in {AccountCapitalState.NORMAL, AccountCapitalState.LOW_CAPITAL}:
             await db.upsert_account_state(
                 account_mode="demo", broker_login=str((result.get("account") or {}).get("login") or ""),
                 state=AccountCapitalState.NORMAL, balance=self._num((result.get("account") or {}).get("balance")),

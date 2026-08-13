@@ -186,6 +186,7 @@ class BotHandlers:
             "**Research commands**\n\n"
             "`/dashboard` — current autonomous-system status\n"
             "`/markets` — broker-verified Deriv universe\n"
+            "`/brokercheck` — read-only MT5 price, volume, contract, and margin audit\n"
             "`/positions` — active broker positions and recorded policy actions\n"
             "`/learning` — measured observations and next objective\n"
             "`/experiments` — immutable policy experiment lifecycle\n"
@@ -270,6 +271,75 @@ class BotHandlers:
             lines.extend(["", f"Complete metadata audit: {audit_paths[1]}", f"Machine-readable audit: {audit_paths[0]}"])
         lines.extend(["", "No non-broker or guessed instrument is enabled. Forex, crypto, and all unsupported products remain rejected."])
         await self._render_plain_menu(update, "\n".join(lines))
+
+    @admin_only
+    async def cmd_brokercheck(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Run and display a read-only account-level MT5 executable-symbol audit."""
+        if not self.scheduler:
+            await self._render_plain_menu(update, "BROKER CHECK\n\nScheduler is unavailable, so no broker-authoritative metadata audit can be produced.")
+            return
+        await self.scheduler.refresh_market_universe()
+        state_result = await self.scheduler.reconcile_account_state()
+        capital = state_result.get("capital") or {}
+        account = capital.get("account") or {}
+        audit = capital.get("broker_metadata") or self.scheduler.capital_state_service.last_metadata_audit or {}
+        try:
+            json_path, markdown_path = self.scheduler.capital_state_service.write_metadata_audit("logs", audit, account)
+            self.scheduler.last_broker_metadata_audit_paths = (str(json_path), str(markdown_path))
+        except Exception as exc:
+            json_path = markdown_path = None
+            logger.exception("Could not write explicit broker-check audit: %s", exc)
+        currency = str(account.get("currency") or "USD")
+        current = bool(capital.get("current"))
+        lines = [
+            "BROKER CHECK — READ-ONLY MT5 AUDIT",
+            f"MT5: {'CONNECTED' if current else 'UNAVAILABLE'}",
+            f"Account: {str(account.get('broker_account_mode') or self.settings.trading_mode).upper()}",
+            f"Balance: {currency} {float(account.get('balance') or 0.0):,.2f}",
+            f"Equity: {currency} {float(account.get('equity') or 0.0):,.2f}",
+            f"Free margin: {currency} {float(account.get('free_margin') or 0.0):,.2f}",
+            f"Margin: {currency} {float(account.get('margin') or 0.0):,.2f} | Level: {float(account.get('margin_level') or 0.0):.1f}%",
+            f"Account leverage: {account.get('leverage') if account.get('leverage') is not None else 'NOT EXPOSED'}",
+            f"Target symbols: {audit.get('target_count', 0)} | Usable: {audit.get('usable_count', 0)} | Invalid: {audit.get('invalid_count', 0)}",
+            f"Account state: {capital.get('state') or 'ACCOUNT_STATE_UNKNOWN'}",
+            f"Reason: {capital.get('reason') or 'Broker data unavailable'}",
+            "",
+            "SYMBOL VALIDATION",
+        ]
+        for record in audit.get("symbols", []):
+            checks = record.get("checks") or {}
+            status = "USABLE" if record.get("usable") else "INVALID"
+            lines.extend([
+                f"{record.get('symbol')} — {status}",
+                f"  PRICE: {checks.get('price', 'NOT_EXPOSED')} | VOLUME: {checks.get('volume', 'NOT_EXPOSED')} | CONTRACT: {checks.get('contract', 'NOT_EXPOSED')}",
+                f"  MARGIN: {checks.get('margin', 'NOT_EXPOSED')} ({record.get('margin_source') or 'NOT EXPOSED'}) | LEVERAGE: {checks.get('leverage', 'NOT_EXPOSED')}",
+                f"  Required margin: {currency} {float(record.get('margin_required') or 0.0):,.2f} | {record.get('reason')}",
+            ])
+        if not audit.get("symbols"):
+            lines.append("No enabled broker target symbols were available for validation.")
+        if markdown_path:
+            lines.extend(["", f"Full audit: {markdown_path}", f"JSON audit: {json_path}"])
+        report = "\n".join(lines)
+        if len(report) <= 3900:
+            await self._render_plain_menu(update, report)
+            return
+        # Never silently discard invalid-symbol reasons. Keep the main response
+        # concise and deliver the remaining field-level audit in Telegram-safe
+        # chunks to the same authorized chat.
+        summary_end = lines.index("SYMBOL VALIDATION") + 1
+        await self._render_plain_menu(update, "\n".join(lines[:summary_end] + ["Detailed per-symbol reasons follow in additional messages."]))
+        detail = lines[summary_end:]
+        chunk: list[str] = []
+        size = 0
+        for line in detail:
+            needed = len(line) + 1
+            if chunk and size + needed > 3500:
+                await update.effective_chat.send_message("\n".join(chunk))
+                chunk, size = [], 0
+            chunk.append(line)
+            size += needed
+        if chunk:
+            await update.effective_chat.send_message("\n".join(chunk))
 
     @admin_only
     async def cmd_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1511,6 +1581,8 @@ class BotHandlers:
             await self.cmd_demo_session_report(update, context)
         elif data == "markets":
             await self.cmd_markets(update, context)
+        elif data == "brokercheck":
+            await self.cmd_brokercheck(update, context)
         elif data == "learning":
             await self.cmd_learning(update, context)
         elif data == "performance":
@@ -1884,6 +1956,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("dashboard", self.cmd_dashboard))
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("markets", self.cmd_markets))
+        app.add_handler(CommandHandler("brokercheck", self.cmd_brokercheck))
         app.add_handler(CommandHandler("account", self.cmd_account))
         app.add_handler(CommandHandler("positions", self.cmd_positions))
         app.add_handler(CommandHandler("position", self.cmd_position))

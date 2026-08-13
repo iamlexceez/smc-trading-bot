@@ -81,6 +81,7 @@ class MarketScheduler:
         self.last_account_reconciliation: dict = {}
         self.capital_state_service = CapitalStateService(self.settings, self.executor)
         self.last_capital_state: dict = {}
+        self.last_broker_metadata_audit_paths: tuple[str, str] | None = None
         self.capital_reduction = CapitalReductionEngine(self.settings, self.executor)
 
     async def start(self, interval_seconds: int = 300):
@@ -112,6 +113,12 @@ class MarketScheduler:
             self.run_capital_reduction,
             IntervalTrigger(seconds=15),
             id="capital_reduction",
+            replace_existing=True,
+        )
+        self.scheduler.add_job(
+            self.send_activity_heartbeat,
+            IntervalTrigger(minutes=10),
+            id="activity_heartbeat",
             replace_existing=True,
         )
         self.scheduler.start()
@@ -164,8 +171,27 @@ class MarketScheduler:
             if verified.get("resume_verified"):
                 self.settings.is_paused = False
                 await db.save_settings(self.settings)
+        elif (
+            self.settings.is_paused and self.settings.auto_trade
+            and str((capital.get("previous") or {}).get("state") or "") == AccountCapitalState.ACCOUNT_STATE_UNKNOWN
+            and state in {AccountCapitalState.NORMAL, AccountCapitalState.LOW_CAPITAL}
+        ):
+            # This is not an account reset. It is a recovery from a fail-closed
+            # metadata/connection unknown state after current MT5 facts prove an
+            # executable target. Reset transitions remain separately controlled.
+            self.settings.is_paused = False
+            await db.save_settings(self.settings)
+            logger.info("Autonomous DEMO scanning resumed after broker metadata verification")
 
         if capital.get("changed"):
+            audit = capital.get("broker_metadata")
+            if audit:
+                try:
+                    json_path, markdown_path = self.capital_state_service.write_metadata_audit("logs", audit, capital.get("account"))
+                    self.last_broker_metadata_audit_paths = (str(json_path), str(markdown_path))
+                    logger.info("MT5 broker metadata audit written: %s", markdown_path)
+                except Exception as exc:
+                    logger.exception("Could not write broker metadata audit: %s", exc)
             await self._notify_capital_state(capital)
         if not result.get("current"):
             logger.warning("Account reconciliation unavailable: %s", result.get("error"))
@@ -206,13 +232,52 @@ class MarketScheduler:
                 "Trading remains PAUSED. Use /resume to re-verify the broker state and resume DEMO trading.",
             ])
         elif state == AccountCapitalState.ACCOUNT_STATE_UNKNOWN:
-            text = f"⚠️ ACCOUNT STATE UNKNOWN\nNew trading is halted until MT5 account state is verified.\nReason: {capital.get('reason')}"
+            audit = capital.get("broker_metadata") or {}
+            text = "\n".join([
+                "⚠️ ACCOUNT STATE UNKNOWN",
+                "New trading is halted until MT5 account state is verified.",
+                f"Reason: {capital.get('reason')}",
+                f"Target symbols: {audit.get('target_count', 0)} | Usable: {audit.get('usable_count', 0)} | Invalid: {audit.get('invalid_count', 0)}",
+                f"Top failure: {audit.get('top_failure', 'Broker account data unavailable')}",
+                "Action: use /brokercheck for the field-by-field MT5 audit.",
+            ])
         else:
             text = f"💰 DEMO CAPITAL STATUS: {state}\nReason: {capital.get('reason')}\nMinimum operating capital: {currency} {minimum:,.2f}"
         try:
             await self.bot_app.bot.send_message(chat_id=self.admin_chat_id, text=text)
         except Exception as exc:
             logger.error("Capital-state notification failed: %s", exc)
+
+    async def send_activity_heartbeat(self) -> None:
+        """Report whether the running engine can currently validate broker execution facts."""
+        if not self.bot_app or not self.admin_chat_id:
+            return
+        capital = self.last_capital_state
+        if not capital:
+            capital = (await self.reconcile_account_state()).get("capital", {})
+        account = capital.get("account") or {}
+        audit = capital.get("broker_metadata") or self.capital_state_service.last_metadata_audit or {}
+        state = str(capital.get("state") or AccountCapitalState.ACCOUNT_STATE_UNKNOWN)
+        running = "🟢 RUNNING" if self._running else "🔴 STOPPED"
+        mt5 = "🟢 CONNECTED" if capital.get("current") else "🔴 UNAVAILABLE"
+        trading = "🟢 PERMITTED" if state not in AccountCapitalState.BLOCKING and not self.settings.is_paused else "🔴 HALTED"
+        text = "\n".join([
+            "🧠 BOT ACTIVITY — LAST 10 MINUTES",
+            f"Engine: {running}",
+            f"MT5: {mt5}",
+            f"Account: {str(account.get('broker_account_mode') or self.settings.trading_mode).upper()}",
+            f"Target symbols: {audit.get('target_count', 0)}",
+            f"Usable: {audit.get('usable_count', 0)} | Invalid: {audit.get('invalid_count', 0)}",
+            f"Trading: {trading}",
+            f"Capital state: {state}",
+            f"Reason: {capital.get('reason') or 'Awaiting the next broker verification'}",
+            f"Top failure: {audit.get('top_failure', 'None')}",
+            "Action: /brokercheck",
+        ])
+        try:
+            await self.bot_app.bot.send_message(chat_id=self.admin_chat_id, text=text)
+        except Exception as exc:
+            logger.error("Activity heartbeat notification failed: %s", exc)
 
     async def run_capital_reduction(self) -> dict:
         """Advance the isolated DEMO reduction engine; it never feeds the optimizer."""

@@ -95,6 +95,14 @@ class BaseExecutor(ABC):
         """Get symbol specs (pip size, min lot, contract size, etc.)."""
         ...
 
+    async def get_symbol_execution_metadata(self, symbol: str, direction: str = "BUY") -> dict:
+        """Return read-only quote, specification, and minimum-volume margin evidence when supported.
+
+        The default is deliberately empty.  Callers must fail closed rather than
+        estimating margin from a fabricated symbol-level leverage value.
+        """
+        return {}
+
     async def list_symbols(self) -> list[dict]:
         """Return raw symbols exposed by the connected broker.
 

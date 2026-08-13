@@ -11,11 +11,12 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 Dashboard", callback_data="dashboard"), InlineKeyboardButton("💰 Account", callback_data="account")],
         [InlineKeyboardButton("📍 Positions", callback_data="positions"), InlineKeyboardButton("📋 Orders", callback_data="orders")],
         [InlineKeyboardButton("⚠️ Exposure", callback_data="exposure"), InlineKeyboardButton("🩺 Account Health", callback_data="health")],
-        [InlineKeyboardButton("📜 History", callback_data="history"), InlineKeyboardButton("📈 Performance", callback_data="performance")],
-        [InlineKeyboardButton("💹 Markets", callback_data="markets"), InlineKeyboardButton("🧠 Learning", callback_data="learning")],
-        [InlineKeyboardButton("🧪 Experiments", callback_data="experiments"), InlineKeyboardButton("🎯 Capital Test", callback_data="capital_test")],
-        [InlineKeyboardButton("🏆 Champion", callback_data="champion"), InlineKeyboardButton("⚔️ Challengers", callback_data="challengers")],
-        [InlineKeyboardButton("⚙️ Settings / DEMO-LIVE", callback_data="settings"), InlineKeyboardButton("🚨 Emergency Stop", callback_data="emergency")],
+        [InlineKeyboardButton("📈 Performance", callback_data="performance"), InlineKeyboardButton("⚙️ Settings / DEMO-LIVE", callback_data="settings")],
+        [InlineKeyboardButton("💹 Markets", callback_data="markets"), InlineKeyboardButton("🔎 Broker Check", callback_data="brokercheck")],
+        [InlineKeyboardButton("🧠 Learning", callback_data="learning"), InlineKeyboardButton("🎯 Capital Test", callback_data="capital_test")],
+        [InlineKeyboardButton("🧪 Experiments", callback_data="experiments"), InlineKeyboardButton("🏆 Champion", callback_data="champion")],
+        [InlineKeyboardButton("⚔️ Challengers", callback_data="challengers"), InlineKeyboardButton("📜 History", callback_data="history")],
+        [InlineKeyboardButton("🚨 Emergency Stop", callback_data="emergency")],
     ])
 
 

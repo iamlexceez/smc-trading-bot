@@ -233,6 +233,8 @@ class LiveAccountViews:
         account = snapshot["account"]
         discrepancies = reconciliation.get("discrepancies", [])
         capital = await db.get_account_state("demo") if self.account_mode == "demo" else None
+        metadata = (capital or {}).get("metadata") or {}
+        broker_metadata = metadata.get("broker_metadata") or {}
         return "\n".join([
             f"ACCOUNT HEALTH — {self.mode_label}",
             "Connection: CONNECTED | Data: CURRENT (fresh MT5 query)",
@@ -240,6 +242,7 @@ class LiveAccountViews:
             f"Free margin: {self._money(account.get('free_margin'), str(account.get('currency') or 'USD'))} | Margin level: {float(account.get('margin_level') or 0.0):.1f}%",
             f"Capital state: {(capital or {}).get('state') or 'NOT YET VERIFIED'} | Minimum operating capital: {self._money((capital or {}).get('minimum_operating_capital'), str(account.get('currency') or 'USD'))}",
             f"Capital reason: {(capital or {}).get('exhaustion_reason') or 'No blocking capital condition recorded.'}",
+            f"Broker target validation: {broker_metadata.get('target_count', 0)} target | {broker_metadata.get('usable_count', 0)} usable | {broker_metadata.get('invalid_count', 0)} invalid | top failure: {broker_metadata.get('top_failure', 'None')}",
             f"Account synchronization: {'SYNCHRONIZED' if not discrepancies else f'{len(discrepancies)} discrepancy(s) detected'}",
             *( [f"- #{item.get('ticket')} {item.get('symbol')}: {item.get('detail')}" for item in discrepancies[:10]] or ["- No broker/local mismatch detected."] ),
             f"Last synchronization: {snapshot.get('retrieved_at')}",

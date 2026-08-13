@@ -423,11 +423,14 @@ async def test_broker_authoritative_capital_state() -> None:
                 },
             }
 
-        async def get_symbol_info(self, symbol):
-            return {"min_lot": 0.1, "contract_size": 100.0}
-
-        async def get_symbol_price(self, symbol):
-            return 100.0, 100.0
+        async def get_symbol_execution_metadata(self, symbol, direction="BUY"):
+            return {
+                "symbol": symbol, "selected": True, "visible": True, "trade_mode": 4, "order_mode": 127,
+                "bid": 100.0, "ask": 100.0, "last": 100.0, "point": 0.01, "digits": 2,
+                "tick_size": 0.01, "tick_value": 1.0, "volume_min": 0.1, "volume_max": 100.0,
+                "volume_step": 0.1, "contract_size": 100.0, "trade_contract_size": 100.0,
+                "margin_required": 10.0, "margin_source": "order_calc_margin",
+            }
 
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "capital_state.db")
@@ -439,6 +442,9 @@ async def test_broker_authoritative_capital_state() -> None:
         service = CapitalStateService(settings, broker, db_path=path)
         normal = await service.evaluate()
         assert_true(normal["state"] == AccountCapitalState.NORMAL and normal["demo_session_id"], "normal broker account did not create a valid DEMO session")
+        audit = normal.get("broker_metadata") or {}
+        first_symbol = (audit.get("symbols") or [{}])[0]
+        assert_true(first_symbol.get("usable") and first_symbol.get("checks", {}).get("leverage") == "NOT_EXPOSED", "valid MT5 direct margin evidence incorrectly required symbol-level leverage")
         first_session = normal["demo_session_id"]
         repeat = await service.evaluate()
         assert_true(repeat["demo_session_id"] == first_session and not repeat["changed"], "steady account state created a duplicate DEMO session or event")
@@ -450,6 +456,8 @@ async def test_broker_authoritative_capital_state() -> None:
         broker.margin_level = 1_000.0
         broker.free_margin = 5.0
         exhausted = await service.evaluate()
+        exhausted_symbol = ((exhausted.get("broker_metadata") or {}).get("symbols") or [{}])[0]
+        assert_true(exhausted_symbol.get("specification_valid") and not exhausted_symbol.get("usable"), "valid symbol specification was lost when only current free margin became insufficient")
         assert_true(exhausted["state"] == AccountCapitalState.CAPITAL_EXHAUSTED, "insufficient broker free margin was not classified as functional exhaustion")
         persisted = await db.get_account_state("demo", path)
         assert_true(persisted and persisted["state"] == AccountCapitalState.CAPITAL_EXHAUSTED, "exhausted state was not persisted authoritatively")
