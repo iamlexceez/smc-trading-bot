@@ -107,6 +107,10 @@ class BaseExecutor(ABC):
         """Return a realized broker outcome for a closed position, if available."""
         return None
 
+    async def get_live_account_snapshot(self, history_days: int = 1) -> dict:
+        """Return a current broker snapshot for read-only monitoring when supported."""
+        return {"current": False, "error": "Executor does not support live broker account snapshots"}
+
     @abstractmethod
     async def disconnect(self) -> None:
         """Clean up connection."""

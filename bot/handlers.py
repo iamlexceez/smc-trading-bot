@@ -39,6 +39,7 @@ from storage import db
 from analysis.scoring import format_signal_report
 from analysis.profiler import profiler
 from analysis.order_flow import order_flow
+from bot.account_views import LiveAccountViews
 from risk.manager import RiskManager
 from executors.mt5 import MT5Executor
 
@@ -82,6 +83,10 @@ class BotHandlers:
         if self.scheduler and hasattr(self.scheduler, 'executor'):
             return self.scheduler.executor
         return self._executor
+
+    def account_views(self) -> LiveAccountViews:
+        """Create a read-only view service using the active broker executor."""
+        return LiveAccountViews(self.executor, self.settings.trading_mode)
 
     async def reload_settings(self):
         """Reload settings from DB."""
@@ -255,17 +260,8 @@ class BotHandlers:
 
     @admin_only
     async def cmd_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Report account-mode-isolated statistics without mixing DEMO and LIVE."""
-        current = self.settings.trading_mode
-        other = "live" if current == "demo" else "demo"
-        current_stats = await db.get_performance_summary(current, days=30)
-        other_stats = await db.get_performance_summary(other, days=30)
-
-        def line(label: str, stats: dict) -> str:
-            factor = "N/A" if stats["profit_factor"] == float("inf") else f"{stats['profit_factor']:.2f}"
-            return f"**{label}** — `{stats['trades']}` closed | P/L `${stats['pnl']:.2f}` | win `{stats['win_rate']:.1f}%` | PF `{factor}` | drawdown `${stats['max_drawdown']:.2f}`"
-
-        await self._render_menu(update, "📊 **PERFORMANCE — LAST 30 DAYS**\n\n" + line(current.upper(), current_stats) + "\n" + line(other.upper(), other_stats) + "\n\nResults are stored and evaluated separately by account mode.")
+        """Show fresh broker-source daily performance, including current floating P/L."""
+        await self._render_plain_menu(update, await self.account_views().daily_performance())
 
     @admin_only
     async def cmd_learning(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -518,8 +514,12 @@ class BotHandlers:
 
     @admin_only
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show live positions with basket state and recent bot management actions."""
+        """Show every current MT5 position with read-only bot provenance."""
         reply_target = update.callback_query.message if update.callback_query else update.message
+        for view in await self.account_views().positions():
+            await reply_target.reply_text(view, parse_mode=None)
+        return
+
         positions = await self.executor.get_open_positions()
         if not positions:
             await reply_target.reply_text("No open positions.")
@@ -561,6 +561,49 @@ class BotHandlers:
             total_profit += position.profit
 
         await reply_target.reply_text(f"💰 **Total Open PnL: ${total_profit:.2f}**", parse_mode="Markdown")
+
+    @admin_only
+    async def cmd_position(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show one current MT5 position by ticket without changing it."""
+        if not context.args:
+            await self._render_plain_menu(update, "Usage: /position <MT5 ticket>")
+            return
+        try:
+            ticket = int(context.args[0])
+        except ValueError:
+            await self._render_plain_menu(update, "Position ticket must be a number.")
+            return
+        await self._render_plain_menu(update, await self.account_views().position_detail(ticket))
+
+    @admin_only
+    async def cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show live MT5 pending orders without changing them."""
+        await self._render_plain_menu(update, await self.account_views().orders())
+
+    @admin_only
+    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show MT5 closed-deal history for 1, 7, or 30 days."""
+        days = 1
+        if context.args:
+            try:
+                days = int(context.args[0])
+            except ValueError:
+                await self._render_plain_menu(update, "Usage: /history [1|7|30]")
+                return
+        if days not in {1, 7, 30}:
+            await self._render_plain_menu(update, "History supports only 1, 7, or 30 broker-history days.")
+            return
+        await self._render_plain_menu(update, await self.account_views().history(days))
+
+    @admin_only
+    async def cmd_exposure(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show read-only live account exposure."""
+        await self._render_plain_menu(update, await self.account_views().exposure())
+
+    @admin_only
+    async def cmd_health(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show fresh MT5 connection and reconciliation health."""
+        await self._render_plain_menu(update, await self.account_views().health())
 
     @admin_only
     async def cmd_manage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -621,7 +664,10 @@ class BotHandlers:
 
     @admin_only
     async def cmd_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show account info."""
+        """Show fresh broker account overview without modifying MT5 state."""
+        await self._render_plain_menu(update, await self.account_views().account_overview())
+        return
+
         info = await self.executor.get_account_info()
         if not info:
             msg = "Could not retrieve account info."
@@ -700,8 +746,8 @@ class BotHandlers:
             await update.message.reply_text(text, reply_markup=keyboards.main_menu(), parse_mode="Markdown")
 
     @admin_only
-    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show recent trade history."""
+    async def cmd_local_history_legacy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Legacy internal database history retained for non-command compatibility."""
         trades = await db.get_trade_history(limit=15, account_mode=self.settings.trading_mode)
         if not trades:
             msg = "No trade history yet."
@@ -1238,6 +1284,16 @@ class BotHandlers:
 
         if data in {"main", "dashboard"}:
             await self.cmd_dashboard(update, context)
+        elif data == "account":
+            await self.cmd_account(update, context)
+        elif data == "positions":
+            await self.cmd_positions(update, context)
+        elif data == "orders":
+            await self.cmd_orders(update, context)
+        elif data == "exposure":
+            await self.cmd_exposure(update, context)
+        elif data == "health":
+            await self.cmd_health(update, context)
         elif data == "markets":
             await self.cmd_markets(update, context)
         elif data == "learning":
@@ -1364,8 +1420,15 @@ class BotHandlers:
         elif data == "confirm_autotrade_on":
             self.settings.auto_trade = True
             await db.save_settings(self.settings)
+            if self.scheduler and not self.settings.is_paused:
+                asyncio.create_task(self.scheduler.activate_and_scan_now())
+                activation_text = "Auto-Trade is now ON. Broker universe refresh and the first safe scan have started immediately."
+            elif self.settings.is_paused:
+                activation_text = "Auto-Trade is ON, but the emergency pause remains active. Resume/clear the pause before scanning can begin."
+            else:
+                activation_text = "Auto-Trade is now ON, but the scheduler is unavailable for an immediate scan."
             await query.edit_message_text(
-                "Auto-Trade is now ON ✅",
+                activation_text,
                 reply_markup=keyboards.main_menu()
             )
         elif data == "set_mode":
@@ -1606,7 +1669,13 @@ class BotHandlers:
         app.add_handler(CommandHandler("dashboard", self.cmd_dashboard))
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("markets", self.cmd_markets))
+        app.add_handler(CommandHandler("account", self.cmd_account))
         app.add_handler(CommandHandler("positions", self.cmd_positions))
+        app.add_handler(CommandHandler("position", self.cmd_position))
+        app.add_handler(CommandHandler("orders", self.cmd_orders))
+        app.add_handler(CommandHandler("history", self.cmd_history))
+        app.add_handler(CommandHandler("exposure", self.cmd_exposure))
+        app.add_handler(CommandHandler("health", self.cmd_health))
         app.add_handler(CommandHandler("learning", self.cmd_learning))
         app.add_handler(CommandHandler("experiments", self.cmd_experiments))
         app.add_handler(CommandHandler("champion", self.cmd_champion))

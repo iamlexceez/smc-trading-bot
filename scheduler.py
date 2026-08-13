@@ -36,6 +36,7 @@ from analysis.profiler import profiler
 from risk.manager import RiskManager
 from executors.base import BaseExecutor, ExecutionResult
 from analysis.optimizer import SelfOptimizer
+from analysis.account_monitor import AccountReconciliationEngine
 from data.provider import DataProvider
 from data.universe import DerivMarketUniverse
 
@@ -74,6 +75,8 @@ class MarketScheduler:
         self._chart_activity_ledger: dict[str, tuple[str, float]] = {}
         # Initialize Self-Optimizer
         self.optimizer = SelfOptimizer(self.settings)
+        self.account_reconciliation = AccountReconciliationEngine(self.executor, self.settings.trading_mode)
+        self.last_account_reconciliation: dict = {}
 
     async def start(self, interval_seconds: int = 300):
         """Start the periodic market scanner after broker-market discovery."""
@@ -92,6 +95,12 @@ class MarketScheduler:
             self.refresh_market_universe,
             IntervalTrigger(hours=1),
             id="market_universe_refresh",
+            replace_existing=True,
+        )
+        self.scheduler.add_job(
+            self.reconcile_account_state,
+            IntervalTrigger(minutes=5),
+            id="account_reconciliation",
             replace_existing=True,
         )
         self.scheduler.start()
@@ -117,6 +126,36 @@ class MarketScheduler:
 
         # Force an immediate scan on startup in a background task
         asyncio.create_task(self.scan_and_execute())
+
+    async def reconcile_account_state(self) -> dict:
+        """Compare MT5 current state with local bot records; never modify either."""
+        self.account_reconciliation.executor = self.executor
+        self.account_reconciliation.account_mode = self.settings.trading_mode
+        snapshot = await self.account_reconciliation.snapshot(history_days=0)
+        result = await self.account_reconciliation.reconcile(snapshot)
+        self.last_account_reconciliation = result
+        if not result.get("current"):
+            logger.warning("Account reconciliation unavailable: %s", result.get("error"))
+        elif result.get("discrepancies"):
+            logger.warning("Account reconciliation found %s discrepancy(s): %s", len(result["discrepancies"]), result["discrepancies"][:3])
+        else:
+            logger.info("Account reconciliation is synchronized: %s MT5 positions", result.get("broker_open_positions", 0))
+        return result
+
+    async def activate_and_scan_now(self) -> bool:
+        """Refresh the broker universe and begin the first scan immediately after activation.
+
+        This is deliberately asynchronous so the Telegram confirmation returns
+        promptly. It preserves all normal eligibility, duplicate, broker-validity,
+        and fail-closed checks inside ``scan_and_execute``.
+        """
+        logger.info("Autonomous execution activated; starting immediate broker-universe refresh and scan")
+        ready = await self.refresh_market_universe()
+        if not ready:
+            logger.warning("Immediate activation scan skipped because no verified broker instrument is available")
+            return False
+        await self.scan_and_execute()
+        return True
 
     async def stop(self):
         """Stop the scanner."""

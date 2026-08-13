@@ -29,6 +29,7 @@ from data.universe import DerivMarketUniverse
 from data.provider import DataProvider
 from analysis.optimizer import SelfOptimizer
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
+from analysis.account_monitor import summarize_history, exposure_summary
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
 from bot.handlers import BotHandlers  # noqa: F401 — validates Telegram control imports.
 
@@ -54,6 +55,21 @@ def test_config_round_trip() -> None:
 
     migrated_markets = TradeSettings.from_dict({"symbols": "EURUSD,XAUUSDmicro", "enabled_symbols": "EURUSD", "available_symbols": "EURUSD"})
     assert_true(not migrated_markets.symbols and not migrated_markets.enabled_symbols, "persisted legacy symbols survived restart migration")
+
+
+def test_account_monitor_aggregates() -> None:
+    history = summarize_history([{"net_profit": 12.0}, {"net_profit": -5.0}, {"net_profit": 0.0}])
+    assert_true(history["trades"] == 3 and history["wins"] == 1 and history["losses"] == 1, "broker history statistics are incorrect")
+    assert_true(abs(history["net_profit"] - 7.0) < 1e-9, "broker net P/L aggregation is incorrect")
+    exposure = exposure_summary({
+        "account": {"equity": 1_000.0, "margin": 100.0, "free_margin": 900.0, "margin_level": 1_000.0},
+        "positions": [
+            {"symbol": "Boom 100 Index", "direction": "BUY", "volume": 0.2, "potential_sl": -10.0, "potential_tp": 20.0},
+            {"symbol": "XAUUSD", "direction": "SELL", "volume": 0.1, "potential_sl": -5.0, "potential_tp": 10.0},
+        ],
+    })
+    assert_true(exposure["open_positions"] == 2 and exposure["margin_exposure_pct"] == 10.0, "live exposure aggregation is incorrect")
+    assert_true(exposure["potential_sl"] == -15.0 and exposure["potential_tp"] == 30.0, "SL/TP exposure aggregation is incorrect")
 
 
 def test_risk_sizing_and_layers() -> None:
@@ -375,6 +391,7 @@ async def test_demo_live_partitioning() -> None:
 
 def run() -> None:
     test_config_round_trip()
+    test_account_monitor_aggregates()
     test_risk_sizing_and_layers()
     test_no_widening_management()
     test_causal_confirmation_invariants()

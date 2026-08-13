@@ -8,10 +8,13 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 def main_menu() -> InlineKeyboardMarkup:
     """Primary monitoring and research lifecycle controls."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Dashboard", callback_data="dashboard"), InlineKeyboardButton("💹 Markets", callback_data="markets")],
-        [InlineKeyboardButton("🧠 Learning", callback_data="learning"), InlineKeyboardButton("🧪 Experiments", callback_data="experiments")],
+        [InlineKeyboardButton("📊 Dashboard", callback_data="dashboard"), InlineKeyboardButton("💰 Account", callback_data="account")],
+        [InlineKeyboardButton("📍 Positions", callback_data="positions"), InlineKeyboardButton("📋 Orders", callback_data="orders")],
+        [InlineKeyboardButton("⚠️ Exposure", callback_data="exposure"), InlineKeyboardButton("🩺 Account Health", callback_data="health")],
+        [InlineKeyboardButton("📜 History", callback_data="history"), InlineKeyboardButton("📈 Performance", callback_data="performance")],
+        [InlineKeyboardButton("💹 Markets", callback_data="markets"), InlineKeyboardButton("🧠 Learning", callback_data="learning")],
+        [InlineKeyboardButton("🧪 Experiments", callback_data="experiments"), InlineKeyboardButton("🔬 Research", callback_data="research")],
         [InlineKeyboardButton("🏆 Champion", callback_data="champion"), InlineKeyboardButton("⚔️ Challengers", callback_data="challengers")],
-        [InlineKeyboardButton("📈 Performance", callback_data="performance"), InlineKeyboardButton("🔬 Research", callback_data="research")],
         [InlineKeyboardButton("⚙️ Settings / DEMO-LIVE", callback_data="settings"), InlineKeyboardButton("🚨 Emergency Stop", callback_data="emergency")],
     ])
 

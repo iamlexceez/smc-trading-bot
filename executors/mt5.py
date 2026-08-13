@@ -11,6 +11,7 @@ If MT5 is not available, the bot logs a clear error and exits in live mode.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from executors.base import BaseExecutor, ExecutionResult, Position
@@ -123,10 +124,138 @@ class MT5Executor(BaseExecutor):
             "equity": info.equity,
             "free_margin": info.margin_free,
             "margin": info.margin,
+            "margin_level": getattr(info, "margin_level", 0.0),
+            "profit": getattr(info, "profit", 0.0),
+            "credit": getattr(info, "credit", 0.0),
             "currency": info.currency,
             "leverage": info.leverage,
             "login": info.login,
             "server": info.server,
+            "company": getattr(info, "company", ""),
+        }
+
+    @staticmethod
+    def _broker_time(value) -> str:
+        try:
+            return datetime.fromtimestamp(int(value or 0), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            return ""
+
+    async def get_live_account_snapshot(self, history_days: int = 1) -> dict:
+        """Read a fresh MT5 account snapshot without submitting any trade request."""
+        if not MT5_AVAILABLE:
+            return {"current": False, "error": "MetaTrader5 package not installed"}
+        if not await self._ensure_connected():
+            return {"current": False, "error": f"MT5 connection unavailable: {mt5.last_error()}"}
+        account = await self.get_account_info()
+        if not account:
+            return {"current": False, "error": "MT5 account_info returned no data"}
+
+        positions = mt5.positions_get() or ()
+        orders = mt5.orders_get() or ()
+        buy_type = getattr(mt5, "POSITION_TYPE_BUY", 0)
+        order_type_names = {
+            getattr(mt5, "ORDER_TYPE_BUY_LIMIT", -1): "buy_limit",
+            getattr(mt5, "ORDER_TYPE_SELL_LIMIT", -1): "sell_limit",
+            getattr(mt5, "ORDER_TYPE_BUY_STOP", -1): "buy_stop",
+            getattr(mt5, "ORDER_TYPE_SELL_STOP", -1): "sell_stop",
+            getattr(mt5, "ORDER_TYPE_BUY_STOP_LIMIT", -1): "buy_stop_limit",
+            getattr(mt5, "ORDER_TYPE_SELL_STOP_LIMIT", -1): "sell_stop_limit",
+        }
+        position_rows: list[dict] = []
+        for position in positions:
+            direction = "BUY" if int(getattr(position, "type", -1)) == buy_type else "SELL"
+            entry = float(getattr(position, "price_open", 0.0) or 0.0)
+            current = float(getattr(position, "price_current", 0.0) or 0.0)
+            sl = float(getattr(position, "sl", 0.0) or 0.0)
+            tp = float(getattr(position, "tp", 0.0) or 0.0)
+            volume = float(getattr(position, "volume", 0.0) or 0.0)
+            order_type = getattr(mt5, "ORDER_TYPE_BUY", 0) if direction == "BUY" else getattr(mt5, "ORDER_TYPE_SELL", 1)
+            potential_sl = 0.0
+            potential_tp = 0.0
+            if sl > 0:
+                calculated = mt5.order_calc_profit(order_type, position.symbol, volume, entry, sl)
+                potential_sl = float(calculated or 0.0)
+            if tp > 0:
+                calculated = mt5.order_calc_profit(order_type, position.symbol, volume, entry, tp)
+                potential_tp = float(calculated or 0.0)
+            distance_sl = abs(current - sl) if current and sl else None
+            distance_tp = abs(tp - current) if current and tp else None
+            position_rows.append({
+                "ticket": int(getattr(position, "ticket", 0)),
+                "identifier": int(getattr(position, "identifier", 0) or 0),
+                "symbol": str(getattr(position, "symbol", "")),
+                "direction": direction,
+                "volume": volume,
+                "entry_price": entry,
+                "current_price": current,
+                "sl": sl,
+                "tp": tp,
+                "profit": float(getattr(position, "profit", 0.0) or 0.0),
+                "swap": float(getattr(position, "swap", 0.0) or 0.0),
+                "commission": float(getattr(position, "commission", 0.0) or 0.0),
+                "open_time": self._broker_time(getattr(position, "time", 0)),
+                "update_time": self._broker_time(getattr(position, "time_update", 0)),
+                "magic": int(getattr(position, "magic", 0) or 0),
+                "comment": str(getattr(position, "comment", "")),
+                "distance_to_sl": distance_sl,
+                "distance_to_tp": distance_tp,
+                "potential_sl": potential_sl,
+                "potential_tp": potential_tp,
+            })
+
+        order_rows = []
+        for order in orders:
+            symbol = str(getattr(order, "symbol", ""))
+            entry_price = float(getattr(order, "price_open", 0.0) or 0.0)
+            tick = mt5.symbol_info_tick(symbol)
+            current_price = ((float(getattr(tick, "bid", 0.0) or 0.0) + float(getattr(tick, "ask", 0.0) or 0.0)) / 2) if tick else 0.0
+            order_rows.append({
+                "ticket": int(getattr(order, "ticket", 0)),
+                "symbol": symbol,
+                "type": order_type_names.get(int(getattr(order, "type", -1)), f"unknown_{getattr(order, 'type', -1)}"),
+                "volume": float(getattr(order, "volume_current", getattr(order, "volume_initial", 0.0)) or 0.0),
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "distance_to_entry": abs(current_price - entry_price) if current_price and entry_price else None,
+                "sl": float(getattr(order, "sl", 0.0) or 0.0),
+                "tp": float(getattr(order, "tp", 0.0) or 0.0),
+                "created_at": self._broker_time(getattr(order, "time_setup", 0)),
+                "expiration": self._broker_time(getattr(order, "time_expiration", 0)),
+                "magic": int(getattr(order, "magic", 0) or 0),
+                "comment": str(getattr(order, "comment", "")),
+            })
+
+        end = datetime.now(timezone.utc)
+        history_rows = []
+        if history_days > 0:
+            start = end - timedelta(days=int(history_days))
+            deals = mt5.history_deals_get(start, end) or ()
+            close_entries = {getattr(mt5, "DEAL_ENTRY_OUT", 1), getattr(mt5, "DEAL_ENTRY_OUT_BY", 3)}
+            for deal in deals:
+                if getattr(deal, "entry", None) not in close_entries:
+                    continue
+                profit = float(getattr(deal, "profit", 0.0) or 0.0)
+                net_profit = profit + float(getattr(deal, "swap", 0.0) or 0.0) + float(getattr(deal, "commission", 0.0) or 0.0) + float(getattr(deal, "fee", 0.0) or 0.0)
+                history_rows.append({
+                    "ticket": int(getattr(deal, "ticket", 0)),
+                    "position_id": int(getattr(deal, "position_id", 0) or 0),
+                    "symbol": str(getattr(deal, "symbol", "")),
+                    "volume": float(getattr(deal, "volume", 0.0) or 0.0),
+                    "price": float(getattr(deal, "price", 0.0) or 0.0),
+                    "profit": profit,
+                    "net_profit": net_profit,
+                    "time": self._broker_time(getattr(deal, "time", 0)),
+                    "magic": int(getattr(deal, "magic", 0) or 0),
+                    "comment": str(getattr(deal, "comment", "")),
+                })
+        return {
+            "current": True,
+            "retrieved_at": end.isoformat(),
+            "account": account,
+            "positions": position_rows,
+            "pending_orders": order_rows,
+            "history": history_rows,
         }
 
     async def get_diagnostic_info(self) -> dict:
