@@ -222,23 +222,19 @@ class BotHandlers:
             await self.scheduler.refresh_market_universe()
         status_map = self.settings.symbol_status or {}
         active = self.settings.enabled_symbols
-        available = self.settings.available_symbols
-        unsupported = self.settings.unsupported_symbols
         lines = [
-            "💹 **BROKER-VERIFIED MARKET UNIVERSE**",
-            f"Mode: `{self.settings.trading_mode.upper()}` | Active: `{len(active)}` | Available: `{len(available)}` | Unsupported: `{len(unsupported)}`",
+            "💹 **BROKER-VERIFIED DERIV UNIVERSE**",
+            f"Mode: `{self.settings.trading_mode.upper()}` | Active instruments: `{len(active)}`",
             "",
         ]
         if active:
-            lines.append("**Active for scanning**")
+            lines.append("**Active Synthetic Indices & Gold (XAUUSD / XAUUSDmicro)**")
             for symbol in active:
-                detail = status_map.get(symbol, {})
-                classification = detail.get("classification", "Deriv-approved") if isinstance(detail, dict) else "Deriv-approved"
-                lines.append(f"• `{symbol}` — {classification}")
+                st = status_map.get(symbol, "available")
+                lines.append(f"• `{symbol}` — `{st}`")
         else:
             lines.append("No broker-verified active instruments. Scanning is fail-closed until the MT5 connection exposes Deriv Synthetic Indices or Gold.")
-        if unsupported:
-            lines.append("\nUnsupported or inactive broker symbols are excluded; they cannot be scanned or traded.")
+        lines.append("\nAll non-target forex pairs, crypto indices, and irrelevant instruments have been completely excluded and purged.")
         await self._render_menu(update, "\n".join(lines))
 
     @admin_only

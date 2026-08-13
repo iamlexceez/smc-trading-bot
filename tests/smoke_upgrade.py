@@ -163,9 +163,9 @@ async def test_deriv_market_universe() -> None:
     await universe.refresh(FakeBroker())
     assert_true(universe.available_symbols == ["DEX 600 UP Index", "Jump 10 Index", "Volatility 75 Index", "XAUUSD", "XAUUSDmicro"], "eligible Deriv markets were not classified correctly")
     assert_true(universe.status_for("Crash 500 Index") == "unavailable", "unavailable broker symbol became active")
-    assert_true("UnsupportedMarket" in universe.unsupported_symbols, "unsupported broker symbol was not excluded from the Deriv universe")
-    assert_true("EURUSD" in universe.unsupported_symbols, "forex symbol was not excluded from the Deriv universe")
-    assert_true("BTCETH Arbitrage Index" in universe.unsupported_symbols, "non-approved synthetic specialty product was not excluded")
+    assert_true("UnsupportedMarket" not in [r.symbol for r in universe.records], "unsupported broker symbol was not purged from universe records")
+    assert_true("EURUSD" not in [r.symbol for r in universe.records], "forex symbol was not purged from universe records")
+    assert_true("BTCETH Arbitrage Index" not in [r.symbol for r in universe.records], "non-approved synthetic specialty product was not purged")
     assert_true("XAUUSDmicro" in universe.available_symbols, "Gold micro variant was incorrectly excluded")
 
 

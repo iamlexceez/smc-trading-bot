@@ -135,19 +135,20 @@ class DerivMarketUniverse:
         return record.status if record else "unavailable"
 
     async def refresh(self, executor: Any) -> list[MarketSymbol]:
-        """Load all symbols exposed by the active MT5 account.
+        """Load and strictly filter symbols exposed by the active MT5 account.
 
-        The executor must return raw records from the broker.  An empty result
-        intentionally leaves no active instruments; it is safer to skip scans
-        than to substitute unrelated markets or generated candles.
+        Only approved Deriv Synthetic Indices and Gold (XAUUSD, XAUUSDmicro)
+        are retained. All forex pairs and other unsupported instruments
+        are completely ignored and purged from memory.
         """
 
         listed = await executor.list_symbols()
-        self._records = {
-            record.symbol: record
-            for record in (classify_deriv_symbol(item) for item in listed)
-            if record.symbol
-        }
+        filtered = {}
+        for item in listed:
+            record = classify_deriv_symbol(item)
+            if record.symbol and record.category in {"synthetic_index", "gold"}:
+                filtered[record.symbol] = record
+        self._records = filtered
         return self.records
 
     def load(self, records: Iterable[dict[str, Any]]) -> None:
