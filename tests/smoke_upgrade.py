@@ -158,6 +158,7 @@ async def test_deriv_market_universe() -> None:
                 {"name": "Jump 10 Index", "description": "Jump 10 Index", "path": "Synthetic Indices\\Jump", "trade_mode": 1, "available": True},
                 {"name": "XAUUSD", "description": "Gold vs US Dollar", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
                 {"name": "XAUUSDmicro", "description": "Gold micro", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
+                {"name": "XAUEUR", "description": "Gold vs Euro", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
                 {"name": "UnsupportedMarket", "description": "Unsupported broker market", "path": "Other\\Market", "trade_mode": 1, "available": True},
                 {"name": "EURUSD", "description": "Euro vs US Dollar", "path": "Forex\\Majors", "trade_mode": 1, "available": True},
                 {"name": "BTCETH Arbitrage Index", "description": "BTCETH Arbitrage Index", "path": "Synthetic Indices\\Specialty", "trade_mode": 1, "available": True},
@@ -173,6 +174,8 @@ async def test_deriv_market_universe() -> None:
     arbitrage = next(record for record in universe.rejected_records if record.symbol == "BTCETH Arbitrage Index")
     assert_true("excluded non-target" in arbitrage.decision_reason, "non-approved synthetic specialty rejection lacked evidence")
     assert_true("XAUUSDmicro" in universe.available_symbols, "Gold micro variant was incorrectly excluded")
+    xau_eur = next(record for record in universe.rejected_records if record.symbol == "XAUEUR")
+    assert_true("only XAUUSD and XAUUSDmicro" in xau_eur.decision_reason, "non-USD Gold cross was incorrectly accepted")
     with tempfile.TemporaryDirectory() as directory:
         json_path, markdown_path = universe.write_audit_report(directory)
         assert_true(json_path.exists() and markdown_path.exists(), "complete MT5 symbol audit files were not written")

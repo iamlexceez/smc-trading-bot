@@ -92,13 +92,12 @@ def _is_deriv_synthetic(raw: dict[str, Any], text: str, path_text: str) -> tuple
 
 
 def _is_gold(raw: dict[str, Any], text: str, path_text: str) -> tuple[bool, str]:
-    """Identify Gold from broker-provided metal metadata, not a guessed symbol list."""
-    explicit_category = _normalise(raw.get("category") or raw.get("group") or raw.get("sector"))
-    gold_context = "gold" in text or "gold" in explicit_category or "gold" in path_text
-    xau_context = "xau" in text
-    metal_context = "metal" in text or "metal" in explicit_category or "metal" in path_text
-    if gold_context and (xau_context or metal_context):
-        return True, "Broker metadata identifies Gold / XAU instrument"
+    """Allow only the two requested Gold symbols, never an arbitrary XAU cross."""
+    symbol = _normalise(raw.get("name") or raw.get("symbol"))
+    if symbol in {"xauusd", "xauusdmicro"}:
+        return True, "Broker symbol matches explicitly permitted Gold instrument"
+    if symbol.startswith("xau") or "gold" in text or "gold" in path_text:
+        return False, "Gold/XAU instrument is outside permitted scope (only XAUUSD and XAUUSDmicro are allowed)"
     return False, "Broker metadata does not identify a Gold / XAU instrument"
 
 
@@ -142,7 +141,7 @@ def classify_deriv_symbol(raw: dict[str, Any]) -> MarketSymbol:
             status, decision, reason = "unavailable", "REJECTED", f"Synthetic metadata matched but broker trade mode is not openable ({trade_mode_name})"
     else:
         category, status, decision = "unsupported", "unsupported", "REJECTED"
-        reason = f"{synthetic_reason}; {gold_reason}"
+        reason = gold_reason if "outside permitted scope" in gold_reason else f"{synthetic_reason}; {gold_reason}"
 
     return MarketSymbol(
         symbol=symbol,
