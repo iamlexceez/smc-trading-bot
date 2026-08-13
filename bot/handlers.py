@@ -187,6 +187,7 @@ class BotHandlers:
             "`/dashboard` — current autonomous-system status\n"
             "`/markets` — broker-verified Deriv universe\n"
             "`/brokercheck` — read-only MT5 price, volume, contract, and margin audit\n"
+            "`/engine` — actual scheduler, scanner, analysis, execution, and task diagnostics\n"
             "`/positions` — active broker positions and recorded policy actions\n"
             "`/learning` — measured observations and next objective\n"
             "`/experiments` — immutable policy experiment lifecycle\n"
@@ -270,6 +271,46 @@ class BotHandlers:
         if audit_paths:
             lines.extend(["", f"Complete metadata audit: {audit_paths[1]}", f"Machine-readable audit: {audit_paths[0]}"])
         lines.extend(["", "No non-broker or guessed instrument is enabled. Forex, crypto, and all unsupported products remain rejected."])
+        await self._render_plain_menu(update, "\n".join(lines))
+
+    @admin_only
+    async def cmd_engine(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show observed task lifecycle and process-lifetime engine telemetry without trading."""
+        if not self.scheduler:
+            await self._render_plain_menu(update, "ENGINE DIAGNOSTICS\n\nScheduler is unavailable; no runtime task evidence exists.")
+            return
+        runtime = self.scheduler.telemetry.snapshot(include_lifetime=True)
+        lifetime = (runtime.get("lifetime") or {}).get("counters") or {}
+        components = runtime.get("components") or {}
+        tasks = self.scheduler.scheduled_task_status()
+        def status(name: str) -> str:
+            component = components.get(name) or {}
+            return f"{component.get('state', 'NOT_STARTED')} | last success: {component.get('last_success') or 'never'} | last failure: {component.get('last_failure') or 'none'}"
+        lines = [
+            "ENGINE DIAGNOSTICS — READ-ONLY",
+            f"Process started: {runtime.get('started_at')}",
+            "", "COMPONENTS",
+            f"Market scanner: {status('market_scanner')}",
+            f"Analysis engine: {status('analysis_engine')}",
+            f"Execution engine: {status('execution_engine')}",
+            f"Position manager: {status('position_manager')}",
+            f"Learning engine: {status('learning_engine')}",
+            f"Account reconciliation: {status('account_reconciliation')}",
+            f"Capital management: {status('capital_management')}",
+            "", "SCHEDULED TASKS",
+        ]
+        for task in tasks:
+            lines.append(f"- {task.get('name')}: interval/trigger={task.get('interval') or task.get('trigger')}; first={task.get('first_started') or 'not yet'}; last run={task.get('last_started') or 'not yet'}; success={task.get('last_success') or 'never'}; failure={task.get('last_failure') or 'none'}; next={task.get('next_run') or 'not scheduled'}")
+            if task.get("last_error"):
+                lines.append(f"  error: {task['last_error']}")
+        lines.extend([
+            "", "PROCESS-LIFETIME COUNTERS",
+            f"Scan cycles: {lifetime.get('scan_cycles_started', 0)} started / {lifetime.get('scan_cycles_completed', 0)} completed / {lifetime.get('scan_cycles_failed', 0)} failed",
+            f"Symbols: {lifetime.get('symbols_attempted', 0)} attempted / {lifetime.get('symbols_analyzed', 0)} analyzed | Candles: {lifetime.get('candle_requests', 0)} requested / {lifetime.get('failed_candle_requests', 0)} failed",
+            f"Analysis: {lifetime.get('analysis_runs', 0)} runs / {lifetime.get('setups_detected', 0)} detected / {lifetime.get('setups_rejected', 0)} rejected",
+            f"Orders: {lifetime.get('orders_submitted', 0)} submitted / {lifetime.get('orders_filled', 0)} filled / {lifetime.get('orders_rejected', 0)} rejected",
+            f"Positions: {lifetime.get('positions_checked', 0)} checked / {lifetime.get('positions_modified', 0)} modified / {lifetime.get('positions_closed', 0)} closed",
+        ])
         await self._render_plain_menu(update, "\n".join(lines))
 
     @admin_only
@@ -1594,6 +1635,8 @@ class BotHandlers:
             await self.cmd_markets(update, context)
         elif data == "brokercheck":
             await self.cmd_brokercheck(update, context)
+        elif data == "engine":
+            await self.cmd_engine(update, context)
         elif data == "learning":
             await self.cmd_learning(update, context)
         elif data == "performance":
@@ -1719,7 +1762,7 @@ class BotHandlers:
             self.settings.auto_trade = True
             await db.save_settings(self.settings)
             if self.scheduler and not self.settings.is_paused:
-                asyncio.create_task(self.scheduler.activate_and_scan_now())
+                self.scheduler._start_background_task("activation_market_scan", self.scheduler.activate_and_scan_now())
                 activation_text = "Auto-Trade is now ON. Broker universe refresh and the first safe scan have started immediately."
             elif self.settings.is_paused:
                 activation_text = "Auto-Trade is ON, but the emergency pause remains active. Resume/clear the pause before scanning can begin."
@@ -1968,6 +2011,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("markets", self.cmd_markets))
         app.add_handler(CommandHandler("brokercheck", self.cmd_brokercheck))
+        app.add_handler(CommandHandler("engine", self.cmd_engine))
         app.add_handler(CommandHandler("account", self.cmd_account))
         app.add_handler(CommandHandler("positions", self.cmd_positions))
         app.add_handler(CommandHandler("position", self.cmd_position))

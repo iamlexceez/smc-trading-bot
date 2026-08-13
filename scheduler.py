@@ -39,6 +39,7 @@ from executors.base import BaseExecutor, ExecutionResult
 from analysis.optimizer import SelfOptimizer
 from analysis.account_monitor import AccountReconciliationEngine
 from analysis.capital_state import AccountCapitalState, CapitalStateService
+from analysis.runtime_telemetry import RuntimeTelemetry
 from data.provider import DataProvider
 from data.universe import DerivMarketUniverse
 
@@ -84,6 +85,74 @@ class MarketScheduler:
         self.last_capital_state: dict = {}
         self.last_broker_metadata_audit_paths: tuple[str, str] | None = None
         self.capital_reduction = CapitalReductionEngine(self.settings, self.executor)
+        self.telemetry = RuntimeTelemetry()
+
+    async def _run_scheduled_task(self, name: str, interval: str, callback):
+        """Record real scheduled-task entry/outcome and never discard exceptions."""
+        self.telemetry.task_started(name, interval=interval)
+        try:
+            result = await callback()
+        except Exception as exc:
+            self.telemetry.task_failed(name, exc)
+            logger.exception("Scheduled task %s failed", name)
+            if name == "market_scan":
+                await self._notify(
+                    f"🔴 **SCANNER FAILURE**\\nTask: `{name}`\\nError: `{type(exc).__name__}: {exc}`\\n"
+                    f"Last successful scan: `{self.telemetry.snapshot().get('components', {}).get('market_scanner', {}).get('last_success') or 'never'}`"
+                )
+            raise
+        self.telemetry.task_succeeded(name)
+        return result
+
+    async def _market_scan_job(self):
+        return await self._run_scheduled_task("market_scan", "configured scan interval", self.scan_and_execute)
+
+    async def _universe_refresh_job(self):
+        return await self._run_scheduled_task("market_universe_refresh", "1 hour", self.refresh_market_universe)
+
+    async def _account_reconciliation_job(self):
+        return await self._run_scheduled_task("account_reconciliation", "5 minutes", self.reconcile_account_state)
+
+    async def _capital_reduction_job(self):
+        return await self._run_scheduled_task("capital_reduction", "15 seconds", self.run_capital_reduction)
+
+    async def _heartbeat_job(self):
+        return await self._run_scheduled_task("activity_heartbeat", "10 minutes", self.send_activity_heartbeat)
+
+    async def _optimization_job(self):
+        return await self._run_scheduled_task("self_optimization", "daily", self.run_self_optimization)
+
+    async def _daily_journal_job(self):
+        return await self._run_scheduled_task("daily_journal", "daily", self.send_daily_journal)
+
+    def _observe_background_task(self, name: str, task: asyncio.Task) -> None:
+        """Consume and report every unexpected exception from create_task work."""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.info("Background task %s was cancelled", name)
+        except Exception as exc:
+            self.telemetry.task_failed(name, exc)
+            logger.exception("Background task %s failed", name)
+
+    def _start_background_task(self, name: str, coroutine) -> asyncio.Task:
+        task = asyncio.create_task(coroutine, name=name)
+        task.add_done_callback(lambda completed: self._observe_background_task(name, completed))
+        return task
+
+    def scheduled_task_status(self) -> list[dict]:
+        """Merge real APScheduler next-runs with observed task entry/outcome data."""
+        observed = self.telemetry.snapshot().get("tasks", {})
+        rows = []
+        for job in self.scheduler.get_jobs():
+            row = dict(observed.get(job.id, {"name": job.id}))
+            row.update({
+                "name": job.id,
+                "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+                "trigger": str(job.trigger),
+            })
+            rows.append(row)
+        return sorted(rows, key=lambda item: item["name"])
 
     async def start(self, interval_seconds: int = 300):
         """Start the periodic market scanner after broker-market discovery."""
@@ -93,31 +162,31 @@ class MarketScheduler:
             logger.error("Market scans are fail-closed until Deriv symbol discovery succeeds")
 
         self.scheduler.add_job(
-            self.scan_and_execute,
+            self._market_scan_job,
             IntervalTrigger(seconds=interval_seconds),
             id="market_scan",
             replace_existing=True,
         )
         self.scheduler.add_job(
-            self.refresh_market_universe,
+            self._universe_refresh_job,
             IntervalTrigger(hours=1),
             id="market_universe_refresh",
             replace_existing=True,
         )
         self.scheduler.add_job(
-            self.reconcile_account_state,
+            self._account_reconciliation_job,
             IntervalTrigger(minutes=5),
             id="account_reconciliation",
             replace_existing=True,
         )
         self.scheduler.add_job(
-            self.run_capital_reduction,
+            self._capital_reduction_job,
             IntervalTrigger(seconds=15),
             id="capital_reduction",
             replace_existing=True,
         )
         self.scheduler.add_job(
-            self.send_activity_heartbeat,
+            self._heartbeat_job,
             IntervalTrigger(minutes=10),
             id="activity_heartbeat",
             replace_existing=True,
@@ -131,24 +200,37 @@ class MarketScheduler:
         from apscheduler.triggers.cron import CronTrigger
         optimization_hour = (self.settings.daily_report_hour_utc - 1) % 24
         self.scheduler.add_job(
-            self.run_self_optimization,
+            self._optimization_job,
             CronTrigger(hour=optimization_hour, minute=self.settings.daily_report_minute_utc),
             id="self_optimization",
             replace_existing=True,
         )
         self.scheduler.add_job(
-            self.send_daily_journal,
+            self._daily_journal_job,
             CronTrigger(hour=self.settings.daily_report_hour_utc, minute=self.settings.daily_report_minute_utc),
             id="daily_journal",
             replace_existing=True,
         )
+        for job in self.scheduler.get_jobs():
+            logger.info("[TASK SCHEDULED] name=%s trigger=%s next_run=%s", job.id, job.trigger, job.next_run_time)
 
         # Establish a broker-authoritative capital state before the first scan.
         await self.reconcile_account_state()
         # Force an immediate scan on startup only after that verification.
-        asyncio.create_task(self.scan_and_execute())
+        self._start_background_task("startup_market_scan", self.scan_and_execute())
 
     async def reconcile_account_state(self) -> dict:
+        """Run the authoritative broker state and account reconciliation with telemetry."""
+        self.telemetry.component_started("account_reconciliation")
+        try:
+            result = await self._reconcile_account_state()
+        except Exception as exc:
+            self.telemetry.component_failed("account_reconciliation", exc)
+            raise
+        self.telemetry.component_succeeded("account_reconciliation", waiting=False)
+        return result
+
+    async def _reconcile_account_state(self) -> dict:
         """Run the one authoritative broker capital-state evaluation plus read-only trade reconciliation."""
         self.capital_state_service.settings = self.settings
         self.capital_state_service.executor = self.executor
@@ -274,38 +356,102 @@ class MarketScheduler:
         except Exception as exc:
             logger.error("Capital-state notification failed: %s", exc)
 
+    @staticmethod
+    def _component_label(component: dict, *, enabled_waiting: bool = False) -> str:
+        state = str(component.get("state") or "NOT_STARTED")
+        if state == "FAILED":
+            return "🔴 FAILED"
+        if state == "NOT_STARTED":
+            return "🟡 WAITING" if enabled_waiting else "🟡 NOT STARTED"
+        if state == "WAITING":
+            return "🟡 WAITING"
+        return "🟢 RUNNING"
+
     async def send_activity_heartbeat(self) -> None:
-        """Report whether the running engine can currently validate broker execution facts."""
+        """Send a ten-minute factual report, resetting only confirmed delivered-window counters."""
+        self.telemetry.component_started("heartbeat")
         if not self.bot_app or not self.admin_chat_id:
+            self.telemetry.component_succeeded("heartbeat", waiting=True)
             return
-        capital = self.last_capital_state
-        if not capital:
-            capital = (await self.reconcile_account_state()).get("capital", {})
-        account = capital.get("account") or {}
-        audit = capital.get("broker_metadata") or self.capital_state_service.last_metadata_audit or {}
-        state = str(capital.get("state") or AccountCapitalState.ACCOUNT_STATE_UNKNOWN)
-        running = "🟢 RUNNING" if self._running else "🔴 STOPPED"
-        mt5 = "🟢 CONNECTED" if capital.get("current") else "🔴 UNAVAILABLE"
-        trading = "🟢 PERMITTED" if state not in AccountCapitalState.BLOCKING and not self.settings.is_paused else "🔴 HALTED"
-        text = "\n".join([
-            "🧠 BOT ACTIVITY — LAST 10 MINUTES",
-            f"Engine: {running}",
-            f"MT5: {mt5}",
-            f"Account: {str(account.get('broker_account_mode') or self.settings.trading_mode).upper()}",
-            f"Broker symbols: {(audit.get('pipeline') or {}).get('broker_symbols_returned', 0)} | Target symbols: {audit.get('target_count', 0)}",
-            f"Usable: {audit.get('usable_count', 0)} | Invalid: {audit.get('invalid_count', 0)} | Universe: {audit.get('universe_state', 'UNKNOWN')}",
-            f"Trading: {trading}",
-            f"Capital state: {state}",
-            f"Reason: {capital.get('reason') or 'Awaiting the next broker verification'}",
-            f"Top failure: {audit.get('top_failure', 'None')}",
-            "Action: /brokercheck",
-        ])
         try:
-            await self.bot_app.bot.send_message(chat_id=self.admin_chat_id, text=text)
+            capital = self.last_capital_state
+            if not capital:
+                capital = (await self.reconcile_account_state()).get("capital", {})
+            account = capital.get("account") or {}
+            audit = capital.get("broker_metadata") or self.capital_state_service.last_metadata_audit or {}
+            state = str(capital.get("state") or AccountCapitalState.ACCOUNT_STATE_UNKNOWN)
+            runtime = self.telemetry.snapshot(include_lifetime=True)
+            window = runtime.get("window") or {}
+            counters = window.get("counters") or {}
+            components = runtime.get("components") or {}
+            rejections = sorted((window.get("rejections") or {}).items(), key=lambda item: (-item[1], item[0]))[:3]
+            errors = sorted((window.get("errors") or {}).items(), key=lambda item: (-item[1], item[0]))[:3]
+            timeframe_text = ", ".join(f"{name}: {count}" for name, count in sorted((window.get("timeframes") or {}).items())) or "None"
+            scanner = components.get("market_scanner", {})
+            analysis = components.get("analysis_engine", {})
+            execution = components.get("execution_engine", {})
+            positions = components.get("position_manager", {})
+            learning = components.get("learning_engine", {})
+            heartbeat = components.get("heartbeat", {})
+            trading = "🟢 ENABLED" if state not in AccountCapitalState.BLOCKING and not self.settings.is_paused and self.settings.auto_trade else "🔴 HALTED"
+            scanner_label = self._component_label(scanner)
+            analysis_label = self._component_label(analysis)
+            execution_label = self._component_label(execution, enabled_waiting=bool(self.settings.auto_trade and not self.settings.is_paused))
+            position_label = self._component_label(positions, enabled_waiting=True)
+            learning_label = self._component_label(learning, enabled_waiting=True)
+            overall = "🟢 ACTIVE" if counters.get("scan_cycles_completed", 0) > 0 and scanner.get("state") != "FAILED" else ("🔴 FAILED" if scanner.get("state") == "FAILED" else "🟡 AWAITING FIRST SCAN")
+            position_count = self.last_account_reconciliation.get("broker_open_positions", 0)
+            lines = [
+                "🧠 BOT ACTIVITY — LAST 10 MINUTES",
+                "", "SYSTEM",
+                f"Heartbeat: {self._component_label(heartbeat)} | MT5: {'🟢 CONNECTED' if capital.get('current') else '🔴 UNAVAILABLE'} | Account: {str(account.get('broker_account_mode') or self.settings.trading_mode).upper()}",
+                "", "MARKET ENGINE",
+                f"Scanner: {scanner_label} | Scan cycles: {counters.get('scan_cycles_completed', 0)} complete / {counters.get('scan_cycles_failed', 0)} failed",
+                f"Last scan: {scanner.get('last_success') or 'never'} | Symbols attempted: {counters.get('symbols_attempted', 0)} | Analyzed: {counters.get('symbols_analyzed', 0)}",
+                f"Candle requests: {counters.get('candle_requests', 0)} | Success: {counters.get('successful_candle_requests', 0)} | Failures: {counters.get('failed_candle_requests', 0)}",
+                f"Timeframes actually requested: {timeframe_text}",
+                "", "ANALYSIS",
+                f"Analysis engine: {analysis_label} | Runs: {counters.get('analysis_runs', 0)} | Failures: {counters.get('analysis_failures', 0)}",
+                f"Setups detected: {counters.get('setups_detected', 0)} | Setups rejected: {counters.get('setups_rejected', 0)}",
+                "Top rejection reasons:",
+                *([f"- {count}× {reason}" for reason, count in rejections] or ["- None recorded"]),
+                "", "EXECUTION",
+                f"Execution engine: {execution_label} | Trade candidates: {counters.get('trade_candidates', 0)}",
+                f"Orders submitted: {counters.get('orders_submitted', 0)} | Filled: {counters.get('orders_filled', 0)} | Rejected: {counters.get('orders_rejected', 0)}",
+                "", "POSITION MANAGEMENT",
+                f"Position manager: {position_label} | Checked: {counters.get('positions_checked', 0)} | SL/TP modifications: {counters.get('positions_modified', 0)} | Closed: {counters.get('positions_closed', 0)}",
+                "", "LEARNING",
+                f"Learning engine: {learning_label} | Observations: {counters.get('observations', 0)} | Experiments: {counters.get('experiments', 0)} | Optimization runs: {counters.get('optimization_runs', 0)}",
+                "", "ACCOUNT",
+                f"Balance: {account.get('currency') or 'USD'} {float(account.get('balance') or 0.0):,.2f} | Equity: {account.get('currency') or 'USD'} {float(account.get('equity') or 0.0):,.2f}",
+                f"Free margin: {account.get('currency') or 'USD'} {float(account.get('free_margin') or 0.0):,.2f} | Open positions: {position_count}",
+                "", "UNIVERSE",
+                f"Broker symbols: {(audit.get('pipeline') or {}).get('broker_symbols_returned', 0)} | Targets: {audit.get('target_count', 0)} | Usable: {audit.get('usable_count', 0)} | Invalid: {audit.get('invalid_count', 0)}",
+                f"Capital state: {state} | Trading: {trading}",
+                "", f"OVERALL STATUS: {overall}",
+            ]
+            if errors:
+                lines.extend(["", "Runtime errors:", *[f"- {count}× {message}" for message, count in errors]])
+            await self.bot_app.bot.send_message(chat_id=self.admin_chat_id, text="\n".join(lines))
         except Exception as exc:
-            logger.error("Activity heartbeat notification failed: %s", exc)
+            self.telemetry.component_failed("heartbeat", exc)
+            logger.exception("Activity heartbeat notification failed")
+            return
+        self.telemetry.component_succeeded("heartbeat", waiting=True)
+        self.telemetry.heartbeat_snapshot_and_reset()
 
     async def run_capital_reduction(self) -> dict:
+        """Advance isolated capital management and record its actual runtime state."""
+        self.telemetry.component_started("capital_management")
+        try:
+            result = await self._run_capital_reduction()
+        except Exception as exc:
+            self.telemetry.component_failed("capital_management", exc)
+            raise
+        self.telemetry.component_succeeded("capital_management", waiting=result.get("state") in {"idle", "paused", "completed"})
+        return result
+
+    async def _run_capital_reduction(self) -> dict:
         """Advance the isolated DEMO reduction engine; it never feeds the optimizer."""
         self.capital_reduction.settings = self.settings
         self.capital_reduction.executor = self.executor
@@ -342,6 +488,17 @@ class MarketScheduler:
         await self.data_provider.close()
 
     async def refresh_market_universe(self) -> bool:
+        """Discover broker targets and record the true universe-component outcome."""
+        self.telemetry.component_started("market_universe")
+        try:
+            result = await self._refresh_market_universe()
+        except Exception as exc:
+            self.telemetry.component_failed("market_universe", exc)
+            raise
+        self.telemetry.component_succeeded("market_universe", waiting=not result)
+        return result
+
+    async def _refresh_market_universe(self) -> bool:
         """Discover and persist the connected account's eligible Deriv markets.
 
         Discovery is intentionally authoritative: legacy configured forex symbols
@@ -413,8 +570,23 @@ class MarketScheduler:
         return True
 
     async def fetch_candles(self, symbol: str, timeframe: str, count: int = 200) -> "pd.DataFrame":
-        """Fetch broker-native, closed OHLCV data for an active Deriv market."""
-        return await self.data_provider.get_candles(symbol, timeframe, count)
+        """Fetch broker-native, closed OHLCV data and record the actual outcome."""
+        self.telemetry.increment("candle_requests")
+        self.telemetry.record_timeframe(timeframe)
+        try:
+            frame = await self.data_provider.get_candles(symbol, timeframe, count)
+        except Exception as exc:
+            self.telemetry.increment("failed_candle_requests")
+            self.telemetry.record_error(f"candle {symbol} {timeframe}: {type(exc).__name__}: {exc}")
+            logger.exception("[CANDLE FAILURE] %s %s", symbol, timeframe)
+            raise
+        if frame is None or frame.empty:
+            self.telemetry.increment("failed_candle_requests")
+            self.telemetry.record_error(f"candle {symbol} {timeframe}: empty broker response")
+            logger.warning("[CANDLE FAILURE] %s %s returned no closed candles", symbol, timeframe)
+        else:
+            self.telemetry.increment("successful_candle_requests")
+        return frame
 
     @staticmethod
     def _validation_snapshot(validation) -> dict:
@@ -524,9 +696,15 @@ class MarketScheduler:
         Returns a TradeSignal if a tradeable setup is found, else None.
         """
         await self._reload_settings()
+        self.telemetry.increment("analysis_runs")
+        self.telemetry.increment("symbols_analyzed")
+        self.telemetry.increment("observations")
         self.optimizer.settings = self.settings
         policy, experiment_id, policy_version = await self.optimizer.active_policy(self.settings.trading_mode)
         if symbol not in self.settings.enabled_symbols:
+            reason = "Symbol is no longer in the broker-enabled target list"
+            self.telemetry.increment("setups_rejected")
+            self.telemetry.record_rejection(reason)
             logger.warning("Skipping non-active broker symbol %s", symbol)
             return None
 
@@ -535,6 +713,9 @@ class MarketScheduler:
         df = await self.fetch_candles(symbol, primary_tf, 200)
 
         if df.empty or len(df) < 20:
+            reason = "Insufficient closed broker candles for structural analysis"
+            self.telemetry.increment("setups_rejected")
+            self.telemetry.record_rejection(reason)
             logger.warning(f"Insufficient data for {symbol}")
             await self._chart_activity(
                 "data_unavailable", symbol,
@@ -599,6 +780,8 @@ class MarketScheduler:
             elif structure.current_zone == "premium":
                 direction = "SELL"
             else:
+                self.telemetry.increment("setups_rejected")
+                self.telemetry.record_rejection("No directional structure or valid premium/discount reversal context")
                 return None  # No clear direction
 
         # The active experimental policy chooses how the observed market features
@@ -665,6 +848,8 @@ class MarketScheduler:
             # Malformed price/stop/target data is an operational integrity fault,
             # not a failed SMC hypothesis. It must never reach the broker.
             reason = "Candidate lacks broker-executable stop/target geometry"
+            self.telemetry.increment("setups_rejected")
+            self.telemetry.record_rejection(reason)
             if setup_id is not None:
                 await db.update_setup_record(setup_id, status="invalidated", rejection_reason=reason)
             await self._chart_activity(
@@ -685,6 +870,8 @@ class MarketScheduler:
             score=quality.score, rr_ratio=validation.rr_ratio, features=features,
         )
         if not policy_ok:
+            self.telemetry.increment("setups_rejected")
+            self.telemetry.record_rejection(policy_reason)
             if setup_id is not None:
                 await db.update_setup_record(setup_id, status="rejected", rejection_reason=policy_reason)
             await self._chart_activity(
@@ -741,7 +928,18 @@ class MarketScheduler:
         return signals
 
     async def execute_signal(self, signal: TradeSignal, df: pd.DataFrame = None) -> bool:
-        """Run risk checks and execute a signal if valid."""
+        """Run actual execution with factual component health instrumentation."""
+        self.telemetry.component_started("execution_engine")
+        try:
+            result = await self._execute_signal(signal, df)
+        except Exception as exc:
+            self.telemetry.component_failed("execution_engine", exc)
+            raise
+        self.telemetry.component_succeeded("execution_engine", waiting=True)
+        return result
+
+    async def _execute_signal(self, signal: TradeSignal, df: pd.DataFrame = None) -> bool:
+        """Run risk checks and submit a broker order only if the candidate remains valid."""
         symbol = signal.symbol
         try:
             # Final revalidation immediately before any market order. A signal
@@ -750,6 +948,7 @@ class MarketScheduler:
             if signal.expires_at and datetime.utcnow() > datetime.fromisoformat(signal.expires_at):
                 signal.passed = False
                 signal.rejection_reason = "Signal expired before execution"
+                self.telemetry.record_rejection(signal.rejection_reason)
                 if setup_id is not None:
                     await db.update_setup_record(setup_id, status="expired", rejection_reason=signal.rejection_reason)
                 await self._chart_activity(
@@ -762,6 +961,7 @@ class MarketScheduler:
             if not refreshed or not refreshed.passed or refreshed.direction != signal.direction:
                 signal.passed = False
                 signal.rejection_reason = "Setup invalidated during final revalidation"
+                self.telemetry.record_rejection(signal.rejection_reason)
                 if setup_id is not None:
                     await db.update_setup_record(setup_id, status="invalidated", rejection_reason=signal.rejection_reason)
                 await self._chart_activity(
@@ -798,6 +998,7 @@ class MarketScheduler:
                 if position_risk == float("inf"):
                     signal.passed = False
                     signal.rejection_reason = f"Unprotected open position: {position.symbol} #{position.ticket}"
+                    self.telemetry.record_rejection(signal.rejection_reason)
                     await self._chart_activity(
                         "execution_rejected", symbol,
                         f"⛔ **SAFETY BLOCK — {symbol}**\nReason: {signal.rejection_reason}\nA new trade will not be opened while an existing position lacks structural protection.",
@@ -820,6 +1021,7 @@ class MarketScheduler:
             if not sizing.valid:
                 signal.passed = False
                 signal.rejection_reason = f"Sizing rejected: {sizing.reason}"
+                self.telemetry.record_rejection(signal.rejection_reason)
                 if signal.setup_id is not None:
                     await db.update_setup_record(signal.setup_id, status="sizing_rejected", rejection_reason=signal.rejection_reason)
                     await db.record_execution_event(
@@ -854,6 +1056,7 @@ class MarketScheduler:
             if not layers:
                 signal.passed = False
                 signal.rejection_reason = "No broker-valid initial layer"
+                self.telemetry.record_rejection(signal.rejection_reason)
                 if signal.setup_id is not None:
                     await db.update_setup_record(signal.setup_id, status="sizing_rejected", rejection_reason=signal.rejection_reason)
                     await db.record_execution_event(
@@ -894,6 +1097,7 @@ class MarketScheduler:
                 logger.info(f"Signal rejected for {symbol}: {risk_result.reason}")
                 signal.passed = False
                 signal.rejection_reason = risk_result.reason
+                self.telemetry.record_rejection(signal.rejection_reason)
                 if signal.setup_id is not None:
                     await db.update_setup_record(signal.setup_id, status="risk_rejected", rejection_reason=risk_result.reason)
                     await db.record_execution_event(
@@ -917,6 +1121,7 @@ class MarketScheduler:
                 fingerprint=f"{setup_id}:submit:{initial_layer['lot']}:{signal.entry_price}", essential=True,
             )
             execution_started = perf_counter()
+            self.telemetry.increment("orders_submitted")
             result = await self.executor.execute_trade(
                 symbol=symbol,
                 direction=signal.direction,
@@ -928,6 +1133,7 @@ class MarketScheduler:
             )
 
             if result.success:
+                self.telemetry.increment("orders_filled")
                 raw_signal = {
                     "entry_mode": signal.entry_mode,
                     "setup_type": signal.setup_type,
@@ -1055,6 +1261,8 @@ class MarketScheduler:
                 logger.info(f"Trade executed: {symbol} {signal.direction} score={signal.score:.1f}")
                 return True
             else:
+                self.telemetry.increment("orders_rejected")
+                self.telemetry.record_rejection(f"Broker rejected order: {result.message}")
                 if signal.setup_id is not None:
                     await db.update_setup_record(signal.setup_id, status="execution_failed", rejection_reason=result.message)
                     await db.record_execution_event(
@@ -1075,10 +1283,28 @@ class MarketScheduler:
 
         except Exception as e:
             logger.error(f"Error executing signal for {symbol}: {e}", exc_info=True)
-            return False
+            raise
 
     async def scan_and_execute(self):
-        """Main loop: scan markets, check risk gates, execute trades."""
+        """Instrumented market-scan entry point called by scheduler and activation."""
+        started = perf_counter()
+        self.telemetry.component_started("market_scanner")
+        self.telemetry.increment("scan_cycles_started")
+        logger.info("[SCANNER START] timestamp=%s", datetime.utcnow().isoformat())
+        try:
+            result = await self._scan_and_execute()
+        except Exception as exc:
+            self.telemetry.increment("scan_cycles_failed")
+            self.telemetry.component_failed("market_scanner", exc)
+            logger.exception("[SCANNER FAILURE] duration=%.3fs", perf_counter() - started)
+            raise
+        self.telemetry.increment("scan_cycles_completed")
+        self.telemetry.component_succeeded("market_scanner", waiting=False)
+        logger.info("[SCANNER COMPLETE] timestamp=%s duration=%.3fs", datetime.utcnow().isoformat(), perf_counter() - started)
+        return result
+
+    async def _scan_and_execute(self):
+        """Main scan implementation: validate account, manage positions, then scan usable markets."""
         await self._reload_settings()
         self.capital_state_service.settings = self.settings
         self.capital_state_service.executor = self.executor
@@ -1110,21 +1336,33 @@ class MarketScheduler:
             logger.debug("Auto-trade disabled or paused — skipping scan")
             return
             
-        if not self.settings.enabled_symbols:
-            logger.warning("No broker-verified Deriv symbols are active; skipping scan")
+        audit = capital.get("broker_metadata") or {}
+        scan_symbols = list(audit.get("usable_symbols") or [])
+        if not scan_symbols:
+            logger.warning("No broker-validated usable Deriv targets are active; skipping scan")
             return
 
-        logger.info("Starting market scan across %s broker-verified Deriv symbols", len(self.settings.enabled_symbols))
-        for symbol in self.settings.enabled_symbols:
-            logger.info(f"Analyzing {symbol}...")
+        logger.info("[SCANNER TARGETS] universe=%s usable=%s scanner_received=%s", audit.get("target_count", 0), audit.get("usable_count", 0), len(scan_symbols))
+        for symbol in scan_symbols:
+            self.telemetry.increment("symbols_attempted")
+            logger.info("[SYMBOL LOOP START] %s", symbol)
             try:
                 # Session participation is intentionally not a global execution
                 # gate. A candidate policy may later include a session feature
                 # when broker-realized evidence supports it.
                 # For the background loop, we analyze and execute.
-                signal = await self.analyze_symbol(symbol)
+                self.telemetry.component_started("analysis_engine")
+                try:
+                    signal = await self.analyze_symbol(symbol)
+                except Exception as exc:
+                    self.telemetry.increment("analysis_failures")
+                    self.telemetry.component_failed("analysis_engine", exc)
+                    raise
+                self.telemetry.component_succeeded("analysis_engine", waiting=not bool(signal and signal.passed))
                 if not signal or not signal.passed:
                     continue
+                self.telemetry.increment("setups_detected")
+                self.telemetry.increment("trade_candidates")
                 
                 await self._chart_activity(
                     "execution_queue", symbol,
@@ -1140,14 +1378,23 @@ class MarketScheduler:
                 await self.execute_signal(signal, df)
 
             except Exception as e:
+                self.telemetry.record_error(f"symbol {symbol}: {type(e).__name__}: {e}")
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
     async def run_self_optimization(self):
         """Run one bounded champion/challenger cycle and retain an audit trail."""
+        self.telemetry.component_started("learning_engine")
         logger.info("Running bounded walk-forward optimization...")
-        self.optimizer.settings = self.settings
-        rollback = await self.optimizer.evaluate_rollback(self.settings.trading_mode)
-        result = rollback or await self.optimizer.run_optimization(self.settings.trading_mode)
+        try:
+            self.optimizer.settings = self.settings
+            rollback = await self.optimizer.evaluate_rollback(self.settings.trading_mode)
+            result = rollback or await self.optimizer.run_optimization(self.settings.trading_mode)
+        except Exception as exc:
+            self.telemetry.component_failed("learning_engine", exc)
+            raise
+        self.telemetry.increment("optimization_runs")
+        self.telemetry.increment("experiments")
+        self.telemetry.component_succeeded("learning_engine", waiting=True)
         if result.get("decision") in {"promoted", "rolled_back"}:
             await self._notify(
                 "🧠 **MODEL GOVERNANCE UPDATE**\n"
@@ -1157,10 +1404,16 @@ class MarketScheduler:
 
     async def send_daily_journal(self):
         """Generate and send the readable, factual morning learning report."""
+        self.telemetry.component_started("learning_engine")
         logger.info("Generating daily learning report...")
-        self.optimizer.settings = self.settings
-        journal = await self.optimizer.generate_daily_journal(self.settings.trading_mode)
-        await self._notify(journal)
+        try:
+            self.optimizer.settings = self.settings
+            journal = await self.optimizer.generate_daily_journal(self.settings.trading_mode)
+            await self._notify(journal)
+        except Exception as exc:
+            self.telemetry.component_failed("learning_engine", exc)
+            raise
+        self.telemetry.component_succeeded("learning_engine", waiting=True)
 
     async def _chart_activity(
         self,
@@ -1270,13 +1523,25 @@ class MarketScheduler:
                 )
 
     async def manage_open_positions(self):
-        """Manage each open trade from fresh closed-candle structure and basket state."""
+        """Instrument real position-management checks and broker outcomes."""
+        self.telemetry.component_started("position_manager")
         try:
-            positions = await self.executor.get_open_positions()
+            result = await self._manage_open_positions()
+        except Exception as exc:
+            self.telemetry.component_failed("position_manager", exc)
+            raise
+        self.telemetry.component_succeeded("position_manager", waiting=bool(result == 0))
+        return result
+
+    async def _manage_open_positions(self):
+        """Manage each open trade from fresh closed-candle structure and basket state."""
+        positions = await self.executor.get_open_positions()
+        self.telemetry.increment("positions_checked", len(positions))
+        try:
             live_tickets = {position.ticket for position in positions}
             await self._reconcile_closed_trades(live_tickets)
             if not positions:
-                return
+                return 0
             logger.info("Managing %s open position(s) using their recorded experimental policies", len(positions))
 
             for position in positions:
@@ -1349,6 +1614,7 @@ class MarketScheduler:
                 if action.action == "move_sl" and action.new_sl is not None:
                     success = await self.executor.modify_position(position.ticket, sl=action.new_sl, tp=position.tp)
                     if success:
+                        self.telemetry.increment("positions_modified")
                         if basket:
                             await db.update_basket_state(basket["id"], state=action.state.value)
                             await db.update_trade_layer(basket["layer_id"], stop_loss=action.new_sl)
@@ -1365,6 +1631,7 @@ class MarketScheduler:
                 elif action.action == "move_tp" and action.new_tp is not None:
                     success = await self.executor.modify_position(position.ticket, sl=position.sl, tp=action.new_tp)
                     if success:
+                        self.telemetry.increment("positions_modified")
                         if basket:
                             await db.update_basket_state(basket["id"], state=action.state.value)
                             await db.update_trade_layer(basket["layer_id"], take_profit=action.new_tp)
@@ -1396,6 +1663,7 @@ class MarketScheduler:
 
                 elif action.action == "close_full":
                     if await self.executor.close_position(position.ticket):
+                        self.telemetry.increment("positions_closed")
                         if basket:
                             await db.update_basket_state(basket["id"], state=action.state.value, status="closed")
                             await db.log_basket_action(
@@ -1415,8 +1683,10 @@ class MarketScheduler:
 
             for basket in await db.get_open_baskets(self.settings.trading_mode):
                 await db.close_basket_if_flat(basket["id"], live_tickets)
+            return len(positions)
         except Exception as e:
             logger.error(f"Error in manage_open_positions: {e}", exc_info=True)
+            raise
 
     async def maybe_add_confirmed_layer(self, basket: dict, position, all_positions: list) -> bool:
         """Add at most one planned layer after fresh confirmation, never while losing.
@@ -1517,6 +1787,7 @@ class MarketScheduler:
         if not risk_result.passed:
             return False
 
+        self.telemetry.increment("orders_submitted")
         result = await self.executor.execute_trade(
             symbol=position.symbol,
             direction=refreshed.direction,
@@ -1527,7 +1798,10 @@ class MarketScheduler:
             comment=f"EXP L{next_layer['layer_number']}/{len(layers)}",
         )
         if not result.success:
+            self.telemetry.increment("orders_rejected")
+            self.telemetry.record_rejection("Broker rejected confirmed layer")
             return False
+        self.telemetry.increment("orders_filled")
 
         await db.update_trade_layer(
             next_layer["id"],

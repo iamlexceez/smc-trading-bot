@@ -13,9 +13,10 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚠️ Exposure", callback_data="exposure"), InlineKeyboardButton("🩺 Account Health", callback_data="health")],
         [InlineKeyboardButton("📈 Performance", callback_data="performance"), InlineKeyboardButton("⚙️ Settings / DEMO-LIVE", callback_data="settings")],
         [InlineKeyboardButton("💹 Markets", callback_data="markets"), InlineKeyboardButton("🔎 Broker Check", callback_data="brokercheck")],
-        [InlineKeyboardButton("🧠 Learning", callback_data="learning"), InlineKeyboardButton("🎯 Capital Test", callback_data="capital_test")],
-        [InlineKeyboardButton("🧪 Experiments", callback_data="experiments"), InlineKeyboardButton("🏆 Champion", callback_data="champion")],
-        [InlineKeyboardButton("⚔️ Challengers", callback_data="challengers"), InlineKeyboardButton("📜 History", callback_data="history")],
+        [InlineKeyboardButton("⚙️ Engine Diagnostics", callback_data="engine"), InlineKeyboardButton("🧠 Learning", callback_data="learning")],
+        [InlineKeyboardButton("🎯 Capital Test", callback_data="capital_test"), InlineKeyboardButton("🧪 Experiments", callback_data="experiments")],
+        [InlineKeyboardButton("🏆 Champion", callback_data="champion"), InlineKeyboardButton("⚔️ Challengers", callback_data="challengers")],
+        [InlineKeyboardButton("📜 History", callback_data="history")],
         [InlineKeyboardButton("🚨 Emergency Stop", callback_data="emergency")],
     ])
 

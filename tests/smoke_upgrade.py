@@ -32,6 +32,7 @@ from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvalua
 from analysis.account_monitor import summarize_history, exposure_summary
 from execution.capital_reduction import CapitalReductionEngine
 from analysis.capital_state import AccountCapitalState, CapitalStateService
+from analysis.runtime_telemetry import RuntimeTelemetry
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
 from bot.handlers import BotHandlers  # noqa: F401 — validates Telegram control imports.
 
@@ -39,6 +40,27 @@ from bot.handlers import BotHandlers  # noqa: F401 — validates Telegram contro
 def assert_true(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def test_runtime_telemetry() -> None:
+    telemetry = RuntimeTelemetry()
+    telemetry.component_started("market_scanner")
+    telemetry.increment("scan_cycles_started")
+    telemetry.increment("symbols_attempted", 3)
+    telemetry.increment("candle_requests", 6)
+    telemetry.record_timeframe("M15", 3)
+    telemetry.record_rejection("No directional structure")
+    telemetry.component_succeeded("market_scanner")
+    first = telemetry.heartbeat_snapshot_and_reset()
+    assert_true(first["window"]["counters"]["scan_cycles_started"] == 1, "heartbeat window lost a real scan start")
+    assert_true(first["window"]["counters"]["symbols_attempted"] == 3 and first["window"]["timeframes"]["M15"] == 3, "runtime symbol/timeframe evidence is incorrect")
+    after = telemetry.snapshot()
+    assert_true(after["window"]["counters"]["scan_cycles_started"] == 0, "heartbeat did not reset its activity window")
+    assert_true(after["lifetime"]["counters"]["scan_cycles_started"] == 1, "lifetime telemetry was incorrectly reset")
+    telemetry.component_started("analysis_engine")
+    telemetry.component_failed("analysis_engine", RuntimeError("fixture failure"))
+    assert_true(after["components"]["market_scanner"]["last_success"], "component success state was not retained")
+    assert_true(telemetry.snapshot()["components"]["analysis_engine"]["state"] == "FAILED", "component failure was not exposed")
 
 
 def test_config_round_trip() -> None:
@@ -506,6 +528,7 @@ async def test_demo_live_partitioning() -> None:
 
 
 def run() -> None:
+    test_runtime_telemetry()
     test_config_round_trip()
     test_account_monitor_aggregates()
     test_risk_sizing_and_layers()
