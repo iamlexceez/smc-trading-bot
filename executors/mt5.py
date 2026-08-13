@@ -207,6 +207,73 @@ class MT5Executor(BaseExecutor):
             "tick_value": getattr(info, 'trade_tick_value', 1.0),
         }
 
+    async def list_symbols(self) -> list[dict]:
+        """Return the account's broker-advertised symbols and metadata.
+
+        No symbols are selected or traded here.  The caller classifies these
+        records and allows only Deriv Synthetic Indices and the broker's Gold
+        instrument into the scanner.
+        """
+        if not MT5_AVAILABLE or not await self._ensure_connected():
+            return []
+        symbols = mt5.symbols_get()
+        if symbols is None:
+            logger.error("MT5 did not return a symbol universe: %s", mt5.last_error())
+            return []
+
+        disabled_mode = getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)
+        records: list[dict] = []
+        for info in symbols:
+            trade_mode = getattr(info, "trade_mode", disabled_mode)
+            records.append({
+                "name": info.name,
+                "description": getattr(info, "description", ""),
+                "path": getattr(info, "path", ""),
+                "visible": bool(getattr(info, "visible", False)),
+                "trade_mode": trade_mode,
+                "available": trade_mode != disabled_mode,
+            })
+        return records
+
+    async def get_candles(self, symbol: str, timeframe: str, count: int):
+        """Fetch only closed broker candles for causal live analysis."""
+        if not MT5_AVAILABLE or not await self._ensure_connected():
+            return None
+        if not mt5.symbol_select(symbol, True):
+            logger.warning("Unable to select broker symbol %s", symbol)
+            return None
+        tf_const = getattr(mt5, f"TIMEFRAME_{timeframe}", None)
+        if tf_const is None:
+            logger.warning("Unsupported MT5 timeframe %s", timeframe)
+            return None
+        # Position 0 is the forming candle.  Starting at 1 prevents the scan
+        # and any stored learning record from seeing future intrabar extremes.
+        rates = mt5.copy_rates_from_pos(symbol, tf_const, 1, count)
+        if rates is None or len(rates) == 0:
+            logger.warning("No closed rates for %s %s: %s", symbol, timeframe, mt5.last_error())
+            return None
+        import pandas as pd
+        frame = pd.DataFrame(rates)
+        frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+        return frame
+
+    async def get_historical_candles(self, symbol: str, timeframe: str, start, end):
+        """Fetch broker historical candles without a generic-data fallback."""
+        if not MT5_AVAILABLE or not await self._ensure_connected():
+            return None
+        if not mt5.symbol_select(symbol, True):
+            return None
+        tf_const = getattr(mt5, f"TIMEFRAME_{timeframe}", None)
+        if tf_const is None:
+            return None
+        rates = mt5.copy_rates_range(symbol, tf_const, start, end)
+        if rates is None or len(rates) == 0:
+            return None
+        import pandas as pd
+        frame = pd.DataFrame(rates)
+        frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+        return frame
+
     async def execute_trade(
         self, symbol: str, direction: str, lot_size: float,
         sl: float, tp: float, magic: int, comment: str = ""
@@ -437,6 +504,37 @@ class MT5Executor(BaseExecutor):
             if await self.close_position(pos.ticket):
                 closed += 1
         return closed
+
+    async def get_closed_position_outcome(self, ticket: int) -> Optional[dict]:
+        """Return the realized MT5 deal outcome for a closed position ticket.
+
+        MT5 exposes deal history filtered by position ID. The caller must first
+        verify that the position is no longer open; partial exits remain part of
+        the position's eventual aggregate P/L.
+        """
+        if not MT5_AVAILABLE or not await self._ensure_connected():
+            return None
+        deals = mt5.history_deals_get(position=ticket)
+        if not deals:
+            return None
+        closed_entry = getattr(mt5, "DEAL_ENTRY_OUT", None)
+        closing_deals = [deal for deal in deals if closed_entry is None or getattr(deal, "entry", None) == closed_entry]
+        if not closing_deals:
+            return None
+        pnl = sum(
+            float(getattr(deal, "profit", 0.0) or 0.0)
+            + float(getattr(deal, "swap", 0.0) or 0.0)
+            + float(getattr(deal, "commission", 0.0) or 0.0)
+            + float(getattr(deal, "fee", 0.0) or 0.0)
+            for deal in deals
+        )
+        latest = max(closing_deals, key=lambda deal: getattr(deal, "time_msc", 0))
+        return {
+            "pnl": pnl,
+            "exit_price": float(getattr(latest, "price", 0.0) or 0.0),
+            "closed_deals": len(closing_deals),
+            "close_time_msc": int(getattr(latest, "time_msc", 0) or 0),
+        }
 
     async def get_open_positions(self) -> list[Position]:
         if not MT5_AVAILABLE:

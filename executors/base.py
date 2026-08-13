@@ -95,6 +95,18 @@ class BaseExecutor(ABC):
         """Get symbol specs (pip size, min lot, contract size, etc.)."""
         ...
 
+    async def list_symbols(self) -> list[dict]:
+        """Return raw symbols exposed by the connected broker.
+
+        Backends that cannot enumerate a broker universe fail closed with an
+        empty list. The scanner must not substitute a generic market list.
+        """
+        return []
+
+    async def get_closed_position_outcome(self, ticket: int) -> Optional[dict]:
+        """Return a realized broker outcome for a closed position, if available."""
+        return None
+
     @abstractmethod
     async def disconnect(self) -> None:
         """Clean up connection."""

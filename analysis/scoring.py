@@ -1,68 +1,49 @@
-"""
-Multi-factor scoring engine for trade signals.
+"""SMC signal transport and reporting.
 
-Scoring criteria (total 100%):
-1. Market structure alignment     — 20%
-2. Supply/Demand zone presence    — 15%
-3. Order block confluence         — 15%
-4. Fair value gap (FVG)           — 10%
-5. Liquidity sweep/grab           — 15%
-6. Risk-reward ratio ≥ 1:3        — 15%
-7. Multi-timeframe confluence     — 10%
-
-Trade auto-executes when score ≥ threshold (default 60%)
-AND all hard gates pass (min RR, valid SL/TP, risk limits, spread, etc.)
+Hard setup validity is owned by ``strategy.setup_validator``. Quality ranking is
+owned by ``strategy.setup_scorer``. This module deliberately performs neither
+external-market sentiment analysis nor heuristic score generation.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
-
-from analysis.structure import MarketStructure, Trend, StructureEventType
-from analysis.supply_demand import SupplyDemandZone, ZoneType, get_nearest_zones
-from analysis.indicators import rsi, ema, atr
-from analysis.sessions import check_trading_session, Session
-from analysis.institutional import calculate_ote_levels
-from analysis.profiler import profiler, SymbolProfile
-from analysis.order_flow import order_flow, OrderFlowProfile
-from analysis.sentiment import sentiment_analyzer
-import pandas as pd
-import numpy as np
+from typing import Any, Optional
 
 
 @dataclass
 class ScoreFactor:
+    """Compatibility view for a transparent score component."""
+
     name: str
-    score: float  # 0-100
-    weight: float  # 0-1
-    max_points: float = 0.0  # computed: score * weight
+    score: float
+    weight: float
+    max_points: float = 0.0
     detail: str = ""
 
 
 @dataclass
 class TradeSignal:
     symbol: str
-    direction: str  # "BUY" or "SELL"
+    direction: str
     entry_price: float
     stop_loss: float
     take_profit: float
-    score: float  # 0-100
+    score: float
     rr_ratio: float
-    # This is a setup/basket budget hint only. It must never be increased by score.
     suggested_risk: float = 0.75
     factors: list[ScoreFactor] = field(default_factory=list)
-    structure: Optional[MarketStructure] = None
-    zones: list[SupplyDemandZone] = field(default_factory=list)
+    structure: Any = None
+    zones: list[Any] = field(default_factory=list)
     timeframe: str = "M15"
     entry_mode: str = "confirmed"
-    setup_type: str = ""
+    setup_type: str = "Liquidity Sweep Reversal"
     created_at: Optional[str] = None
     expires_at: Optional[str] = None
     validation: Any = None
     quality_factors: list[Any] = field(default_factory=list)
     target_source: str = ""
+    setup_id: Optional[int] = None
     passed: bool = False
     rejection_reason: str = ""
 
@@ -71,430 +52,33 @@ class TradeSignal:
         return self.passed
 
 
-def score_structure_alignment(structure: MarketStructure, direction: str) -> ScoreFactor:
-    """Factor 1: Market structure alignment (20%)."""
-    trend = structure.trend
-    event = structure.last_event
-
-    # Use event_type from the StructureEvent dataclass
-    event_type = event.event_type if hasattr(event, 'event_type') else event
-
-    if direction == "BUY":
-        if trend == Trend.BULLISH:
-            score = 100.0 if event_type in (StructureEventType.BOS_BULLISH, StructureEventType.CHOCH_BULLISH) else 80.0
-        elif trend == Trend.RANGING:
-            score = 40.0 if structure.current_zone == "discount" else 20.0
-        else:
-            score = 0.0
-    else:  # SELL
-        if trend == Trend.BEARISH:
-            score = 100.0 if event_type in (StructureEventType.BOS_BEARISH, StructureEventType.CHOCH_BEARISH) else 80.0
-        elif trend == Trend.RANGING:
-            score = 40.0 if structure.current_zone == "premium" else 20.0
-        else:
-            score = 0.0
-
-    detail = f"Trend: {trend.value}, Zone: {structure.current_zone}, Event: {event_type.value}"
-    return ScoreFactor(name="Structure Alignment", score=score, weight=0.20, detail=detail)
-
-
-def score_sd_zone(zones: list[SupplyDemandZone], direction: str, current_price: float) -> ScoreFactor:
-    """Factor 2: Supply/Demand zone presence (15%)."""
-    nearest = get_nearest_zones(zones, current_price)
-
-    if direction == "BUY":
-        zone = nearest["nearest_demand"]
-        if zone and zone.fresh:
-            score = 100.0 if zone.strength > 70 else (70.0 if zone.strength > 40 else 50.0)
-            detail = f"Fresh demand zone at {zone.bottom:.5f}-{zone.top:.5f} (strength: {zone.strength:.0f})"
-        elif zone:
-            score = 30.0
-            detail = f"Mitigated demand zone at {zone.bottom:.5f}-{zone.top:.5f}"
-        else:
-            score = 0.0
-            detail = "No demand zone detected"
-    else:
-        zone = nearest["nearest_supply"]
-        if zone and zone.fresh:
-            score = 100.0 if zone.strength > 70 else (70.0 if zone.strength > 40 else 50.0)
-            detail = f"Fresh supply zone at {zone.bottom:.5f}-{zone.top:.5f} (strength: {zone.strength:.0f})"
-        elif zone:
-            score = 30.0
-            detail = f"Mitigated supply zone at {zone.bottom:.5f}-{zone.top:.5f}"
-        else:
-            score = 0.0
-            detail = "No supply zone detected"
-
-    return ScoreFactor(name="S/D Zone", score=score, weight=0.15, detail=detail)
-
-
-def score_order_block(structure: MarketStructure, direction: str, current_price: float, atr_val: float) -> ScoreFactor:
-    """Factor 3: Order block confluence (15%)."""
-    if direction == "BUY":
-        obs = [ob for ob in structure.order_blocks if ob.direction == "bullish" and not ob.mitigated]
-    else:
-        obs = [ob for ob in structure.order_blocks if ob.direction == "bearish" and not ob.mitigated]
-
-    if not obs:
-        return ScoreFactor(name="Order Block", score=0.0, weight=0.15, detail="No order block detected")
-
-    # Find nearest OB to current price
-    nearest_ob = min(obs, key=lambda ob: abs((ob.high + ob.low) / 2 - current_price))
-    distance = abs((nearest_ob.high + nearest_ob.low) / 2 - current_price)
-
-    # Score based on proximity using real ATR
-    if distance < atr_val * 2:
-        score = 100.0
-    elif distance < atr_val * 5:
-        score = 60.0
-    else:
-        score = 30.0
-
-    detail = f"Bullish OB" if direction == "BUY" else f"Bearish OB"
-    detail += f" at {nearest_ob.low:.5f}-{nearest_ob.high:.5f}"
-    return ScoreFactor(name="Order Block", score=score, weight=0.15, detail=detail)
-
-
-def score_fvg(structure: MarketStructure, direction: str, current_price: float, atr_val: float) -> ScoreFactor:
-    """Factor 4: Fair value gap / imbalance (10%)."""
-    if direction == "BUY":
-        fvgs = [f for f in structure.fvgs if f.direction == "bullish"]
-    else:
-        fvgs = [f for f in structure.fvgs if f.direction == "bearish"]
-
-    if not fvgs:
-        return ScoreFactor(name="FVG", score=0.0, weight=0.10, detail="No FVG detected")
-
-    nearest = min(fvgs, key=lambda f: abs(((f.top + f.bottom) / 2) - current_price))
-    nearest_mid = (nearest.top + nearest.bottom) / 2
-    distance = abs(nearest_mid - current_price)
-
-    if distance < atr_val * 2:
-        score = 100.0
-    elif distance < atr_val * 5:
-        score = 50.0
-    else:
-        score = 20.0
-
-    detail = f"{'Bullish' if direction == 'BUY' else 'Bearish'} FVG at {nearest.bottom:.5f}-{nearest.top:.5f}"
-    return ScoreFactor(name="FVG", score=score, weight=0.10, detail=detail)
-
-
-def score_liquidity(structure: MarketStructure, direction: str, current_price: float, atr_val: float) -> ScoreFactor:
-    """Factor 5: Liquidity sweep / grab (15%)."""
-    if direction == "BUY":
-        pools = [p for p in structure.liquidity_pools if p.type == "sell-side"]
-    else:
-        pools = [p for p in structure.liquidity_pools if p.type == "buy-side"]
-
-    if not pools:
-        return ScoreFactor(name="Liquidity Sweep", score=0.0, weight=0.15, detail="No liquidity pool detected")
-
-    nearest = min(pools, key=lambda p: abs(p.price - current_price))
-    distance = abs(nearest.price - current_price)
-
-    if distance < atr_val * 1:
-        score = 100.0
-        detail = f"{'Sell-side' if direction == 'BUY' else 'Buy-side'} liquidity swept at {nearest.price:.5f}"
-    elif distance < atr_val * 3:
-        score = 60.0
-        detail = f"{'Sell-side' if direction == 'BUY' else 'Buy-side'} liquidity near at {nearest.price:.5f}"
-    else:
-        score = 20.0
-        detail = f"Liquidity pool at {nearest.price:.5f} (far)"
-
-    return ScoreFactor(name="Liquidity Sweep", score=score, weight=0.15, detail=detail)
-
-
-def score_rr(entry: float, sl: float, tp: float, min_rr: float = 3.0) -> ScoreFactor:
-    """Factor 6: Risk-reward ratio (15%)."""
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
-
-    if risk <= 0:
-        return ScoreFactor(name="RR Ratio", score=0.0, weight=0.15, detail="Invalid: zero risk")
-
-    rr = reward / risk
-
-    if rr >= min_rr:
-        score = 100.0
-    elif rr >= min_rr * 0.7:
-        score = 70.0
-    elif rr >= min_rr * 0.5:
-        score = 40.0
-    else:
-        score = 0.0
-
-    detail = f"RR = 1:{rr:.1f} (min: 1:{min_rr:.1f})"
-    return ScoreFactor(name="RR Ratio", score=score, weight=0.15, detail=detail)
-
-
-def score_mtf_confluence(ltf_structure: MarketStructure, htf_structures: list[MarketStructure], direction: str, aggressive: bool = False) -> ScoreFactor:
-    """Factor 7: Multi-timeframe confluence (15%)."""
-    if not htf_structures:
-        return ScoreFactor(name="MTF Confluence", score=50.0, weight=0.15, detail="No HTF data")
-
-    aligned = 0
-    total = len(htf_structures)
-
-    for htf in htf_structures:
-        is_aligned = False
-        if direction == "BUY":
-            # Normal: Needs Bullish trend OR Discount zone
-            if htf.trend == Trend.BULLISH or htf.current_zone == "discount":
-                is_aligned = True
-            # Aggressive: Accept Ranging HTF regardless of zone
-            elif aggressive and htf.trend == Trend.RANGING:
-                is_aligned = True
-        else:  # SELL
-            # Normal: Needs Bearish trend OR Premium zone
-            if htf.trend == Trend.BEARISH or htf.current_zone == "premium":
-                is_aligned = True
-            # Aggressive: Accept Ranging HTF regardless of zone
-            elif aggressive and htf.trend == Trend.RANGING:
-                is_aligned = True
-        
-        if is_aligned:
-            aligned += 1
-
-    score = (aligned / total) * 100 if total > 0 else 0
-    detail = f"{aligned}/{total} HTF timeframes aligned"
-    if aggressive:
-        detail += " (Hyper-Scalp active)"
-
-    return ScoreFactor(name="MTF Confluence", score=score, weight=0.15, detail=detail)
-
-
-def score_kill_zone() -> ScoreFactor:
-    """Factor 8: ICT Kill Zone Timing (10%)."""
-    info = check_trading_session(["ict_london_killzone", "ict_ny_killzone"])
-    if info.current_session in (Session.ICT_LONDON_KZ, Session.ICT_NY_KZ):
-        score = 100.0
-        detail = f"Inside {info.current_session.value.replace('_', ' ').upper()}"
-    else:
-        score = 0.0
-        detail = "Outside ICT Kill Zones"
-    return ScoreFactor(name="Kill Zone", score=score, weight=0.10, detail=detail)
-
-
-def score_ote(entry: float, structure: MarketStructure, direction: str) -> ScoreFactor:
-    """Factor 9: Optimal Trade Entry (OTE) Fibonacci (10%)."""
-    # Use the most recent swing high/low from structure
-    if not structure.swing_highs or not structure.swing_lows:
-        return ScoreFactor(name="OTE Fibonacci", score=0.0, weight=0.10, detail="No swings found")
-        
-    last_high = structure.swing_highs[-1].price
-    last_low = structure.swing_lows[-1].price
-    
-    ote = calculate_ote_levels(last_high, last_low, direction)
-    
-    # Check if entry is between 62% and 79%
-    low_bound = min(ote["62.0"], ote["79.0"])
-    high_bound = max(ote["62.0"], ote["79.0"])
-    
-    if low_bound <= entry <= high_bound:
-        score = 100.0
-        detail = "Entry inside OTE (62%-79%)"
-    else:
-        score = 0.0
-        detail = "Entry outside OTE range"
-        
-    return ScoreFactor(name="OTE Fibonacci", score=score, weight=0.10, detail=detail)
-
-
-def score_historical_backing(profile: Optional[SymbolProfile], ltf_structure: MarketStructure) -> ScoreFactor:
-    """Factor 10: Historical Pattern Backing (15%)."""
-    if not profile:
-        return ScoreFactor(name="Historical Backing", score=65.0, weight=0.15, detail="No profile data")
-
-    # Calculate conviction based on which patterns are present
-    conviction = 0
-    patterns = []
-    
-    if ltf_structure.order_blocks:
-        conviction += profile.historical_win_rate_ob
-        patterns.append("OB")
-    if ltf_structure.fvgs:
-        conviction += profile.historical_win_rate_fvg
-        patterns.append("FVG")
-    
-    score = (conviction / len(patterns)) if patterns else 65.0
-    detail = f"Backing: {score:.1f}% based on {', '.join(patterns)} DNA"
-    
-    return ScoreFactor(name="Historical Backing", score=score, weight=0.15, detail=detail)
-
-def score_order_flow(of_profile: Optional[OrderFlowProfile], entry_price: float, zones: list[SupplyDemandZone], direction: str) -> ScoreFactor:
-    """Factor 11: Order Flow Conviction (15%)."""
-    if not of_profile:
-        return ScoreFactor(name="Order Flow", score=50.0, weight=0.15, detail="No volume data")
-
-    # Check if entry is near POC or inside a High Volume Node
-    dist_to_poc = abs(entry_price - of_profile.poc) / entry_price
-    conviction = 0
-    
-    if dist_to_poc < 0.001: # Within 0.1% of POC
-        conviction += 60.0
-    
-    # Check if the last move had high intensity
-    if of_profile.delta_intensity > 1.5:
-        conviction += 40.0
-        
-    score = min(conviction, 100.0)
-    detail = f"Intensity: {of_profile.delta_intensity}x, POC dist: {dist_to_poc*100:.2f}%"
-    
-    return ScoreFactor(name="Order Flow", score=score, weight=0.15, detail=detail)
-
-def score_sentiment(sentiment: Optional[Dict[str, Any]], direction: str) -> ScoreFactor:
-    """Factor 12: AI Sentiment (15%)."""
-    if not sentiment:
-        return ScoreFactor(name="AI Sentiment", score=50.0, weight=0.15, detail="No sentiment data")
-
-    score = sentiment.get("score", 50.0)
-    bias = sentiment.get("bias", "Neutral")
-    
-    # If direction is BUY and sentiment is Bullish, high score
-    if direction == "BUY":
-        if bias == "Bullish": score = 100.0
-        elif bias == "Bearish": score = 0.0
-    else: # SELL
-        if bias == "Bearish": score = 100.0
-        elif bias == "Bullish": score = 0.0
-        
-    return ScoreFactor(name="AI Sentiment", score=score, weight=0.15, detail=f"Bias: {bias}")
-
-def compute_signal(
-    symbol: str,
-    direction: str,
-    entry_price: float,
-    stop_loss: float,
-    take_profit: float,
-    ltf_structure: MarketStructure,
-    htf_structures: list[MarketStructure],
-    zones: list[SupplyDemandZone],
-    atr_val: float,
-    min_rr: float = 3.0,
-    timeframe: str = "M15",
-    aggressive: bool = False,
-    profile: SymbolProfile = None,
-    of_profile: OrderFlowProfile = None,
-    sentiment: Dict[str, Any] = None,
-    risk_budget_pct: float = 0.75,
-    entry_mode: str = "confirmed",
-    signal_ttl_minutes: int = 10,
-) -> TradeSignal:
-    """
-    Compute the full trade signal with multi-factor scoring.
-    """
-    factors = [
-        score_structure_alignment(ltf_structure, direction),
-        score_sd_zone(zones, direction, entry_price),
-        score_order_block(ltf_structure, direction, entry_price, atr_val),
-        score_fvg(ltf_structure, direction, entry_price, atr_val),
-        score_liquidity(ltf_structure, direction, entry_price, atr_val),
-        score_rr(entry_price, stop_loss, take_profit, min_rr),
-        score_mtf_confluence(ltf_structure, htf_structures, direction, aggressive=aggressive),
-        score_kill_zone(),
-        score_ote(entry_price, ltf_structure, direction),
-        score_historical_backing(profile, ltf_structure),
-        score_order_flow(of_profile, entry_price, zones, direction),
-        score_sentiment(sentiment, direction),
-    ]
-    
-    # Adaptive Weight Adjustment based on Symbol Profile
-    if profile:
-        for f in factors:
-            if f.name == "Structure Alignment" and profile.structure_respect_score > 80:
-                f.weight *= 1.2 # Trust structure more if symbol respects it
-            if f.name == "Order Block" and profile.structure_respect_score > 80:
-                f.weight *= 1.1
-            if f.name == "FVG" and profile.avg_fvg_fill_rate > 0.7:
-                f.weight *= 1.2 # Trust FVGs more for this pair
-            if f.name == "Volatility" and profile.volatility_index > 70:
-                f.weight *= 0.8 # Be more cautious if volatility is extreme
-
-    # Adjust weights to total 1.0
-    total_weight = sum(f.weight for f in factors)
-    for f in factors:
-        f.weight = f.weight / total_weight
-        f.max_points = 100 * f.weight
-
-    # Compute weighted score
-    total_score = sum(f.score * f.weight for f in factors)
-
-    # Compute RR
-    risk_dist = abs(entry_price - stop_loss)
-    reward_dist = abs(take_profit - entry_price)
-    rr = reward_dist / risk_dist if risk_dist > 0 else 0.0
-
-    # Setup quality must never increase financial risk. The caller supplies a
-    # configured basket-risk budget that is capped at 1% by this legacy signal
-    # path until the dedicated basket engine performs final sizing.
-    suggested_risk = min(max(float(risk_budget_pct), 0.0), 1.0)
-    now = datetime.utcnow()
-    expires_at = now + timedelta(minutes=max(int(signal_ttl_minutes), 1))
-
-    return TradeSignal(
-        symbol=symbol,
-        direction=direction,
-        entry_price=entry_price,
-        stop_loss=stop_loss,
-        take_profit=take_profit,
-        score=total_score,
-        rr_ratio=rr,
-        suggested_risk=round(suggested_risk, 2),
-        factors=factors,
-        structure=ltf_structure,
-        zones=zones,
-        timeframe=timeframe,
-        entry_mode=entry_mode,
-        created_at=now.isoformat(),
-        expires_at=expires_at.isoformat(),
-        passed=True,
-    )
-
-
 def format_signal_report(signal: TradeSignal) -> str:
-    """Format a signal into a readable Telegram message."""
-    lines = [
-        f"📊 **{signal.symbol}** — {signal.direction} ({signal.timeframe})",
+    """Render validity gates separately from the non-bypassable quality rank."""
+    header = [
+        f"📊 **{signal.symbol}** — `{signal.direction}` ({signal.timeframe})",
+        f"Setup: `{signal.setup_type}` | Entry model: `{signal.entry_mode}`",
+        f"Quality rank: `{signal.score:.1f}/100` | Market-derived RR: `1:{signal.rr_ratio:.2f}`",
         "",
-        f"**Setup Quality: {signal.score:.1f}/100** | Mode: `{signal.entry_mode.upper()}`",
-        f"**Market-derived RR: 1:{signal.rr_ratio:.2f}**",
-        f"Setup: `{signal.setup_type or 'SMC validation'}` | Target: `{signal.target_source or 'structural liquidity'}`",
-        "",
-        f"Entry: `{signal.entry_price:.5f}`",
-        f"SL: `{signal.stop_loss:.5f}`",
-        f"TP: `{signal.take_profit:.5f}`",
+        f"Entry: `{signal.entry_price:.5f}` | SL: `{signal.stop_loss:.5f}` | TP: `{signal.take_profit:.5f}`",
     ]
+    validation = signal.validation
+    if validation is not None:
+        header.extend(["", "**Hard validity gates**"])
+        for check in getattr(validation, "checks", []):
+            state = "✅" if check.passed else "❌"
+            header.append(f"{state} {check.name}: {check.detail}")
 
-    if signal.validation is not None:
-        lines.extend(["", "**Mandatory Validity Checks:**"])
-        for check in signal.validation.checks:
-            status = "✅" if check.passed else "❌"
-            lines.append(f"{status} {check.name}: _{check.detail}_")
+    factors = signal.quality_factors or signal.factors
+    if factors:
+        header.extend(["", "**Quality ranking — cannot override hard gates**"])
+        for factor in factors:
+            if hasattr(factor, "points"):
+                header.append(f"• {factor.name}: `{factor.points:.1f}/{factor.maximum:.1f}` — {factor.detail}")
+            else:
+                header.append(f"• {factor.name}: `{factor.score:.1f}` — {factor.detail}")
 
-    if signal.quality_factors:
-        lines.extend(["", "**Quality Ranking (does not bypass validity):**"])
-        for factor in signal.quality_factors:
-            lines.append(f"• {factor.name}: `{factor.points:.1f}/{factor.maximum:.1f}` — _{factor.detail}_")
-    else:
-        lines.extend(["", "**Legacy Factor Breakdown:**"])
-        for factor in signal.factors:
-            points = factor.score * factor.weight
-            status = "✅" if factor.score >= 50 else "❌"
-            lines.append(f"{status} {factor.name}: {factor.score:.0f}% × {factor.weight*100:.0f}% = {points:.1f} pts")
-            lines.append(f"   _{factor.detail}_")
+    header.extend(["", ("✅ **VALIDATED — execution still subject to portfolio and broker checks**" if signal.passed else f"❌ **NOT EXECUTABLE**: {signal.rejection_reason or 'Hard validity or safety check failed'}")])
+    return "\n".join(header)
 
-    if signal.expires_at:
-        lines.append(f"\nSignal expiry: `{signal.expires_at}` UTC")
 
-    lines.append(f"")
-    if signal.passed:
-        if signal.rejection_reason:
-            lines.append(f"✅ **SIGNAL PASSED** — {signal.rejection_reason}")
-        else:
-            lines.append("✅ **SIGNAL PASSED** — Analysis complete")
-    else:
-        lines.append(f"❌ **REJECTED**: {signal.rejection_reason}")
-
-    return "\n".join(lines)
+__all__ = ["ScoreFactor", "TradeSignal", "format_signal_report"]

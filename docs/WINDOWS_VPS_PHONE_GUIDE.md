@@ -158,16 +158,15 @@ Once running, use these commands from your phone:
 
 | What you want | Command |
 |---|---|
-| See the main menu | `/start` |
-| Scan all symbols for signals | `/scan` |
-| Analyze a specific pair | `/analyze EURUSD` |
-| Check open positions | `/positions` |
-| See account balance | `/account` |
-| View/change settings | `/settings` |
-| Turn ON auto-trading | `/settings` → Auto-Trade → Confirm |
-| Switch to live trading | `/settings` → Mode → Live → Confirm |
-| Pause everything | `/pause` |
-| Close all positions | `/close_all` → Confirm |
+| See the autonomous-system dashboard | `/start` or `/dashboard` |
+| View broker-verified Deriv markets | `/markets` |
+| Check open positions and management actions | `/positions` |
+| Review learning evidence | `/learning` |
+| Review separate DEMO/LIVE performance | `/performance` |
+| View or change mode and safety controls | `/settings` |
+| Switch to LIVE | `/settings` → Mode → LIVE → Confirm explicitly |
+| Run a causal broker-history test | `/backtest <broker-symbol> <tf> <days>` |
+| Halt new execution; optionally close positions | `/emergency` → Confirm close if required |
 
 ---
 

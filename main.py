@@ -124,32 +124,23 @@ async def main():
     # Set bot commands menu
     from telegram import BotCommand
     commands = [
-        BotCommand("start", "Show main menu"),
-        BotCommand("scan", "Institutional Market Scan"),
-        BotCommand("positions", "Show open positions and management"),
-        BotCommand("baskets", "Show setup baskets and layer state"),
-        BotCommand("safety", "Show risk and circuit-breaker status"),
-        BotCommand("entry_mode", "Set confirmed/aggressive entry mode"),
-        BotCommand("account", "Show MT5 account info"),
-        BotCommand("optimize", "Trigger AI Weight Tuning"),
-        BotCommand("journal", "Daily Institutional AI Journal"),
-        BotCommand("manage", "Optimize Specific Position"),
-        BotCommand("settings", "Adjust bot settings"),
-        BotCommand("aggressive", "Toggle High-Growth Mode"),
-        BotCommand("scalping", "Toggle Scalping mode"),
-        BotCommand("daily_limit", "Set Daily Profit Stop %"),
-        BotCommand("loss_limit", "Set Daily Loss Stop %"),
-        BotCommand("open_risk", "Set Total Open-Risk Ceiling"),
-        BotCommand("layers", "Set Planned Layers Per Setup"),
-        BotCommand("cooldown", "Set Symbol Cooldown"),
-        BotCommand("add_broker", "Add Multi-Broker Terminal"),
-        BotCommand("debug_mt5", "Run MT5 health check"),
-        BotCommand("help", "Show all commands"),
+        BotCommand("start", "Open the Deriv system dashboard"),
+        BotCommand("dashboard", "Current autonomous-system status"),
+        BotCommand("markets", "Broker-verified Deriv universe"),
+        BotCommand("positions", "Active broker positions and management"),
+        BotCommand("learning", "Measured learning status and next objective"),
+        BotCommand("performance", "DEMO/LIVE-separated results"),
+        BotCommand("settings", "Mode and safety controls"),
+        BotCommand("backtest", "Causal broker-history backtest"),
+        BotCommand("safety", "Hard limits and circuit breakers"),
+        BotCommand("model", "Champion model and governance"),
+        BotCommand("emergency", "Pause execution; optionally close positions"),
+        BotCommand("help", "Operational command guide"),
     ]
     await app.bot.set_my_commands(commands)
 
     # Start scheduler
-    await scheduler.start(interval_seconds=300)  # 5 minute scan interval
+    await scheduler.start(interval_seconds=60)  # closed-candle universe check every minute; no heartbeat notifications
 
     # Notify admin
     if admin_ids:

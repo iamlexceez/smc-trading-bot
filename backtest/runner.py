@@ -2,10 +2,10 @@
 Backtest runner — CLI and Telegram interface for running backtests.
 
 Usage from CLI:
-    python -m backtest.runner --symbol EURUSD --timeframe H1 --days 180
+    python -m backtest.runner --symbol "Volatility 75 Index" --timeframe H1 --days 180
 
 Usage from Telegram:
-    /backtest EURUSD H1 180
+    /backtest "Volatility 75 Index" H1 180
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from backtest.engine import BacktestEngine, BacktestResult
 from config import TradeSettings
@@ -31,12 +31,13 @@ async def run_backtest(
     initial_balance: float = 10000.0,
     commission_pips: float = 0.5,
     slippage_pips: float = 0.5,
+    executor: Optional[Any] = None,
 ) -> BacktestResult:
     """
     Run a full backtest on historical data.
 
     Args:
-        symbol: Trading symbol (e.g., "EURUSD", "XAUUSD")
+        symbol: Broker-verified Deriv Synthetic Index or Deriv Gold symbol
         timeframe: Trading timeframe (e.g., "M15", "H1", "H4")
         days: Number of days of historical data to test
         settings: Trade settings (uses defaults if None)
@@ -50,9 +51,19 @@ async def run_backtest(
     if settings is None:
         settings = TradeSettings.defaults()
 
-    # Initialize data provider
-    provider = DataProvider()
-    await provider.init()
+    # Backtests use the same broker history as live analysis. Missing account
+    # history fails closed rather than silently substituting generic markets.
+    provider = DataProvider(executor)
+    if not await provider.init():
+        logger.error("Cannot backtest %s: Deriv broker history is unavailable", symbol)
+        return BacktestResult(
+            symbol=symbol,
+            timeframe=timeframe,
+            start_date="",
+            end_date="",
+            initial_balance=initial_balance,
+            final_balance=initial_balance,
+        )
 
     # Fetch historical data
     end = datetime.now(timezone.utc)
@@ -107,12 +118,13 @@ async def run_multi_symbol_backtest(
     days: int = 180,
     settings: Optional[TradeSettings] = None,
     initial_balance: float = 10000.0,
+    executor: Optional[Any] = None,
 ) -> dict[str, BacktestResult]:
     """Run backtests on multiple symbols and return all results."""
     results = {}
     for symbol in symbols:
         try:
-            result = await run_backtest(symbol, timeframe, days, settings, initial_balance)
+            result = await run_backtest(symbol, timeframe, days, settings, initial_balance, executor=executor)
             results[symbol] = result
         except Exception as e:
             logger.error(f"Backtest failed for {symbol}: {e}")
@@ -123,7 +135,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="SMC Trading Bot — Backtest Runner")
-    parser.add_argument("--symbol", default="EURUSD", help="Trading symbol (default: EURUSD)")
+    parser.add_argument("--symbol", required=True, help="Broker-verified Deriv Synthetic Index or Gold symbol")
     parser.add_argument("--timeframe", default="H1", help="Timeframe (default: H1)")
     parser.add_argument("--days", type=int, default=180, help="Days of history (default: 180)")
     parser.add_argument("--balance", type=float, default=10000, help="Initial balance (default: 10000)")

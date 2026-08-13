@@ -74,8 +74,11 @@ class TradeSettings:
     max_trades_per_day: int = 10
     max_open_positions: int = 2
     min_rr_ratio: float = 3.0
-    score_threshold: float = 75.0
-    min_setup_score: float = 75.0
+    # Quality ranks already-valid setups; it never replaces or relaxes a
+    # structural validity gate. A zero floor allows DEMO research to observe
+    # all structurally valid archetypes before evidence sets a soft threshold.
+    score_threshold: float = 0.0
+    min_setup_score: float = 0.0
     extreme_setup_score: float = 90.0
     max_spread_pips: float = 5.0
     symbol_cooldown_minutes: int = 5
@@ -100,19 +103,21 @@ class TradeSettings:
     structural_stop_atr_buffer: float = 0.15
     max_chase_distance_atr: float = 0.50
 
-    # Auto-trade
-    auto_trade: bool = False
+    # Autonomous execution. DEMO begins enabled after the broker market
+    # universe and all risk checks are verified; LIVE remains separately gated.
+    autonomous_learning_mode: bool = True
+    auto_trade: bool = True
     is_paused: bool = False
+    live_trading_confirmed_at: Optional[str] = None
 
-    # Instruments
-    symbols: list[str] = field(default_factory=lambda: [
-        "EURUSD", "GBPUSD", "USDJPY", "XAUUSD",
-        "Volatility 75 Index", "Boom 500 Index", "Crash 500 Index",
-    ])
-    enabled_symbols: list[str] = field(default_factory=lambda: [
-        "EURUSD", "GBPUSD", "USDJPY", "XAUUSD",
-        "Volatility 75 Index", "Boom 500 Index", "Crash 500 Index",
-    ])
+    # Instruments are populated from the connected Deriv MT5 account only.
+    # No forex ticker or guessed Gold symbol is retained as a default.
+    symbols: list[str] = field(default_factory=list)
+    enabled_symbols: list[str] = field(default_factory=list)
+    available_symbols: list[str] = field(default_factory=list)
+    unsupported_symbols: list[str] = field(default_factory=list)
+    symbol_status: dict[str, str] = field(default_factory=dict)
+    market_universe_updated_at: Optional[str] = None
     timeframes: list[str] = field(default_factory=lambda: ["M15", "H1", "H4"])
     htf_timeframes: list[str] = field(default_factory=lambda: ["H1", "H4", "D1"])
     expert_mode: bool = False
@@ -129,9 +134,19 @@ class TradeSettings:
     llm_provider: str = "openai" # openai | local
     sentiment_weight: float = 0.15 # Impact on total score
 
-    # Self-Optimization AI
-    self_optimization_enabled: bool = False
-    optimization_interval_days: int = 7
+    # Bounded learning and model governance. The optimizer may adjust only
+    # soft parameters inside the hard caps declared above.
+    self_optimization_enabled: bool = True
+    optimization_interval_days: int = 1
+    optimization_min_sample_size: int = 30
+    optimization_min_split_size: int = 10
+    optimization_min_improvement: float = 0.05
+    optimization_rollback_tolerance: float = 0.20
+    preferred_risk_pct: float = 0.75
+    preferred_max_trades_per_day: int = 10
+    active_model_version: str = ""
+    daily_report_hour_utc: int = 7
+    daily_report_minute_utc: int = 0
     last_optimization_date: Optional[str] = None
 
     # Execution
@@ -170,14 +185,15 @@ class TradeSettings:
         import json
         d = asdict(self)
         # Lists → comma strings for SQLite storage
-        for key in ("symbols", "enabled_symbols", "timeframes", "htf_timeframes", "enabled_sessions", "news_impact_levels", "layer_allocation"):
+        for key in ("symbols", "enabled_symbols", "available_symbols", "unsupported_symbols", "timeframes", "htf_timeframes", "enabled_sessions", "news_impact_levels", "layer_allocation"):
             if isinstance(d.get(key), list):
                 d[key] = ",".join(str(value) for value in d[key])
         
         # Complex objects → JSON
         if isinstance(d.get("brokers"), list):
             d["brokers"] = json.dumps([asdict(b) for b in self.brokers])
-            
+        d["symbol_status"] = json.dumps(d.get("symbol_status", {}), sort_keys=True)
+
         return d
 
     @classmethod
@@ -198,10 +214,19 @@ class TradeSettings:
                     return [s.strip() for s in default.split(",") if s.strip()]
             return []
 
-        # Parse master symbols first
+        # Broker discovery replaces legacy persisted market lists at runtime.
+        # These values are parsed only so the scheduler can migrate safely.
         symbols_list = parse_list(d.get("symbols"))
+        enabled_symbols_list = parse_list(d.get("enabled_symbols"), symbols_list)
+        available_symbols_list = parse_list(d.get("available_symbols"))
+        unsupported_symbols_list = parse_list(d.get("unsupported_symbols"))
 
         import json
+        symbol_status_raw = d.get("symbol_status", "{}")
+        try:
+            symbol_status = json.loads(symbol_status_raw) if isinstance(symbol_status_raw, str) else dict(symbol_status_raw or {})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            symbol_status = {}
         
         # Parse brokers
         brokers_raw = d.get("brokers", "[]")
@@ -231,8 +256,8 @@ class TradeSettings:
             max_trades_per_day=int(d.get("max_trades_per_day", 10)),
             max_open_positions=int(d.get("max_open_positions", 2)) if "max_total_open_risk_pct" in d else 2,
             min_rr_ratio=max(3.0, float(d.get("min_rr_ratio", 3.0))),
-            score_threshold=max(75.0, float(d.get("score_threshold", 75.0))) if "min_setup_score" not in d else float(d.get("score_threshold", 75.0)),
-            min_setup_score=max(75.0, float(d.get("min_setup_score", d.get("score_threshold", 75.0)))),
+            score_threshold=max(0.0, float(d.get("score_threshold", 0.0))),
+            min_setup_score=max(0.0, float(d.get("min_setup_score", 0.0))),
             extreme_setup_score=float(d.get("extreme_setup_score", 90.0)),
             max_spread_pips=float(d.get("max_spread_pips", 5.0)),
             symbol_cooldown_minutes=int(d.get("symbol_cooldown_minutes", 5)),
@@ -252,15 +277,24 @@ class TradeSettings:
             displacement_range_ratio_min=float(d.get("displacement_range_ratio_min", 1.20)),
             structural_stop_atr_buffer=float(d.get("structural_stop_atr_buffer", 0.15)),
             max_chase_distance_atr=float(d.get("max_chase_distance_atr", 0.50)),
-            auto_trade=parse_bool(d.get("auto_trade", "false")),
+            autonomous_learning_mode=parse_bool(d.get("autonomous_learning_mode", "true"), True),
+            # Existing installations are deliberately migrated into the new
+            # demo learning default once. Later explicit pause/stop controls
+            # retain their saved setting.
+            auto_trade=(parse_bool(d.get("auto_trade", "true"), True) if "autonomous_learning_mode" in d else True),
             is_paused=parse_bool(d.get("is_paused", "false")),
+            live_trading_confirmed_at=d.get("live_trading_confirmed_at"),
             symbols=symbols_list,
-            enabled_symbols=parse_list(d.get("enabled_symbols"), symbols_list),
+            enabled_symbols=enabled_symbols_list,
+            available_symbols=available_symbols_list,
+            unsupported_symbols=unsupported_symbols_list,
+            symbol_status={str(key): str(value) for key, value in symbol_status.items()},
+            market_universe_updated_at=d.get("market_universe_updated_at"),
             timeframes=parse_list(d.get("timeframes"), ["M15", "H1", "H4"]),
             htf_timeframes=parse_list(d.get("htf_timeframes"), ["H1", "H4", "D1"]),
             expert_mode=parse_bool(d.get("expert_mode", "false")),
             scalping_mode=parse_bool(d.get("scalping_mode", "false")),
-            trading_mode=d.get("trading_mode", "demo"),
+            trading_mode=("live" if str(d.get("trading_mode", "demo")).lower() == "live" and d.get("live_trading_confirmed_at") else "demo"),
             magic_number=int(d.get("magic_number", 20260807)),
             require_zone_retest=parse_bool(d.get("require_zone_retest", "true"), True),
             require_candle_confirmation=parse_bool(d.get("require_candle_confirmation", "true"), True),
@@ -288,8 +322,17 @@ class TradeSettings:
             sentiment_analysis_enabled=parse_bool(d.get("sentiment_analysis_enabled", "false")),
             llm_provider=d.get("llm_provider", "openai"),
             sentiment_weight=float(d.get("sentiment_weight", 0.15)),
-            self_optimization_enabled=parse_bool(d.get("self_optimization_enabled", "false")),
-            optimization_interval_days=int(d.get("optimization_interval_days", 7)),
+            self_optimization_enabled=parse_bool(d.get("self_optimization_enabled", "true"), True),
+            optimization_interval_days=max(1, int(d.get("optimization_interval_days", 1))),
+            optimization_min_sample_size=max(10, int(d.get("optimization_min_sample_size", 30))),
+            optimization_min_split_size=max(5, int(d.get("optimization_min_split_size", 10))),
+            optimization_min_improvement=max(0.0, float(d.get("optimization_min_improvement", 0.05))),
+            optimization_rollback_tolerance=max(0.0, float(d.get("optimization_rollback_tolerance", 0.20))),
+            preferred_risk_pct=min(float(d.get("preferred_risk_pct", d.get("risk_per_trade", 0.75))), 1.0),
+            preferred_max_trades_per_day=max(1, int(d.get("preferred_max_trades_per_day", d.get("max_trades_per_day", 10)))),
+            active_model_version=d.get("active_model_version", ""),
+            daily_report_hour_utc=max(0, min(23, int(d.get("daily_report_hour_utc", 7)))),
+            daily_report_minute_utc=max(0, min(59, int(d.get("daily_report_minute_utc", 0)))),
             last_optimization_date=d.get("last_optimization_date"),
         )
 
@@ -308,8 +351,8 @@ class TradeSettings:
             max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "10")),
             max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "2")),
             min_rr_ratio=float(os.getenv("MIN_RR_RATIO", "3.0")),
-            score_threshold=float(os.getenv("SCORE_THRESHOLD", "75.0")),
-            min_setup_score=float(os.getenv("MIN_SETUP_SCORE", "75.0")),
+            score_threshold=float(os.getenv("SCORE_THRESHOLD", "0.0")),
+            min_setup_score=float(os.getenv("MIN_SETUP_SCORE", "0.0")),
             extreme_setup_score=float(os.getenv("EXTREME_SETUP_SCORE", "90.0")),
             max_spread_pips=float(os.getenv("MAX_SPREAD_PIPS", "5.0")),
             symbol_cooldown_minutes=int(os.getenv("SYMBOL_COOLDOWN_MINUTES", "5")),
@@ -329,13 +372,19 @@ class TradeSettings:
             displacement_range_ratio_min=float(os.getenv("DISPLACEMENT_RANGE_RATIO_MIN", "1.20")),
             structural_stop_atr_buffer=float(os.getenv("STRUCTURAL_STOP_ATR_BUFFER", "0.15")),
             max_chase_distance_atr=float(os.getenv("MAX_CHASE_DISTANCE_ATR", "0.50")),
-            auto_trade=os.getenv("AUTO_TRADE", "false").lower() == "true",
+            autonomous_learning_mode=True,
+            auto_trade=os.getenv("AUTO_TRADE", "true").lower() == "true",
             is_paused=False,
-            symbols=[s.strip() for s in os.getenv("SYMBOLS", "EURUSD,GBPUSD,USDJPY,XAUUSD,Volatility 75 Index,Boom 500 Index,Crash 500 Index").split(",")],
-            enabled_symbols=[s.strip() for s in os.getenv("ENABLED_SYMBOLS", os.getenv("SYMBOLS", "EURUSD,GBPUSD,USDJPY,XAUUSD,Volatility 75 Index,Boom 500 Index,Crash 500 Index")).split(",")],
+            live_trading_confirmed_at=None,
+            symbols=[],
+            enabled_symbols=[],
+            available_symbols=[],
+            unsupported_symbols=[],
+            symbol_status={},
+            market_universe_updated_at=None,
             timeframes=[s.strip() for s in os.getenv("TIMEFRAMES", "M15,H1,H4").split(",")],
             htf_timeframes=[s.strip() for s in os.getenv("HTF_TIMEFRAMES", "H1,H4,D1").split(",")],
-            trading_mode=get_trading_mode(),
+            trading_mode="demo",
             magic_number=20260807,
             require_zone_retest=os.getenv("REQUIRE_ZONE_RETEST", "true").lower() == "true",
             require_candle_confirmation=os.getenv("REQUIRE_CANDLE_CONFIRMATION", "true").lower() == "true",
@@ -353,7 +402,7 @@ class TradeSettings:
             partial_close_rr=float(os.getenv("PARTIAL_CLOSE_RR", "2.0")),
             partial_close_percent=float(os.getenv("PARTIAL_CLOSE_PERCENT", "0.20")),
             max_hold_bars=int(os.getenv("MAX_HOLD_BARS", "100")),
-            enabled_sessions=[s.strip() for s in os.getenv("ENABLED_SESSIONS", "london,new_york,overlap").split(",")],
+            enabled_sessions=[s.strip() for s in os.getenv("ENABLED_SESSIONS", "all").split(",")],
             news_filter_enabled=os.getenv("NEWS_FILTER_ENABLED", "true").lower() == "true",
             news_impact_levels=[s.strip() for s in os.getenv("NEWS_IMPACT_LEVELS", "High").split(",")],
             news_blackout_minutes=int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")),

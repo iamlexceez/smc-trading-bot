@@ -154,35 +154,33 @@ Every trade must pass ALL of these checks before execution:
 lot_size = (balance × risk_per_trade%) / (SL_distance_pips × pip_value_per_lot)
 ```
 
-- Risk per trade: configurable (default 1%)
-- Min lot: 0.01
-- Hard cap: 10% of balance worth
+- Preferred risk per setup: 0.75% by default
+- Hard cap: 1% per setup; no automatic process can exceed it
+- Portfolio-risk cap: 3%; daily-loss cap: 3%; emergency stop: 4%
 
 ---
 
 ## Supported Instruments
 
-| Type | Examples |
-|------|----------|
-| Forex Pairs | EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD |
-| Metals | XAUUSD (Gold) |
-| Synthetic Indices | Volatility 75 Index, Boom 500, Crash 500 |
+| Type | Eligibility |
+|------|-------------|
+| Deriv Synthetic Indices | Only symbols exposed as tradeable by the connected Deriv MT5 account. |
+| Deriv Gold | Only a Gold symbol exposed as tradeable by the connected Deriv MT5 account. |
+| Other markets | Explicitly unsupported and excluded from scans, backtests, and execution. |
 
 ---
 
 ## Execution Modes
 
-### Paper Mode (default)
-- No real trades
-- Simulated $10,000 balance
-- Full analysis and scoring
-- Trade tracking in SQLite
+### DEMO Mode (default)
+- Executes only through the configured Deriv MT5 demo account.
+- Autonomous execution begins after broker-universe discovery and hard safety checks pass.
+- DEMO trade, setup, execution, and model statistics are stored separately from LIVE.
 
-### Live Mode (MT5)
-- Real trade execution via MetaTrader 5
-- Requires MT5 terminal (Windows VPS or Linux+Wine)
-- Market orders with SL/TP
-- Configurable slippage/deviation (default 20 points)
+### LIVE Mode (MT5)
+- Real trade execution via the configured Deriv MT5 live account.
+- Requires an explicit in-app confirmation for each DEMO-to-LIVE switch.
+- LIVE observes and reports model performance but cannot self-promote model changes.
 
 ---
 
@@ -190,21 +188,17 @@ lot_size = (balance × risk_per_trade%) / (SL_distance_pips × pip_value_per_lot
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Main menu with quick stats |
-| `/scan` | Scan all symbols for signals |
-| `/analyze [symbol]` | Deep analysis of specific symbol |
-| `/positions` | Show open positions |
-| `/close_all` | Close all positions (with confirmation) |
-| `/settings` | Adjust all settings via inline keyboards |
-| `/account` | Show account info |
-| `/history` | Recent trade history |
-| `/pause` | Pause auto-trading |
-| `/resume` | Resume auto-trading |
-| `/mode [paper\|live]` | Switch execution mode |
-| `/risk [pct]` | Set risk per trade |
-| `/rr [ratio]` | Set minimum RR ratio |
-| `/score [val]` | Set score threshold |
-| `/help` | Show all commands |
+| `/start` or `/dashboard` | Current autonomous-system status |
+| `/markets` | Broker-verified Deriv Synthetic Indices and Gold universe |
+| `/positions` | Active broker positions and management actions |
+| `/learning` | Measured learning evidence and next objective |
+| `/performance` | Separate DEMO and LIVE performance |
+| `/settings` | Mode, autonomy, safety, and universe controls |
+| `/backtest [symbol] [tf] [days]` | Causal backtest using connected Deriv MT5 history only |
+| `/safety` | Risk limits and circuit breakers |
+| `/model` | Champion model and governance decision |
+| `/emergency` | Halt new execution and optionally close positions after confirmation |
+| `/help` | Operational command guide |
 
 ---
 

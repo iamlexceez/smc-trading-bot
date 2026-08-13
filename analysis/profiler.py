@@ -1,143 +1,154 @@
-import pandas as pd
-import numpy as np
+"""Persistent, evidence-based market behavior profiles.
+
+Profiles describe observable broker-market behavior and completed trade outcomes.
+They do not invent historical win rates, simulate proxy entries, or override the
+hard setup-validation gates.
+"""
+
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict
+
+import numpy as np
+import pandas as pd
+
+from storage import db
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class SymbolProfile:
     symbol: str
-    volatility_index: float  # 0-100
-    structure_respect_score: float  # 0-100
+    volatility_index: float
+    structure_respect_score: float
     avg_fvg_fill_rate: float
     optimal_atr_multiplier: float
-    historical_win_rate_ob: float # Success rate of OB entries
-    historical_win_rate_fvg: float # Success rate of FVG entries
+    historical_win_rate_ob: float
+    historical_win_rate_fvg: float
     best_timeframe: str
     last_updated: pd.Timestamp
+    sample_size: int = 0
+    expectancy_r: float = 0.0
+
 
 class AdaptiveProfiler:
-    def __init__(self):
+    """Build and persist descriptive profiles from broker candles and outcomes."""
+
+    def __init__(self) -> None:
         self.profiles: Dict[str, SymbolProfile] = {}
 
-    async def profile_symbol(self, symbol: str, df: pd.DataFrame) -> SymbolProfile:
-        """Analyze historical data to create a behavioral profile for the symbol."""
-        if df.empty or len(df) < 500:
-            return self._default_profile(symbol)
+    @staticmethod
+    def _atr(frame: pd.DataFrame, period: int = 14) -> pd.Series:
+        high_low = frame["high"] - frame["low"]
+        high_close = (frame["high"] - frame["close"].shift()).abs()
+        low_close = (frame["low"] - frame["close"].shift()).abs()
+        return pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(period).mean()
 
-        try:
-            # 1. Volatility Index (Standardized ATR)
-            df['atr'] = self._calculate_atr(df)
-            volatility = (df['atr'].iloc[-1] / df['close'].iloc[-1]) * 10000
-            volatility_index = min(max(volatility * 10, 0), 100)
+    @staticmethod
+    def _closed_candle_persistence(frame: pd.DataFrame) -> float:
+        """Measure one-bar directional follow-through on already closed bars."""
+        body = frame["close"] - frame["open"]
+        next_move = frame["close"].shift(-1) - frame["close"]
+        valid = (body != 0) & next_move.notna()
+        if not valid.any():
+            return 0.0
+        follow = ((body[valid] * next_move[valid]) > 0).mean() * 100
+        return float(follow)
 
-            # 2. Structure Respect (How often BOS leads to continuation)
-            # Simplified: Check if price continues in BOS direction for N bars
-            respect_score = self._calculate_structure_respect(df)
+    async def profile_symbol(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+        timeframe: str = "M15",
+        account_mode: str = "demo",
+    ) -> SymbolProfile:
+        """Persist a profile derived only from known candles and completed trades."""
+        if df.empty or len(df) < 30:
+            return self._default_profile(symbol, timeframe)
 
-            # 3. Optimal ATR Multiplier (Based on wick sizes)
-            df['wick_size'] = df[['high', 'low', 'open', 'close']].apply(
-                lambda x: max(x['high'] - max(x['open'], x['close']), max(x['open'], x['close']) - x['low']), axis=1
-            )
-            avg_wick = df['wick_size'].tail(100).mean()
-            current_atr = df['atr'].iloc[-1]
-            optimal_atr = max(1.5, min(3.0, (avg_wick / current_atr) * 2.5))
+        frame = df.copy().tail(500).reset_index(drop=True)
+        atr_series = self._atr(frame)
+        atr_values = atr_series.dropna()
+        if atr_values.empty or float(frame["close"].iloc[-1]) == 0:
+            return self._default_profile(symbol, timeframe)
 
-            # 4. Pattern Success Analysis (Simulated historical backtest for this symbol)
-            win_rate_ob = self._backtest_pattern_success(df, "OB")
-            win_rate_fvg = self._backtest_pattern_success(df, "FVG")
+        median_atr = float(atr_values.tail(100).median())
+        close = float(frame["close"].iloc[-1])
+        atr_pct = abs(median_atr / close) * 100
+        candle_ranges = (frame["high"] - frame["low"]).tail(100)
+        median_range = float(candle_ranges.median()) if not candle_ranges.empty else median_atr
+        persistence = self._closed_candle_persistence(frame.tail(200))
+        outcomes = await db.get_symbol_setup_metrics(symbol, timeframe, account_mode)
+        all_outcomes = outcomes["all"]
+        ob_outcomes = outcomes["order_block"]
+        fvg_outcomes = outcomes["fvg"]
 
-            profile = SymbolProfile(
-                symbol=symbol,
-                volatility_index=round(volatility_index, 2),
-                structure_respect_score=round(respect_score, 2),
-                avg_fvg_fill_rate=0.65,
-                optimal_atr_multiplier=round(optimal_atr, 2),
-                historical_win_rate_ob=round(win_rate_ob, 2),
-                historical_win_rate_fvg=round(win_rate_fvg, 2),
-                best_timeframe="M5" if volatility_index > 50 else "M15",
-                last_updated=pd.Timestamp.now()
-            )
-            
-            self.profiles[symbol] = profile
-            logger.info(f"Profile created for {symbol}: Volatility={profile.volatility_index}, ATR_Mult={profile.optimal_atr_multiplier}")
-            return profile
+        # Outcome-derived fields remain neutral until there is a meaningful
+        # sample. Descriptive observations never masquerade as an edge.
+        min_evidence = 20
+        historical_ob = ob_outcomes["win_rate"] if ob_outcomes["sample_size"] >= min_evidence else 0.0
+        historical_fvg = fvg_outcomes["win_rate"] if fvg_outcomes["sample_size"] >= min_evidence else 0.0
+        structure_score = persistence if all_outcomes["sample_size"] >= min_evidence else 0.0
+        fvg_fill_proxy = historical_fvg / 100 if historical_fvg else 0.0
 
-        except Exception as e:
-            logger.error(f"Error profiling {symbol}: {e}")
-            return self._default_profile(symbol)
+        profile = SymbolProfile(
+            symbol=symbol,
+            volatility_index=round(min(100.0, atr_pct * 50.0), 2),
+            structure_respect_score=round(structure_score, 2),
+            avg_fvg_fill_rate=round(fvg_fill_proxy, 4),
+            optimal_atr_multiplier=round(max(0.5, min(3.0, median_range / max(median_atr, 1e-12))), 2),
+            historical_win_rate_ob=round(historical_ob, 2),
+            historical_win_rate_fvg=round(historical_fvg, 2),
+            best_timeframe=timeframe,
+            last_updated=pd.Timestamp.now(tz="UTC"),
+            sample_size=int(all_outcomes["sample_size"]),
+            expectancy_r=round(float(all_outcomes["expectancy_r"]), 4),
+        )
+        self.profiles[symbol] = profile
+        await db.upsert_symbol_profile(
+            account_mode=account_mode,
+            symbol=symbol,
+            timeframe=timeframe,
+            metrics={
+                "volatility_index": profile.volatility_index,
+                "median_atr": median_atr,
+                "atr_pct": atr_pct,
+                "median_range": median_range,
+                "closed_candle_persistence_pct": persistence,
+                "outcome_sample_size": profile.sample_size,
+                "expectancy_r": profile.expectancy_r,
+                "order_block": ob_outcomes,
+                "fvg": fvg_outcomes,
+            },
+        )
+        logger.info(
+            "Updated %s %s profile: observations=%s completed_outcomes=%s",
+            symbol,
+            timeframe,
+            len(frame),
+            profile.sample_size,
+        )
+        return profile
 
-    def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
-        high_low = df['high'] - df['low']
-        high_cp = (df['high'] - df['close'].shift()).abs()
-        low_cp = (df['low'] - df['close'].shift()).abs()
-        tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
-        return tr.rolling(window=period).mean()
-
-    def _calculate_structure_respect(self, df: pd.DataFrame) -> float:
-        # Check how often price continues in the direction of high-volume moves
-        df['body_size'] = (df['close'] - df['open']).abs()
-        avg_body = df['body_size'].mean()
-        displacement_bars = df[df['body_size'] > avg_body * 1.5]
-        
-        continuations = 0
-        for idx in displacement_bars.index:
-            if idx + 3 >= len(df): continue
-            current_dir = 1 if df.loc[idx, 'close'] > df.loc[idx, 'open'] else -1
-            future_dir = 1 if df.loc[idx+3, 'close'] > df.loc[idx, 'close'] else -1
-            if current_dir == future_dir:
-                continuations += 1
-        
-        total = len(displacement_bars)
-        return (continuations / total * 100) if total > 0 else 70.0
-
-    def _backtest_pattern_success(self, df: pd.DataFrame, pattern_type: str) -> float:
-        """Simple internal backtest to see how often a pattern leads to a win."""
-        # This is a lightweight simulation of the strategy over the last 500 bars
-        wins = 0
-        total_setups = 0
-        
-        # Simplified logic for profiling speed
-        for i in range(len(df) - 50, len(df) - 5):
-            # Check for high volume / displacement as a proxy for OB/FVG
-            if df.iloc[i]['high'] - df.iloc[i]['low'] > df['high'].rolling(50).mean().iloc[i] * 1.5:
-                total_setups += 1
-                # Check if price hits 1:2 RR in the next 5 bars
-                entry = df.iloc[i]['close']
-                direction = 1 if df.iloc[i]['close'] > df.iloc[i]['open'] else -1
-                target = entry + (direction * (entry * 0.005)) # 0.5% move
-                
-                for j in range(i+1, min(i+10, len(df))):
-                    if (direction == 1 and df.iloc[j]['high'] >= target) or \
-                       (direction == -1 and df.iloc[j]['low'] <= target):
-                        wins += 1
-                        break
-        
-        return (wins / total_setups * 100) if total_setups > 0 else 65.0
-
-    def _default_profile(self, symbol: str) -> SymbolProfile:
+    @staticmethod
+    def _default_profile(symbol: str, timeframe: str) -> SymbolProfile:
+        """Return an explicitly neutral profile when evidence is insufficient."""
         return SymbolProfile(
             symbol=symbol,
-            volatility_index=50.0,
-            structure_respect_score=70.0,
-            avg_fvg_fill_rate=0.6,
-            optimal_atr_multiplier=2.0,
-            historical_win_rate_ob=65.0,
-            historical_win_rate_fvg=60.0,
-            best_timeframe="M15",
-            last_updated=pd.Timestamp.now()
-        )
-        return SymbolProfile(
-            symbol=symbol,
-            volatility_index=50.0,
-            structure_respect_score=70.0,
-            avg_fvg_fill_rate=0.6,
-            optimal_atr_multiplier=2.0,
-            best_timeframe="M15",
-            last_updated=pd.Timestamp.now()
+            volatility_index=0.0,
+            structure_respect_score=0.0,
+            avg_fvg_fill_rate=0.0,
+            optimal_atr_multiplier=1.0,
+            historical_win_rate_ob=0.0,
+            historical_win_rate_fvg=0.0,
+            best_timeframe=timeframe,
+            last_updated=pd.Timestamp.now(tz="UTC"),
+            sample_size=0,
+            expectancy_r=0.0,
         )
 
-# Global instance
+
 profiler = AdaptiveProfiler()

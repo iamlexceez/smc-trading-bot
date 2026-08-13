@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import json
 import asyncio
+from datetime import datetime, timezone
 from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -106,71 +107,176 @@ class BotHandlers:
             self.executor.server = creds["server"]
             self.executor.path = creds["path"]
             
-            # Connect
-            return await self.executor.connect()
+            # Connect and rebuild the market universe from the newly selected
+            # account before any scan can continue.
+            connected = await self.executor.connect()
+            if connected and self.scheduler:
+                await self.scheduler.data_provider.init()
+                await self.scheduler.refresh_market_universe()
+            return connected
         except Exception as e:
             logger.error(f"Reconnection error: {e}")
             return False
 
     # ─── Commands ──────────────────────────────────────────
 
+    async def _render_menu(self, update: Update, text: str, markup=None) -> None:
+        """Render one monitoring view for either a command or an inline callback."""
+        markup = markup or keyboards.main_menu()
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        elif update.message:
+            await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+    async def _dashboard_text(self) -> str:
+        performance = await db.get_performance_summary(self.settings.trading_mode, days=1)
+        model = await db.get_active_model(self.settings.trading_mode)
+        universe = self.settings.symbol_status or {}
+        active_count = len(self.settings.enabled_symbols)
+        available_count = len(self.settings.available_symbols)
+        model_text = model["version"] if model else "baseline pending"
+        return "\n".join([
+            "🤖 **DERIV SMC LEARNING SYSTEM**",
+            f"Mode: `{self.settings.trading_mode.upper()}` | Autonomous execution: `{'ON' if self.settings.auto_trade and not self.settings.is_paused else 'OFF'}`",
+            f"Broker universe: `{active_count}` active / `{available_count}` available Deriv Synthetic Indices or Gold",
+            f"Safety: `{self.settings.risk_per_trade:.2f}%` preferred risk (hard cap `{self.settings.max_setup_risk_pct:.2f}%`) | min RR `1:{self.settings.min_rr_ratio:.1f}`",
+            f"Today: `{performance['trades']}` closed trades | P/L `${performance['pnl']:.2f}` | win rate `{performance['win_rate']:.1f}%`",
+            f"Model: `{model_text}` | DEMO learning is {'enabled' if self.settings.self_optimization_enabled else 'disabled'}",
+            "\nUse the monitoring controls below. LIVE always requires a separate explicit confirmation.",
+        ])
+
     @admin_only
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show the main menu."""
+        """Show the monitoring dashboard."""
         await self.reload_settings()
-        text = (
-            f"🤖 **SMC Trading Bot**\n\n"
-            f"Mode: `{self.settings.trading_mode.upper()}`\n"
-            f"Auto-Trade: {'✅ ON' if self.settings.auto_trade else '❌ OFF'}\n"
-            f"Paused: {'⏸ YES' if self.settings.is_paused else '▶️ NO'}\n"
-            f"Aggressive: {'🔥 YES' if self.settings.aggressive_mode else '🛡 NO'}\n\n"
-            f"Risk/trade: {self.settings.risk_per_trade}%\n"
-            f"Min RR: 1:{self.settings.min_rr_ratio}\n"
-            f"Score threshold: {self.settings.score_threshold}%\n\n"
-            f"Enabled Symbols: {', '.join(self.settings.enabled_symbols[:5])}{'...' if len(self.settings.enabled_symbols) > 5 else ''}\n"
-            f"Timeframes: {', '.join(self.settings.timeframes)}\n\n"
-            f"Choose an option below 👇"
-        )
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text, reply_markup=keyboards.main_menu())
-        else:
-            await update.message.reply_text(text, reply_markup=keyboards.main_menu())
+        await self._render_menu(update, await self._dashboard_text())
+
+    @admin_only
+    async def cmd_dashboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Alias for the primary dashboard."""
+        await self.cmd_start(update, context)
 
     @admin_only
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show help message."""
-        help_text = (
-            "🤖 **SMC Trading Bot Commands**\n\n"
-            "**Core Controls:**\n"
-            "/start - Show the main menu\n"
-            "/scan - Scan enabled symbols using hard validity gates\n"
-            "/positions - Show live positions and recorded bot actions\n"
-            "/baskets - Show setup risk budgets and planned layers\n"
-            "/manage [ticket] - Review one position and safely optimize its SL/TP\n"
-            "/safety - Show active limits and circuit breakers\n"
-            "/account - Show MT5 account information\n"
-            "/settings - Open the settings dashboard\n"
-            "/debug_mt5 - Run the MT5 connection and permission check\n\n"
-            "**Setup & Risk:**\n"
-            "/entry_mode [confirmed|aggressive|extreme confirm] - Select the confirmation model\n"
-            "/risk [pct] - Set risk per setup within the hard 1% cap\n"
-            "/rr [ratio] - Set the minimum market-derived RR\n"
-            "/score [pct] - Set the minimum setup-quality threshold\n"
-            "/daily_limit [pct] - Set the daily profit stop\n"
-            "/loss_limit [pct] - Set the daily loss and emergency stop\n"
-            "/open_risk [pct] - Set the account-wide open-risk ceiling\n"
-            "/layers [count] - Set the maximum confirmation-only layers\n"
-            "/cooldown [min] - Set the symbol cooldown\n\n"
-            "**Monitoring & Analysis:**\n"
-            "/journal - View the daily learning journal\n"
-            "/optimize - Run the performance optimizer\n"
-            "/profile [symbol] - View Symbol DNA\n"
-            "/history - Show recent trade history\n"
-            "/backtest [symbol] [tf] [days] - Run a backtest\n"
-            "/news - Check the news filter\n"
-            "/sessions - Check trading-session status"
+        """Show the deliberately small operational command surface."""
+        await self._render_menu(
+            update,
+            "**Operational commands**\n\n"
+            "`/dashboard` — current autonomous-system status\n"
+            "`/markets` — broker-verified Deriv universe\n"
+            "`/positions` — active broker positions and management actions\n"
+            "`/learning` — measured observations and next objective\n"
+            "`/performance` — DEMO/LIVE-isolated statistics\n"
+            "`/backtest <symbol> <tf> <days>` — broker-history causal backtest\n"
+            "`/safety` — hard limits and circuit breakers\n"
+            "`/model` — active model and governance decision\n"
+            "`/emergency` — pause new execution and optionally close positions\n\n"
+            "Use `/settings` only for mode, entry model, and safety controls.",
         )
-        await update.message.reply_text(help_text)
+
+    @admin_only
+    async def cmd_markets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show only currently broker-verified Deriv Synthetic Indices and Gold."""
+        if self.scheduler:
+            await self.scheduler.refresh_market_universe()
+        status_map = self.settings.symbol_status or {}
+        active = self.settings.enabled_symbols
+        available = self.settings.available_symbols
+        unsupported = self.settings.unsupported_symbols
+        lines = [
+            "💹 **BROKER-VERIFIED MARKET UNIVERSE**",
+            f"Mode: `{self.settings.trading_mode.upper()}` | Active: `{len(active)}` | Available: `{len(available)}` | Unsupported: `{len(unsupported)}`",
+            "",
+        ]
+        if active:
+            lines.append("**Active for scanning**")
+            for symbol in active:
+                detail = status_map.get(symbol, {})
+                classification = detail.get("classification", "Deriv-approved") if isinstance(detail, dict) else "Deriv-approved"
+                lines.append(f"• `{symbol}` — {classification}")
+        else:
+            lines.append("No broker-verified active instruments. Scanning is fail-closed until the MT5 connection exposes Deriv Synthetic Indices or Gold.")
+        if unsupported:
+            lines.append("\nUnsupported or inactive broker symbols are excluded; they cannot be scanned or traded.")
+        await self._render_menu(update, "\n".join(lines))
+
+    @admin_only
+    async def cmd_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Report account-mode-isolated statistics without mixing DEMO and LIVE."""
+        current = self.settings.trading_mode
+        other = "live" if current == "demo" else "demo"
+        current_stats = await db.get_performance_summary(current, days=30)
+        other_stats = await db.get_performance_summary(other, days=30)
+
+        def line(label: str, stats: dict) -> str:
+            factor = "N/A" if stats["profit_factor"] == float("inf") else f"{stats['profit_factor']:.2f}"
+            return f"**{label}** — `{stats['trades']}` closed | P/L `${stats['pnl']:.2f}` | win `{stats['win_rate']:.1f}%` | PF `{factor}` | drawdown `${stats['max_drawdown']:.2f}`"
+
+        await self._render_menu(update, "📊 **PERFORMANCE — LAST 30 DAYS**\n\n" + line(current.upper(), current_stats) + "\n" + line(other.upper(), other_stats) + "\n\nResults are stored and evaluated separately by account mode.")
+
+    @admin_only
+    async def cmd_learning(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show factual learning status rather than a generic confidence claim."""
+        mode = self.settings.trading_mode
+        model = await db.get_active_model(mode)
+        recent = await db.get_recent_optimization_runs(mode, limit=1)
+        performance = await db.get_performance_summary(mode, days=30)
+        profile_lines = []
+        for symbol, profile in list(profiler.profiles.items())[:5]:
+            profile_lines.append(f"• `{symbol}` — completed outcomes `{profile.sample_size}`, expectancy `{profile.expectancy_r:.2f}R`")
+        model_text = model["version"] if model else "baseline pending"
+        decision = recent[0]["decision"] if recent else "no optimization run yet"
+        text = [
+            "🧠 **LEARNING STATUS**",
+            f"Mode: `{mode.upper()}` | Active model: `{model_text}` | Latest governance decision: `{decision}`",
+            f"Completed 30-day outcomes: `{performance['trades']}` | P/L `${performance['pnl']:.2f}` | win rate `{performance['win_rate']:.1f}%`",
+            "",
+            "**Current symbol evidence**",
+            *(profile_lines or ["No in-memory profile yet. The next broker-candle scan will build observable profiles; completed outcomes are required before outcome statistics affect settings."]),
+            "",
+            "**Next objective**",
+            f"Collect at least `{self.settings.optimization_min_sample_size}` completed DEMO R-recorded outcomes, then run a separated train/validation/out-of-sample challenger test. Hard gates and hard risk caps are never optimized.",
+        ]
+        await self._render_menu(update, "\n".join(text))
+
+    @admin_only
+    async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Expose champion version, soft settings, and latest model decision."""
+        mode = self.settings.trading_mode
+        model = await db.get_active_model(mode)
+        runs = await db.get_recent_optimization_runs(mode, limit=1)
+        if not model:
+            text = "🔄 **MODEL GOVERNANCE**\n\nNo champion exists yet. The next DEMO optimization cycle will create a baseline version without changing any safety limits."
+        else:
+            params = model.get("parameters", {})
+            performance = model.get("performance", {})
+            oos = performance.get("out_of_sample", {})
+            latest = runs[0]["decision"] if runs else "none"
+            text = "\n".join([
+                "🔄 **MODEL GOVERNANCE**",
+                f"Champion: `{model['version']}` | Status: `{model['status']}` | Latest decision: `{latest}`",
+                f"Soft settings: quality floor `{params.get('min_setup_score', 0):.1f}`, preferred risk `{params.get('preferred_risk_pct', 0):.2f}%`, preferred trade cap `{params.get('preferred_max_trades_per_day', 0)}`",
+                f"Stored OOS evidence: `{oos.get('sample_size', 0)}` trades | expectancy `{oos.get('expectancy_r', 0):.2f}R` | maximum drawdown `{oos.get('max_drawdown_r', 0):.2f}R`",
+                "A challenger may be promoted only in DEMO after positive unseen evidence and acceptable drawdown. LIVE self-promotion is blocked.",
+            ])
+        await self._render_menu(update, text)
+
+    @admin_only
+    async def cmd_backtest_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Explain the broker-history-only causal backtest interface."""
+        await self._render_menu(update, "🧪 **CAUSAL BACKTEST**\n\nUse `/backtest <broker-symbol> <timeframe> <days>`. The bot requests closed historical candles from the connected Deriv MT5 account and refuses unavailable or unsupported symbols. Backtests use the same validity gates, structural management, and risk ceilings as live execution.")
+
+    @admin_only
+    async def cmd_emergency(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Immediately halt new execution, then require confirmation to close positions."""
+        self.settings.is_paused = True
+        self.settings.auto_trade = False
+        await db.save_settings(self.settings)
+        text = "🚨 **EMERGENCY STOP ACTIVE**\n\nNew trade execution has been paused and autonomous execution is OFF. Existing positions remain open until you explicitly confirm closing them below."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=keyboards.confirm_keyboard("emergency_close_all"), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=keyboards.confirm_keyboard("emergency_close_all"), parse_mode="Markdown")
 
     @admin_only
     async def cmd_sessions_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -183,7 +289,7 @@ class BotHandlers:
     async def cmd_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show the behavioral profile for a symbol."""
         if not context.args:
-            await update.message.reply_text("Usage: `/profile [symbol]` (e.g., `/profile EURUSD`)")
+            await update.message.reply_text("Usage: `/profile [broker-symbol]` (choose a broker-verified Deriv market from `/markets`)")
             return
 
         symbol = " ".join(context.args).strip()
@@ -289,7 +395,7 @@ class BotHandlers:
         total_profit = 0.0
         for position in positions:
             emoji = "🟢" if position.profit >= 0 else "🔴"
-            basket = await db.get_basket_for_ticket(position.ticket)
+            basket = await db.get_basket_for_ticket(position.ticket, self.settings.trading_mode)
             logs = await db.get_trade_logs(ticket=position.ticket)
             if basket:
                 layers = await db.get_basket_layers(basket["id"])
@@ -469,7 +575,7 @@ class BotHandlers:
     @admin_only
     async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show recent trade history."""
-        trades = await db.get_trade_history(limit=15)
+        trades = await db.get_trade_history(limit=15, account_mode=self.settings.trading_mode)
         if not trades:
             msg = "No trade history yet."
             if update.callback_query:
@@ -590,10 +696,7 @@ class BotHandlers:
     @admin_only
     async def cmd_expert_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Activate the Expert Selection of symbols."""
-        expert_selection = [
-            "Volatility 75 Index", "Volatility 100 Index", "Volatility 10 Index", "Volatility 25 Index",
-            "EURUSD", "GBPUSD", "USDJPY", "XAUUSD"
-        ]
+        expert_selection = list(self.settings.available_symbols)
         
         # Add any expert symbols that aren't in the available list yet
         for s in expert_selection:
@@ -606,10 +709,8 @@ class BotHandlers:
         await db.save_settings(self.settings)
         await update.message.reply_text(
             "🏆 **EXPERT MODE ACTIVATED**\n\n"
-            "The bot is now focused on high-probability institutional pairs:\n"
-            "- Volatility 75, 100, 10, 25\n"
-            "- EURUSD, GBPUSD, USDJPY, XAUUSD\n\n"
-            "Your previous symbols are still in the list but have been **DISABLED**."
+            "The bot is now restricted to the currently broker-verified Deriv Synthetic Indices and Gold universe.\n\n"
+            "Unavailable or unsupported broker instruments remain disabled."
         )
 
     @admin_only
@@ -694,105 +795,6 @@ class BotHandlers:
                 await update.message.reply_text("❌ Invalid amount. Please enter a positive number.")
 
     @admin_only
-    async def cmd_burn_to(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Burn demo balance down to a target amount via high-lot trades."""
-        if self.settings.trading_mode != "demo":
-            await update.message.reply_text("⛔ The /burn_to command is only allowed in DEMO mode for safety.")
-            return
-
-        if not context.args:
-            await update.message.reply_text("Usage: /burn_to [target_amount] (e.g. /burn_to 500)")
-            return
-
-        try:
-            target = float(context.args[0])
-            account = await self.executor.get_account_info()
-            current_balance = account.get("balance", 0)
-
-            if target >= current_balance:
-                await update.message.reply_text(f"Target ${target:,.2f} must be lower than current balance ${current_balance:,.2f}")
-                return
-
-            await update.message.reply_text(
-                f"🔥 **BALANCE BURNER ACTIVATED**\n"
-                f"Current: ${current_balance:,.2f}\n"
-                f"Target: ${target:,.2f}\n\n"
-                f"I will now open high-lot trades to reduce the balance. Please wait..."
-            )
-
-            # Start the burn process in the background
-            asyncio.create_task(self._run_balance_burn(target))
-
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount. Please enter a number.")
-
-    async def _run_balance_burn(self, target: float):
-        """Background task to open and close trades until target is reached."""
-        try:
-            while True:
-                account = await self.executor.get_account_info()
-                current_equity = account.get("equity", 0)
-                
-                if current_equity <= target:
-                    await self.executor.close_all_positions()
-                    if self.app and self.admin_chat_id:
-                        await self.app.bot.send_message(
-                            get_admin_ids()[0], 
-                            f"✅ **BURN COMPLETE**\nTarget reached: ${current_equity:,.2f}\nAll positions closed."
-                        )
-                    break
-
-                # Sort symbols to prioritize Indices for faster burning
-                sorted_symbols = sorted(self.settings.symbols, key=lambda x: "Index" in x or "Volatility" in x, reverse=True)
-                
-                # BATCH OPENING: Open hedged trades on multiple symbols at once
-                active_symbols = []
-                for sym in sorted_symbols[:5]: # Try top 5 indices at once
-                    sym_info = await self.executor.get_symbol_info(sym)
-                    if not sym_info or not sym_info.get("max_lot"): continue
-                    
-                    # Determine safe lot size using normalization
-                    test_lot = self.risk_manager.normalize_lot(sym_info.get("max_lot"), sym_info)
-                    res = await self.executor.execute_trade(
-                        symbol=sym, direction="BUY", lot_size=test_lot,
-                        sl=0, tp=0, magic=999999, comment="BURN"
-                    )
-                    
-                    # If max lot fails, try a smaller safer lot
-                    if not res.success:
-                        test_lot = self.risk_manager.normalize_lot(test_lot * 0.1, sym_info)
-                        res = await self.executor.execute_trade(
-                            symbol=sym, direction="BUY", lot_size=test_lot,
-                            sl=0, tp=0, magic=999999, comment="BURN"
-                        )
-                    
-                    if res.success:
-                        # Hedge it
-                        await self.executor.execute_trade(
-                            symbol=sym, direction="SELL", lot_size=test_lot,
-                            sl=0, tp=0, magic=999999, comment="BURN"
-                        )
-                        active_symbols.append(sym)
-                        logger.info(f"HyperBurner: Opened hedge on {sym} ({test_lot} lots)")
-
-                if not active_symbols:
-                    logger.error("HyperBurner: No symbols available. Retrying in 5s...")
-                    await asyncio.sleep(5)
-                    continue
-
-                # Wait briefly to let spread/slippage burn equity
-                await asyncio.sleep(4)
-                
-                # BATCH CLOSING: Realize the losses and clear margin
-                closed_count = await self.executor.close_all_positions()
-                logger.info(f"HyperBurner: Cycle complete. Closed {closed_count} positions. Equity: ${current_equity:,.2f}")
-                
-                await asyncio.sleep(1) # Brief pause before next cycle
-                
-        except Exception as e:
-            logger.error(f"Burn process error: {e}")
-
-    @admin_only
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Switch execution mode."""
         if context.args and context.args[0].lower() in ("demo", "live"):
@@ -808,6 +810,7 @@ class BotHandlers:
                 success = await self.reconnect_executor("demo")
                 if success:
                     self.settings.trading_mode = "demo"
+                    self.settings.live_trading_confirmed_at = None
                     await db.save_settings(self.settings)
                     await update.message.reply_text("✅ Switched to DEMO mode.")
                 else:
@@ -858,7 +861,7 @@ class BotHandlers:
     @admin_only
     async def cmd_safety(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show the active portfolio, daily, and execution safeguards."""
-        streak = await db.get_consecutive_losses()
+        streak = await db.get_consecutive_losses(account_mode=self.settings.trading_mode)
         text = (
             "🛡 **Execution Safety Dashboard**\n\n"
             f"Entry mode: `{self.settings.entry_mode}`\n"
@@ -879,7 +882,7 @@ class BotHandlers:
     @admin_only
     async def cmd_baskets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show active setup baskets, reserved risk, and layer progress."""
-        baskets = await db.get_open_baskets()
+        baskets = await db.get_open_baskets(self.settings.trading_mode)
         if not baskets:
             await update.message.reply_text("No active bot-managed baskets. Manual MT5 positions are shown in `/positions`.")
             return
@@ -1048,9 +1051,9 @@ class BotHandlers:
     async def cmd_backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Run a backtest."""
         if not context.args:
-            await update.message.reply_text("Usage: /backtest EURUSD H1 180")
+            await update.message.reply_text("Usage: /backtest [broker-listed Deriv symbol] [timeframe] [days]")
             return
-            
+
         symbol = context.args[0]
         timeframe = context.args[1] if len(context.args) > 1 else "H1"
         try:
@@ -1058,15 +1061,19 @@ class BotHandlers:
         except ValueError:
             days = 180
 
+        await self.reload_settings()
+        if symbol not in self.settings.available_symbols:
+            await update.message.reply_text("❌ That symbol is not currently a broker-verified Deriv Synthetic Index or Gold instrument.")
+            return
+
         await update.message.reply_text(
-            f"📊 Running backtest: {symbol} {timeframe} over {days} days...\n"
+            f"📊 Running broker-history backtest: {symbol} {timeframe} over {days} days...\n"
             f"This may take a moment."
         )
 
         try:
             from backtest.runner import run_backtest
-            await self.reload_settings()
-            result = await run_backtest(symbol, timeframe, days, self.settings)
+            result = await run_backtest(symbol, timeframe, days, self.settings, executor=self.executor)
             await update.message.reply_text(result.summary())
         except Exception as e:
             logger.error(f"Backtest error: {e}", exc_info=True)
@@ -1102,8 +1109,20 @@ class BotHandlers:
         await query.answer()
         data = query.data
 
-        if data == "main":
-            await self.cmd_start(update, context)
+        if data in {"main", "dashboard"}:
+            await self.cmd_dashboard(update, context)
+        elif data == "markets":
+            await self.cmd_markets(update, context)
+        elif data == "learning":
+            await self.cmd_learning(update, context)
+        elif data == "performance":
+            await self.cmd_performance(update, context)
+        elif data == "model":
+            await self.cmd_model(update, context)
+        elif data == "backtest_help":
+            await self.cmd_backtest_help(update, context)
+        elif data == "emergency":
+            await self.cmd_emergency(update, context)
         elif data == "cancel":
             await query.edit_message_text("Action cancelled.", reply_markup=keyboards.main_menu())
         elif data == "scan":
@@ -1119,7 +1138,7 @@ class BotHandlers:
         elif data == "history":
             await self.cmd_history(update, context)
         elif data == "safety":
-            streak = await db.get_consecutive_losses()
+            streak = await db.get_consecutive_losses(account_mode=self.settings.trading_mode)
             await query.edit_message_text(
                 "🛡 **Execution Safety Dashboard**\n\n"
                 f"Entry: `{self.settings.entry_mode}` | Risk/setup: `{self.settings.risk_per_trade}%` (cap `{self.settings.max_setup_risk_pct}%`)\n"
@@ -1133,7 +1152,7 @@ class BotHandlers:
                 parse_mode="Markdown",
             )
         elif data == "baskets":
-            baskets = await db.get_open_baskets()
+            baskets = await db.get_open_baskets(self.settings.trading_mode)
             if not baskets:
                 text = "📦 **Active Trade Baskets**\n\nNo active bot-managed baskets."
             else:
@@ -1153,9 +1172,13 @@ class BotHandlers:
             await self.cmd_resume(update, context)
         elif data == "close_all":
             await self.cmd_close_all(update, context)
-        elif data == "confirm_close_all":
+        elif data in {"confirm_close_all", "confirm_emergency_close_all"}:
             closed = await self.executor.close_all_positions()
-            await query.edit_message_text(f"✅ Closed {closed} positions.", reply_markup=keyboards.main_menu())
+            await query.edit_message_text(
+                f"🚨 Emergency state remains active. Closed `{closed}` broker position(s).",
+                reply_markup=keyboards.main_menu(),
+                parse_mode="Markdown",
+            )
         elif data == "set_autotrade":
             await query.edit_message_text(
                 f"Auto-Trade is currently {'ON ✅' if self.settings.auto_trade else 'OFF ❌'}",
@@ -1190,6 +1213,7 @@ class BotHandlers:
             success = await self.reconnect_executor("demo")
             if success:
                 self.settings.trading_mode = "demo"
+                self.settings.live_trading_confirmed_at = None
                 await db.save_settings(self.settings)
                 await query.edit_message_text("✅ Switched to DEMO mode.", reply_markup=keyboards.settings_menu())
             else:
@@ -1203,6 +1227,7 @@ class BotHandlers:
             success = await self.reconnect_executor("live")
             if success:
                 self.settings.trading_mode = "live"
+                self.settings.live_trading_confirmed_at = datetime.now(timezone.utc).isoformat()
                 await db.save_settings(self.settings)
                 await query.edit_message_text("⚠️ LIVE mode enabled. Real trades will execute.", reply_markup=keyboards.settings_menu())
             else:
@@ -1270,7 +1295,7 @@ class BotHandlers:
                 reply_markup=keyboards.confirm_keyboard("expert_mode")
             )
         elif data == "confirm_confirm_expert_mode":
-            expert_selection = ["Volatility 75 Index", "Volatility 100 Index", "Volatility 10 Index", "Volatility 25 Index", "EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+            expert_selection = list(self.settings.available_symbols)
             for s in expert_selection:
                 if s not in self.settings.symbols: self.settings.symbols.append(s)
             self.settings.enabled_symbols = [s for s in expert_selection]
@@ -1349,12 +1374,7 @@ class BotHandlers:
                 reply_markup=keyboards.settings_menu()
             )
         elif data == "set_symbols":
-            all_symbols = [
-                "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD",
-                "Volatility 75 Index", "Volatility 100 Index",
-                "Boom 500 Index", "Boom 1000 Index",
-                "Crash 500 Index", "Crash 1000 Index",
-            ]
+            all_symbols = list(self.settings.available_symbols)
             await query.edit_message_text(
                 "Toggle symbols (✅ = enabled):",
                 reply_markup=keyboards.symbol_select_keyboard(all_symbols, self.settings.enabled_symbols)
@@ -1366,12 +1386,7 @@ class BotHandlers:
             else:
                 self.settings.enabled_symbols.append(sym)
             await db.save_settings(self.settings)
-            all_symbols = [
-                "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD",
-                "Volatility 75 Index", "Volatility 100 Index",
-                "Boom 500 Index", "Boom 1000 Index",
-                "Crash 500 Index", "Crash 1000 Index",
-            ]
+            all_symbols = list(self.settings.available_symbols)
             await query.edit_message_text(
                 "Toggle symbols (✅ = enabled):",
                 reply_markup=keyboards.symbol_select_keyboard(all_symbols, self.settings.enabled_symbols)
@@ -1420,46 +1435,20 @@ class BotHandlers:
 
     def setup(self, app: Application) -> None:
         """Register all handlers with the application."""
+        # The command surface intentionally mirrors the autonomous-system
+        # dashboard. Legacy manual strategy and arbitrary market commands are
+        # no longer registered.
         app.add_handler(CommandHandler("start", self.cmd_start))
+        app.add_handler(CommandHandler("dashboard", self.cmd_dashboard))
         app.add_handler(CommandHandler("help", self.cmd_help))
-        app.add_handler(CommandHandler("scan", self.cmd_scan))
-        app.add_handler(CommandHandler("analyze", self.cmd_analyze))
+        app.add_handler(CommandHandler("markets", self.cmd_markets))
         app.add_handler(CommandHandler("positions", self.cmd_positions))
-        app.add_handler(CommandHandler("close_all", self.cmd_close_all))
+        app.add_handler(CommandHandler("learning", self.cmd_learning))
+        app.add_handler(CommandHandler("performance", self.cmd_performance))
         app.add_handler(CommandHandler("settings", self.cmd_settings))
-        app.add_handler(CommandHandler("account", self.cmd_account))
-        app.add_handler(CommandHandler("debug_mt5", self.cmd_debug_mt5))
-        app.add_handler(CommandHandler("history", self.cmd_history))
-        app.add_handler(CommandHandler("pause", self.cmd_pause))
-        app.add_handler(CommandHandler("resume", self.cmd_resume))
-        app.add_handler(CommandHandler("set_balance", self.cmd_set_balance))
-        app.add_handler(CommandHandler("burn_to", self.cmd_burn_to))
-        app.add_handler(CommandHandler("aggressive", self.cmd_aggressive))
-        app.add_handler(CommandHandler("target", self.cmd_target))
-        app.add_handler(CommandHandler("scalping", self.cmd_scalping))
-        app.add_handler(CommandHandler("toggle_symbol", self.cmd_toggle_symbol))
-        app.add_handler(CommandHandler("expert_mode", self.cmd_expert_mode))
-        app.add_handler(CommandHandler("focus_indices", self.cmd_focus_indices))
-        app.add_handler(CommandHandler("profile", self.cmd_profile))
-        app.add_handler(CommandHandler("mode", self.cmd_mode))
-        app.add_handler(CommandHandler("risk", self.cmd_risk))
-        app.add_handler(CommandHandler("entry_mode", self.cmd_entry_mode))
         app.add_handler(CommandHandler("safety", self.cmd_safety))
-        app.add_handler(CommandHandler("baskets", self.cmd_baskets))
-        app.add_handler(CommandHandler("rr", self.cmd_rr))
-        app.add_handler(CommandHandler("add_broker", self.cmd_add_broker))
-        app.add_handler(CommandHandler("optimize", self.cmd_optimize))
-        app.add_handler(CommandHandler("journal", self.cmd_journal))
-        app.add_handler(CommandHandler("manage", self.cmd_manage))
-        app.add_handler(CommandHandler("score", self.cmd_score))
-        app.add_handler(CommandHandler("daily_limit", self.cmd_daily_limit))
-        app.add_handler(CommandHandler("loss_limit", self.cmd_loss_limit))
-        app.add_handler(CommandHandler("open_risk", self.cmd_open_risk))
-        app.add_handler(CommandHandler("layers", self.cmd_layers))
-        app.add_handler(CommandHandler("cooldown", self.cmd_cooldown))
+        app.add_handler(CommandHandler("model", self.cmd_model))
+        app.add_handler(CommandHandler("emergency", self.cmd_emergency))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))
-        app.add_handler(CommandHandler("sessions", self.cmd_sessions))
-        app.add_handler(CommandHandler("sessions_all", self.cmd_sessions_all))
-        app.add_handler(CommandHandler("news", self.cmd_news))
         app.add_handler(CallbackQueryHandler(self.handle_callback))
         self.app = app

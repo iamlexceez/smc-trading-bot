@@ -11,9 +11,11 @@ import asyncio
 import logging
 import json
 import os
+from time import perf_counter
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import pandas as pd
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -21,7 +23,7 @@ from config import TradeSettings
 from storage import db
 from analysis.structure import analyze_structure, MarketStructure, Trend
 from analysis.supply_demand import detect_sd_zones, SupplyDemandZone, ZoneType
-from analysis.scoring import compute_signal, TradeSignal, format_signal_report
+from analysis.scoring import TradeSignal, format_signal_report
 from analysis.indicators import pip_value, atr
 from strategy.setup_scorer import score_setup_quality
 from strategy.setup_validator import EntryMode, SetupValidator
@@ -31,15 +33,11 @@ from analysis.liquidity import build_liquidity_pools, select_market_target
 from analysis.visuals import render_smc_chart
 from execution.manager import ManagementState, TradeManager
 from analysis.profiler import profiler
-from analysis.order_flow import order_flow
-from analysis.sentiment import sentiment_analyzer
 from risk.manager import RiskManager
 from executors.base import BaseExecutor, ExecutionResult
-from executors.multi import MultiBrokerManager
-from analysis.arbitrage import ArbitrageMonitor
 from analysis.optimizer import SelfOptimizer
 from data.provider import DataProvider
-from news.filter import NewsFilter
+from data.universe import DerivMarketUniverse
 
 logger = logging.getLogger(__name__)
 
@@ -68,59 +66,49 @@ class MarketScheduler:
         self.admin_chat_id = admin_chat_id
         self.scheduler = AsyncIOScheduler()
         self._running = False
-        self.data_provider = DataProvider()
-        self.news_filter = NewsFilter(
-            impact_levels=settings.news_impact_levels,
-            blackout_minutes=settings.news_blackout_minutes,
-        )
-        self.last_structure_events = {}  # symbol -> last StructureEvent
-        
-        # Initialize Multi-Broker and Arbitrage if needed
-        self.multi_manager = None
-        self.arb_monitor = None
-        if self.settings.brokers:
-            self.multi_manager = MultiBrokerManager(self.settings)
-            self.arb_monitor = ArbitrageMonitor(self.multi_manager)
-            # Use multi_manager as the primary executor
-            self.executor = self.multi_manager
-            
+        self.data_provider = DataProvider(self.executor)
+        self.market_universe = DerivMarketUniverse()
         # Initialize Self-Optimizer
         self.optimizer = SelfOptimizer(self.settings)
 
     async def start(self, interval_seconds: int = 300):
-        """Start the periodic market scanner."""
-        await self.data_provider.init()
-        
-        # Adjust interval based on timeframe and mode
-        primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"
-        if primary_tf == "M1":
-            interval_seconds = 60
-        elif primary_tf == "M5" or self.settings.aggressive_mode:
-            interval_seconds = 120
-            
+        """Start the periodic market scanner after broker-market discovery."""
+        broker_ready = await self.data_provider.init()
+        universe_ready = await self.refresh_market_universe()
+        if not broker_ready or not universe_ready:
+            logger.error("Market scans are fail-closed until Deriv symbol discovery succeeds")
+
         self.scheduler.add_job(
             self.scan_and_execute,
             IntervalTrigger(seconds=interval_seconds),
             id="market_scan",
             replace_existing=True,
         )
+        self.scheduler.add_job(
+            self.refresh_market_universe,
+            IntervalTrigger(hours=1),
+            id="market_universe_refresh",
+            replace_existing=True,
+        )
         self.scheduler.start()
         self._running = True
         logger.info(f"Market scanner started (every {interval_seconds}s)")
         
-        # Schedule Self-Optimization (once a week)
+        # Run the bounded optimizer before the daily report. The optimizer can
+        # also record an explicit no-change decision when evidence is weak.
+        from apscheduler.triggers.cron import CronTrigger
+        optimization_hour = (self.settings.daily_report_hour_utc - 1) % 24
         self.scheduler.add_job(
             self.run_self_optimization,
-            IntervalTrigger(days=self.settings.optimization_interval_days),
-            id="self_optimization"
+            CronTrigger(hour=optimization_hour, minute=self.settings.daily_report_minute_utc),
+            id="self_optimization",
+            replace_existing=True,
         )
-        
-        # Schedule Daily Journal (Every day at 23:55)
-        from apscheduler.triggers.cron import CronTrigger
         self.scheduler.add_job(
             self.send_daily_journal,
-            CronTrigger(hour=23, minute=55),
-            id="daily_journal"
+            CronTrigger(hour=self.settings.daily_report_hour_utc, minute=self.settings.daily_report_minute_utc),
+            id="daily_journal",
+            replace_existing=True,
         )
 
         # Force an immediate scan on startup in a background task
@@ -130,17 +118,151 @@ class MarketScheduler:
         """Stop the scanner."""
         self.scheduler.shutdown(wait=False)
         self._running = False
+        await self.data_provider.close()
+
+    async def refresh_market_universe(self) -> bool:
+        """Discover and persist the connected account's eligible Deriv markets.
+
+        Discovery is intentionally authoritative: legacy configured forex symbols
+        are discarded. A failed discovery clears the active set, so a broken
+        broker connection cannot lead to a stale or guessed execution symbol.
+        """
+        try:
+            records = await self.market_universe.refresh(self.executor)
+        except Exception as exc:
+            logger.error("Deriv market-universe discovery failed: %s", exc)
+            records = []
+
+        if not records:
+            self.settings.enabled_symbols = []
+            self.settings.available_symbols = []
+            self.settings.symbol_status = {}
+            self.settings.market_universe_updated_at = datetime.utcnow().isoformat()
+            await db.save_settings(self.settings)
+            return False
+
+        eligible = [record for record in records if record.category in {"synthetic_index", "gold"}]
+        active = sorted(record.symbol for record in eligible if record.is_tradeable)
+        self.settings.symbols = sorted(record.symbol for record in eligible)
+        self.settings.available_symbols = active
+        self.settings.enabled_symbols = active
+        self.settings.unsupported_symbols = self.market_universe.unsupported_symbols
+        self.settings.symbol_status = {record.symbol: record.status for record in records}
+        self.settings.market_universe_updated_at = datetime.utcnow().isoformat()
+        await db.save_settings(self.settings)
+
+        logger.info(
+            "Deriv market universe refreshed: %s active / %s eligible / %s unsupported",
+            len(self.settings.enabled_symbols),
+            len(eligible),
+            len(self.settings.unsupported_symbols),
+        )
+        return bool(self.settings.enabled_symbols)
 
     async def fetch_candles(self, symbol: str, timeframe: str, count: int = 200) -> "pd.DataFrame":
-        """Fetch OHLCV data using the real market data provider."""
+        """Fetch broker-native, closed OHLCV data for an active Deriv market."""
         return await self.data_provider.get_candles(symbol, timeframe, count)
 
-    async def analyze_symbol(self, symbol: str) -> Optional[TradeSignal]:
+    @staticmethod
+    def _validation_snapshot(validation) -> dict:
+        """Create a compact, JSON-safe account of causal setup validity gates."""
+        sweep = getattr(validation, "sweep", None)
+        zone = getattr(validation, "zone", None)
+        displacement = getattr(validation, "displacement", None)
+        target = getattr(validation, "target_pool", None)
+        return {
+            "valid": bool(getattr(validation, "valid", False)),
+            "entry_mode": getattr(getattr(validation, "entry_mode", None), "value", ""),
+            "checks": [
+                {"name": check.name, "passed": bool(check.passed), "detail": check.detail}
+                for check in getattr(validation, "checks", [])
+            ],
+            "zone": ({"source": zone.source, "top": zone.top, "bottom": zone.bottom, "detail": zone.detail} if zone else None),
+            "sweep": ({"pool_level": sweep.pool.level, "pool_side": sweep.pool.side.value, "index": sweep.index} if sweep else None),
+            "displacement": ({"confirmed": bool(displacement.confirmed), "index": displacement.index, "detail": displacement.detail} if displacement else None),
+            "target": ({"level": target.level, "side": target.side.value, "kind": target.kind.value} if target else None),
+        }
+
+    @staticmethod
+    def _feature_snapshot(df, structure, htf_structures, atr_value: float) -> dict:
+        """Capture observable market state only at the closed-candle decision point."""
+        event = structure.last_event
+        return {
+            "bar_time": str(df.iloc[-1]["time"]),
+            "close": float(df.iloc[-1]["close"]),
+            "atr": float(atr_value),
+            "ltf_trend": structure.trend.value,
+            "ltf_zone": structure.current_zone,
+            "structure_event": event.event_type.value,
+            "structure_event_index": int(event.index),
+            "htf_trends": [item.trend.value for item in htf_structures],
+            "htf_events": [item.last_event.event_type.value for item in htf_structures],
+        }
+
+    async def _evaluate_counterfactuals(self, symbol: str, timeframe: str, df) -> None:
+        """Resolve rejected setups only with candles that closed after detection.
+
+        If a single candle can hit both hypothetical stop and target, bar-level
+        data cannot establish the event order. The outcome remains explicitly
+        ambiguous instead of assuming a profitable path.
+        """
+        pending = await db.get_pending_counterfactual_setups(
+            self.settings.trading_mode, symbol, timeframe
+        )
+        for setup in pending:
+            features = setup.get("features") or {}
+            detected_at = features.get("bar_time")
+            if not detected_at:
+                continue
+            later = df[df["time"] > pd.to_datetime(detected_at, utc=True)]
+            if later.empty:
+                continue
+            entry = float(setup["entry_price"])
+            stop = float(setup["stop_loss"])
+            target = float(setup["take_profit"])
+            risk = abs(entry - stop)
+            if risk <= 0:
+                continue
+            direction = str(setup["direction"]).upper()
+            mfe, mae = 0.0, 0.0
+            resolved = None
+            for _, bar in later.iterrows():
+                high, low = float(bar["high"]), float(bar["low"])
+                favorable = ((high - entry) if direction == "BUY" else (entry - low)) / risk
+                adverse = ((low - entry) if direction == "BUY" else (entry - high)) / risk
+                mfe, mae = max(mfe, favorable), min(mae, adverse)
+                stop_hit = low <= stop if direction == "BUY" else high >= stop
+                target_hit = high >= target if direction == "BUY" else low <= target
+                if stop_hit and target_hit:
+                    resolved = "counterfactual_ambiguous"
+                    break
+                if target_hit:
+                    resolved = "counterfactual_win"
+                    break
+                if stop_hit:
+                    resolved = "counterfactual_loss"
+                    break
+            if resolved:
+                await db.update_setup_record(
+                    int(setup["id"]),
+                    status=resolved,
+                    outcome={
+                        "result": resolved,
+                        "mfe_r": mfe,
+                        "mae_r": mae,
+                        "resolved_on": str(later.iloc[-1]["time"]),
+                    },
+                )
+
+    async def analyze_symbol(self, symbol: str, *, record_learning: bool = True) -> Optional[TradeSignal]:
         """
         Full analysis of a single symbol across all timeframes.
         Returns a TradeSignal if a tradeable setup is found, else None.
         """
         await self._reload_settings()
+        if symbol not in self.settings.enabled_symbols:
+            logger.warning("Skipping non-active broker symbol %s", symbol)
+            return None
 
         # Fetch data for primary timeframe
         primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"
@@ -149,6 +271,7 @@ class MarketScheduler:
         if df.empty or len(df) < 20:
             logger.warning(f"Insufficient data for {symbol}")
             return None
+        await self._evaluate_counterfactuals(symbol, primary_tf, df)
 
         # Run structure analysis
         structure = analyze_structure(df, lookback=3)
@@ -157,29 +280,14 @@ class MarketScheduler:
         zones = detect_sd_zones(df, lookback=100)
 
         # 2.5 Adaptive Profiling
-        profile = await profiler.profile_symbol(symbol, df)
+        profile = await profiler.profile_symbol(
+            symbol,
+            df,
+            timeframe=primary_tf,
+            account_mode=self.settings.trading_mode,
+        )
         
-        # 2.6 Order Flow Analysis
-        of_profile = order_flow.calculate_profile(df)
         
-        # 2.7 AI Sentiment Analysis
-        sentiment = None
-        if self.settings.sentiment_analysis_enabled:
-            sentiment = await sentiment_analyzer.get_market_sentiment(symbol)
-        
-        # Check for new structural events (BOS/CHoCH)
-        from analysis.structure import StructureEventType
-        last_event_type = self.last_structure_events.get(symbol, StructureEventType.NONE)
-        if structure.last_event.event_type != StructureEventType.NONE and structure.last_event.event_type != last_event_type:
-            self.last_structure_events[symbol] = structure.last_event.event_type
-            event_name = structure.last_event.event_type.value.replace("_", " ").upper()
-            
-            # Render chart for structure change
-            chart = render_smc_chart(df, symbol, structure, zones)
-            await self._notify(
-                f"📢 **MARKET STRUCTURE CHANGE: {symbol}**\nEvent: `{event_name}`\nTrend: `{structure.trend.value.upper()}`\nZone: `{structure.current_zone.upper()}`",
-                photo=chart
-            )
 
         # Fetch HTF structures for confluence
         htf_structures = []
@@ -231,6 +339,10 @@ class MarketScheduler:
             if not candidate_ltf.empty:
                 ltf_df = candidate_ltf
 
+        atr_val = atr(df, 14).iloc[-1]
+        if atr_val <= 0 or (isinstance(atr_val, float) and atr_val != atr_val):
+            atr_val = current_price * 0.002
+
         validator = SetupValidator(
             min_rr=self.settings.min_rr_ratio,
             min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
@@ -250,13 +362,26 @@ class MarketScheduler:
             entry_mode=entry_mode,
             ltf_df=ltf_df,
         )
+        setup_id = None
+        if record_learning:
+            setup_id = await db.record_setup(
+                account_mode=self.settings.trading_mode,
+                symbol=symbol,
+                timeframe=primary_tf,
+                direction=direction,
+                setup_type="Liquidity Sweep Reversal",
+                status="candidate" if validation.valid else "rejected",
+                rejection_reason=validation.rejection_reason,
+                entry_price=validation.entry_price or current_price,
+                stop_loss=validation.stop_loss or None,
+                take_profit=validation.take_profit or None,
+                rr_ratio=validation.rr_ratio or None,
+                validation=self._validation_snapshot(validation),
+                features=self._feature_snapshot(df, structure, htf_structures, float(atr_val)),
+            )
         if not validation.valid:
             logger.debug("Invalid setup for %s: %s", symbol, validation.rejection_reason)
             return None
-
-        atr_val = atr(df, 14).iloc[-1]
-        if atr_val <= 0 or (isinstance(atr_val, float) and atr_val != atr_val):
-            atr_val = current_price * 0.002
 
         quality = score_setup_quality(
             validation,
@@ -267,39 +392,36 @@ class MarketScheduler:
             historical_expectancy_r=None,
         )
         if not quality.approved:
+            if setup_id is not None:
+                await db.update_setup_record(setup_id, status="rejected", rejection_reason=quality.rejection_reason)
             logger.debug("Valid but low-quality setup for %s: %s", symbol, quality.rejection_reason)
             return None
 
-        # Retain the established report object/UI while replacing its legacy
-        # ATR-created prices and score-driven risk path with the validated setup.
-        is_scalping = primary_tf in ["M1", "M5"]
-        signal = compute_signal(
+        # Signal transport contains only prices derived by the causal validator
+        # and the transparent post-validity quality rank.
+        signal = TradeSignal(
             symbol=symbol,
             direction=direction,
             entry_price=validation.entry_price,
             stop_loss=validation.stop_loss,
             take_profit=validation.take_profit,
-            ltf_structure=structure,
-            htf_structures=htf_structures,
+            score=quality.score,
+            rr_ratio=validation.rr_ratio,
+            suggested_risk=min(self.settings.risk_per_trade, self.settings.max_setup_risk_pct),
+            structure=structure,
             zones=zones,
-            atr_val=atr_val,
-            min_rr=self.settings.min_rr_ratio,
             timeframe=primary_tf,
-            aggressive=is_scalping and self.settings.aggressive_mode,
-            profile=profile,
-            of_profile=of_profile,
-            sentiment=sentiment,
-            risk_budget_pct=min(self.settings.risk_per_trade, self.settings.max_setup_risk_pct),
             entry_mode=entry_mode.value,
-            signal_ttl_minutes=self.settings.max_signal_age_minutes,
+            setup_type="Liquidity Sweep Reversal",
+            created_at=datetime.utcnow().isoformat(),
+            expires_at=(datetime.utcnow() + timedelta(minutes=self.settings.max_signal_age_minutes)).isoformat(),
+            validation=validation,
+            quality_factors=quality.factors,
+            target_source=validation.target_pool.kind.value if validation.target_pool else "",
+            setup_id=setup_id,
+            passed=quality.approved,
+            rejection_reason=quality.rejection_reason,
         )
-        signal.score = quality.score
-        signal.validation = validation
-        signal.quality_factors = quality.factors
-        signal.setup_type = "Liquidity Sweep Reversal"
-        signal.target_source = validation.target_pool.kind.value if validation.target_pool else ""
-        signal.passed = quality.approved
-        signal.rejection_reason = quality.rejection_reason
         return signal
 
     async def scan_markets(self) -> list[TradeSignal]:
@@ -320,26 +442,32 @@ class MarketScheduler:
         try:
             # Final revalidation immediately before any market order. A signal
             # approval or prior scan never freezes market structure or pricing.
+            setup_id = signal.setup_id
             if signal.expires_at and datetime.utcnow() > datetime.fromisoformat(signal.expires_at):
                 signal.passed = False
                 signal.rejection_reason = "Signal expired before execution"
+                if setup_id is not None:
+                    await db.update_setup_record(setup_id, status="expired", rejection_reason=signal.rejection_reason)
                 await self._notify(format_signal_report(signal))
                 return False
-            refreshed = await self.analyze_symbol(symbol)
+            refreshed = await self.analyze_symbol(symbol, record_learning=False)
             if not refreshed or not refreshed.passed or refreshed.direction != signal.direction:
                 signal.passed = False
                 signal.rejection_reason = "Setup invalidated during final revalidation"
+                if setup_id is not None:
+                    await db.update_setup_record(setup_id, status="invalidated", rejection_reason=signal.rejection_reason)
                 await self._notify(format_signal_report(signal))
                 return False
             signal = refreshed
+            signal.setup_id = setup_id
 
             account = await self.executor.get_account_info()
             equity = float(account.get("equity", account.get("balance", 0)))
             free_margin = float(account.get("free_margin", 0))
             leverage = float(account.get("leverage", 1) or 1)
-            today_pnl = await db.get_today_pnl()
-            today_count = await db.get_today_trade_count()
-            consecutive_losses = await db.get_consecutive_losses()
+            today_pnl = await db.get_today_pnl(self.settings.trading_mode)
+            today_count = await db.get_today_trade_count(self.settings.trading_mode)
+            consecutive_losses = await db.get_consecutive_losses(account_mode=self.settings.trading_mode)
             open_positions = await self.executor.get_open_positions()
             sym_info = await self.executor.get_symbol_info(symbol)
             pip = sym_info.get("pip_size", pip_value(symbol))
@@ -369,6 +497,17 @@ class MarketScheduler:
             if not sizing.valid:
                 signal.passed = False
                 signal.rejection_reason = f"Sizing rejected: {sizing.reason}"
+                if signal.setup_id is not None:
+                    await db.update_setup_record(signal.setup_id, status="sizing_rejected", rejection_reason=signal.rejection_reason)
+                    await db.record_execution_event(
+                        account_mode=self.settings.trading_mode,
+                        symbol=symbol,
+                        setup_id=signal.setup_id,
+                        status="sizing_rejected",
+                        requested_price=signal.entry_price,
+                        reason=signal.rejection_reason,
+                        details={"free_margin": free_margin, "required_margin": sizing.required_margin},
+                    )
                 await self._notify(format_signal_report(signal))
                 return False
 
@@ -385,6 +524,16 @@ class MarketScheduler:
             if not layers:
                 signal.passed = False
                 signal.rejection_reason = "No broker-valid initial layer"
+                if signal.setup_id is not None:
+                    await db.update_setup_record(signal.setup_id, status="sizing_rejected", rejection_reason=signal.rejection_reason)
+                    await db.record_execution_event(
+                        account_mode=self.settings.trading_mode,
+                        symbol=symbol,
+                        setup_id=signal.setup_id,
+                        status="sizing_rejected",
+                        requested_price=signal.entry_price,
+                        reason=signal.rejection_reason,
+                    )
                 await self._notify(format_signal_report(signal))
                 return False
             initial_layer = layers[0]
@@ -410,9 +559,20 @@ class MarketScheduler:
                 logger.info(f"Signal rejected for {symbol}: {risk_result.reason}")
                 signal.passed = False
                 signal.rejection_reason = risk_result.reason
+                if signal.setup_id is not None:
+                    await db.update_setup_record(signal.setup_id, status="risk_rejected", rejection_reason=risk_result.reason)
+                    await db.record_execution_event(
+                        account_mode=self.settings.trading_mode,
+                        symbol=symbol,
+                        setup_id=signal.setup_id,
+                        status="risk_rejected",
+                        requested_price=signal.entry_price,
+                        reason=risk_result.reason,
+                    )
                 await self._notify(format_signal_report(signal))
                 return False
 
+            execution_started = perf_counter()
             result = await self.executor.execute_trade(
                 symbol=symbol,
                 direction=signal.direction,
@@ -454,6 +614,24 @@ class MarketScheduler:
                     rr_ratio=signal.rr_ratio,
                     executor=self.executor.name,
                     raw_signal=json.dumps(raw_signal),
+                    account_mode=self.settings.trading_mode,
+                    ticket=result.ticket,
+                    setup_id=signal.setup_id,
+                    initial_risk=sizing.expected_loss,
+                )
+                if signal.setup_id is not None:
+                    await db.update_setup_record(signal.setup_id, status="executed", trade_id=trade_id)
+                await db.record_execution_event(
+                    account_mode=self.settings.trading_mode,
+                    symbol=symbol,
+                    setup_id=signal.setup_id,
+                    trade_id=trade_id,
+                    ticket=result.ticket,
+                    requested_price=signal.entry_price,
+                    executed_price=result.entry_price,
+                    execution_delay_ms=(perf_counter() - execution_started) * 1000,
+                    status="filled",
+                    details={"lot_size": result.lot_size, "entry_mode": signal.entry_mode},
                 )
                 basket_id = await db.create_trade_basket(
                     symbol=symbol,
@@ -471,6 +649,7 @@ class MarketScheduler:
                         "quality_score": signal.score,
                         "rr_ratio": signal.rr_ratio,
                     },
+                    account_mode=self.settings.trading_mode,
                 )
                 await db.record_trade_layer(
                     basket_id=basket_id,
@@ -521,6 +700,17 @@ class MarketScheduler:
                 logger.info(f"Trade executed: {symbol} {signal.direction} score={signal.score:.1f}")
                 return True
             else:
+                if signal.setup_id is not None:
+                    await db.update_setup_record(signal.setup_id, status="execution_failed", rejection_reason=result.message)
+                    await db.record_execution_event(
+                        account_mode=self.settings.trading_mode,
+                        symbol=symbol,
+                        setup_id=signal.setup_id,
+                        requested_price=signal.entry_price,
+                        execution_delay_ms=(perf_counter() - execution_started) * 1000,
+                        status="rejected",
+                        reason=result.message,
+                    )
                 await self._notify(f"❌ Trade execution failed for {symbol}: {result.message}")
                 return False
 
@@ -557,10 +747,11 @@ class MarketScheduler:
                 await self._notify(f"🏆 **CYCLE TARGET REACHED!**\nBalance: **${current_equity:,.2f}**\nAll positions closed and Auto-Trade turned OFF.")
                 return
 
-        logger.info("Starting market scan...")
-        # Heartbeat to user
-        await self._notify("💓 **HEARTBEAT**: Market scan in progress...")
+        if not self.settings.enabled_symbols:
+            logger.warning("No broker-verified Deriv symbols are active; skipping scan")
+            return
 
+        logger.info("Starting market scan across %s broker-verified Deriv symbols", len(self.settings.enabled_symbols))
         for symbol in self.settings.enabled_symbols:
             logger.info(f"Analyzing {symbol}...")
             try:
@@ -614,19 +805,23 @@ class MarketScheduler:
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
     async def run_self_optimization(self):
-        """Analyze trade history and tune the bot's brain."""
-        logger.info("Running Self-Optimization AI...")
-        new_weights = await self.optimizer.run_optimization()
-        if new_weights:
+        """Run one bounded champion/challenger cycle and retain an audit trail."""
+        logger.info("Running bounded walk-forward optimization...")
+        self.optimizer.settings = self.settings
+        rollback = await self.optimizer.evaluate_rollback(self.settings.trading_mode)
+        result = rollback or await self.optimizer.run_optimization(self.settings.trading_mode)
+        if result.get("decision") in {"promoted", "rolled_back"}:
             await self._notify(
-                f"🧠 **SELF-OPTIMIZATION COMPLETE**\n"
-                f"The bot has analyzed recent trades and updated its scoring weights for better performance."
+                "🧠 **MODEL GOVERNANCE UPDATE**\n"
+                f"Decision: `{result['decision']}`\n"
+                f"Reason: {result.get('reason', 'Measured post-promotion performance required a rollback.')}"
             )
 
     async def send_daily_journal(self):
-        """Generate and send the daily AI journal."""
-        logger.info("Generating daily journal...")
-        journal = await self.optimizer.generate_daily_journal()
+        """Generate and send the readable, factual morning learning report."""
+        logger.info("Generating daily learning report...")
+        self.optimizer.settings = self.settings
+        journal = await self.optimizer.generate_daily_journal(self.settings.trading_mode)
         await self._notify(journal)
 
     async def _notify(self, message: str, photo: bytes = None):
@@ -655,14 +850,48 @@ class MarketScheduler:
             except Exception as e:
                 logger.error(f"Failed to send WhatsApp notification: {e}")
 
+    async def _reconcile_closed_trades(self, live_tickets: set[int]) -> None:
+        """Close local learning records only after broker history confirms an outcome."""
+        for trade in await db.get_open_trades(self.settings.trading_mode):
+            ticket = trade.get("ticket")
+            if ticket is None or int(ticket) in live_tickets:
+                continue
+            outcome = await self.executor.get_closed_position_outcome(int(ticket))
+            if not outcome:
+                continue
+            initial_risk = float(trade.get("initial_risk") or 0.0)
+            pnl = float(outcome.get("pnl") or 0.0)
+            pnl_r = pnl / initial_risk if initial_risk > 0 else None
+            await db.close_trade(
+                int(trade["id"]),
+                pnl,
+                exit_price=float(outcome.get("exit_price") or 0.0),
+                pnl_r=pnl_r,
+                max_favorable_r=float(trade.get("max_favorable_r") or 0.0),
+                max_adverse_r=float(trade.get("max_adverse_r") or 0.0),
+            )
+            setup_id = trade.get("setup_id")
+            if setup_id:
+                await db.update_setup_record(
+                    int(setup_id),
+                    status="closed",
+                    outcome={
+                        "pnl": pnl,
+                        "pnl_r": pnl_r,
+                        "exit_price": outcome.get("exit_price"),
+                        "max_favorable_r": trade.get("max_favorable_r", 0.0),
+                        "max_adverse_r": trade.get("max_adverse_r", 0.0),
+                    },
+                )
+
     async def manage_open_positions(self):
         """Manage each open trade from fresh closed-candle structure and basket state."""
         try:
             positions = await self.executor.get_open_positions()
+            live_tickets = {position.ticket for position in positions}
+            await self._reconcile_closed_trades(live_tickets)
             if not positions:
                 return
-
-            live_tickets = {position.ticket for position in positions}
             logger.info("Structurally managing %s open position(s)...", len(positions))
             manager = TradeManager(
                 breakeven_at_rr=self.settings.breakeven_at_rr,
@@ -675,7 +904,7 @@ class MarketScheduler:
             )
 
             for position in positions:
-                basket = await db.get_basket_for_ticket(position.ticket)
+                basket = await db.get_basket_for_ticket(position.ticket, self.settings.trading_mode)
                 if basket:
                     initial_stop = float(basket["initial_stop"])
                     try:
@@ -698,6 +927,15 @@ class MarketScheduler:
                 if df.empty or len(df) < 30:
                     continue
                 current_price = float(df.iloc[-1]["close"])
+                if basket and basket.get("metadata", {}).get("trade_id"):
+                    initial_distance = abs(position.entry_price - initial_stop)
+                    current_r = (
+                        ((current_price - position.entry_price) if position.direction == "BUY" else (position.entry_price - current_price))
+                        / initial_distance
+                        if initial_distance > 0
+                        else 0.0
+                    )
+                    await db.update_trade_excursions(int(basket["metadata"]["trade_id"]), current_r=current_r)
                 atr_val = float(atr(df, 14).iloc[-1])
                 if atr_val <= 0:
                     continue
@@ -790,7 +1028,7 @@ class MarketScheduler:
                 if basket and action.action != "close_full":
                     await self.maybe_add_confirmed_layer(basket, position, positions)
 
-            for basket in await db.get_open_baskets():
+            for basket in await db.get_open_baskets(self.settings.trading_mode):
                 await db.close_basket_if_flat(basket["id"], live_tickets)
         except Exception as e:
             logger.error(f"Error in manage_open_positions: {e}", exc_info=True)
@@ -867,9 +1105,9 @@ class MarketScheduler:
         if not sizing.valid or sizing.expected_loss > remaining_basket_risk + 1e-6:
             return False
 
-        today_pnl = await db.get_today_pnl()
-        today_count = await db.get_today_trade_count()
-        consecutive_losses = await db.get_consecutive_losses()
+        today_pnl = await db.get_today_pnl(self.settings.trading_mode)
+        today_count = await db.get_today_trade_count(self.settings.trading_mode)
+        consecutive_losses = await db.get_consecutive_losses(account_mode=self.settings.trading_mode)
         risk_result = await self.risk_manager.check_all(
             symbol=position.symbol,
             direction=refreshed.direction,
