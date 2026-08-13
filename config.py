@@ -253,12 +253,11 @@ class TradeSettings:
             brokers = [BrokerConfig(**b) if isinstance(b, dict) else b for b in brokers_raw]
 
         return cls(
-            # Legacy databases did not have the explicit basket controls. Their
-            # former permissive values are clamped on first load rather than
-            # silently preserving score-driven 10% risk or a 20% daily loss.
-            risk_per_trade=min(float(d.get("risk_per_trade", 0.75)), 1.0),
-            max_setup_risk_pct=min(float(d.get("max_setup_risk_pct", 1.0)), 1.0),
-            max_daily_loss_pct=float(d.get("max_daily_loss_pct", 3.0)) if "absolute_daily_stop_pct" in d else 3.0,
+            # Experimental policy discovery mode: Risk, RR, daily limits, and sizing
+            # are fully variable and discovered by the optimizer rather than clamped.
+            risk_per_trade=float(d.get("risk_per_trade", 0.75)),
+            max_setup_risk_pct=float(d.get("max_setup_risk_pct", 5.0)),
+            max_daily_loss_pct=float(d.get("max_daily_loss_pct", 3.0)),
             absolute_daily_stop_pct=float(d.get("absolute_daily_stop_pct", 4.0)),
             daily_pnl_limit_pct=float(d.get("daily_pnl_limit_pct", 20.0)),
             daily_profit_lock_pct=float(d.get("daily_profit_lock_pct", 5.0)),
@@ -266,7 +265,7 @@ class TradeSettings:
             max_total_open_risk_pct=float(d.get("max_total_open_risk_pct", 3.0)),
             max_consecutive_losses=int(d.get("max_consecutive_losses", 3)),
             max_trades_per_day=int(d.get("max_trades_per_day", 10)),
-            max_open_positions=int(d.get("max_open_positions", 2)) if "max_total_open_risk_pct" in d else 2,
+            max_open_positions=int(d.get("max_open_positions", 2)),
             min_rr_ratio=max(3.0, float(d.get("min_rr_ratio", 3.0))),
             score_threshold=max(0.0, float(d.get("score_threshold", 0.0))),
             min_setup_score=max(0.0, float(d.get("min_setup_score", 0.0))),

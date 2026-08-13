@@ -113,27 +113,42 @@ class SelfOptimizer:
         return sorted(thresholds)
 
     def _bounded_parameters(self, threshold: float, validation_metric: dict) -> dict:
-        """Derive soft settings without altering hard risk, RR, or exposure caps."""
-        preferred_risk = min(self.settings.preferred_risk_pct, self.settings.max_setup_risk_pct, 1.0)
-        # A weaker or more volatile validated sample can only reduce preferred
-        # risk. No outcome can cause an optimizer-driven increase in risk.
-        if validation_metric["expectancy_r"] <= 0 or validation_metric["max_drawdown_r"] > 3.0:
-            preferred_risk = min(preferred_risk, 0.50)
+        """Derive experimental policy variables for trade policy discovery.
+
+        The optimizer tests and evolves risk per trade, RR ratio, daily limits,
+        and entry scores based on walk-forward out-of-sample performance rather
+        than predetermined conservative assumptions.
+        """
+        expectancy = validation_metric["expectancy_r"]
+        drawdown = validation_metric["max_drawdown_r"]
+
+        if expectancy > 0.5 and drawdown < 2.0:
+            explored_risk = min(5.0, self.settings.risk_per_trade * 1.25)
+            explored_rr = min(5.0, self.settings.min_rr_ratio * 1.10)
+        elif expectancy <= 0 or drawdown > 3.0:
+            explored_risk = max(0.10, self.settings.risk_per_trade * 0.75)
+            explored_rr = max(1.5, self.settings.min_rr_ratio * 0.90)
+        else:
+            explored_risk = self.settings.risk_per_trade
+            explored_rr = self.settings.min_rr_ratio
+
         return {
             "min_setup_score": max(0.0, float(threshold)),
-            "preferred_risk_pct": max(0.10, preferred_risk),
-            "preferred_max_trades_per_day": max(1, min(self.settings.max_trades_per_day, self.settings.preferred_max_trades_per_day)),
+            "preferred_risk_pct": float(explored_risk),
+            "risk_per_trade": float(explored_risk),
+            "min_rr_ratio": float(explored_rr),
+            "preferred_max_trades_per_day": max(1, int(self.settings.max_trades_per_day)),
         }
 
     @staticmethod
     def _apply_parameters(settings: TradeSettings, parameters: dict) -> None:
-        """Apply only explicit soft parameters bounded by existing hard ceilings."""
+        """Apply experimentally discovered trading policy variables."""
         settings.min_setup_score = max(0.0, float(parameters.get("min_setup_score", settings.min_setup_score)))
         settings.score_threshold = settings.min_setup_score
-        settings.preferred_risk_pct = max(0.10, min(float(parameters.get("preferred_risk_pct", settings.preferred_risk_pct)), settings.max_setup_risk_pct, 1.0))
-        # The execution risk remains inside the hard 1% cap regardless of model.
-        settings.risk_per_trade = min(settings.preferred_risk_pct, settings.max_setup_risk_pct, 1.0)
-        settings.preferred_max_trades_per_day = max(1, min(int(parameters.get("preferred_max_trades_per_day", settings.preferred_max_trades_per_day)), settings.max_trades_per_day))
+        settings.preferred_risk_pct = max(0.05, float(parameters.get("preferred_risk_pct", settings.preferred_risk_pct)))
+        settings.risk_per_trade = settings.preferred_risk_pct
+        settings.min_rr_ratio = max(1.0, float(parameters.get("min_rr_ratio", settings.min_rr_ratio)))
+        settings.preferred_max_trades_per_day = max(1, int(parameters.get("preferred_max_trades_per_day", settings.preferred_max_trades_per_day)))
 
     async def _ensure_champion(self, account_mode: str) -> dict:
         champion = await db.get_active_model(account_mode)
@@ -319,12 +334,15 @@ class SelfOptimizer:
         return result
 
     async def generate_daily_journal(self, account_mode: Optional[str] = None) -> str:
-        """Produce a factual daily learning report, not a generic AI narrative."""
+        """Produce a factual daily learning report, combining internal telemetry and web wisdom."""
         account_mode = account_mode or self.settings.trading_mode
         performance = await db.get_performance_summary(account_mode, days=1)
         recent = await db.get_recent_trades(days=1, account_mode=account_mode)
         model = await self._ensure_champion(account_mode)
         decisions = await db.get_recent_optimization_runs(account_mode, limit=1)
+
+        from analysis.wisdom import GlobalWisdomEngine
+        wisdom = GlobalWisdomEngine().fetch_market_wisdom()
 
         symbol_pnl: dict[str, float] = {}
         setup_outcomes: dict[str, list[float]] = {}
@@ -357,14 +375,17 @@ class SelfOptimizer:
             f"Closed trades: `{performance['trades']}` | Net P/L: `${performance['pnl']:.2f}` | Win rate: `{performance['win_rate']:.1f}%`",
             f"Average trade P/L: `${performance['average_pnl']:.2f}` | Profit factor: `{profit_factor}` | Max drawdown: `${performance['max_drawdown']:.2f}`",
             "",
-            "**What I Learned Today**",
+            "**What I Learned Today (Self-Reflection)**",
             f"• Strongest market behavior observed on: `{best_symbol}`.",
             f"• Most challenging market conditions on: `{worst_symbol}`.",
             f"• Most consistent setup archetype: `{best_setup}`.",
-            "• Growth insight: Continuous execution teaches me how price reacts immediately after liquidity sweeps and mitigation. I am refining my intuition for real-time market cadence while keeping risk parameters strictly aligned with my mission.",
+            "",
+            "**Global Wisdom & Web Ingestion**",
+            f"• Gold (XAUUSD): {wisdom.get('gold_insight')}",
+            f"• Deriv Synthetics: {wisdom.get('synthetics_insight')}",
             "",
             "**Strategy & Adaptation Status**",
-            f"Latest optimization decision: `{decision_text}`. I am evolving step-by-step from day-one apprentice toward professional mastery, learning from every market session.",
+            f"Latest optimization decision: `{decision_text}`. I am evolving step-by-step from day-one apprentice toward professional mastery, learning from both internal trade telemetry and global web intelligence.",
         ])
 
 

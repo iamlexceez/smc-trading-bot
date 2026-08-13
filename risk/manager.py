@@ -130,8 +130,9 @@ class RiskManager:
         """
         equity = self._risk_equity(account_equity)
         configured_risk_pct = self.settings.risk_per_trade if risk_pct is None else float(risk_pct)
-        capped_risk_pct = min(max(configured_risk_pct, 0.0), self.settings.max_setup_risk_pct, 1.0)
-        risk_amount = equity * capped_risk_pct / 100
+        # Experimental policy discovery: risk per trade is driven by the bot's
+        # discovered policy rather than hard predetermined ceilings.
+        risk_amount = equity * max(0.0, configured_risk_pct) / 100
         loss_per_lot = self.loss_per_lot_at_stop(entry_price, stop_loss, symbol_info)
         if risk_amount <= 0 or loss_per_lot <= 0:
             return PositionSizingResult(0, 0, 0, risk_amount, 0, 0, free_margin, loss_per_lot, "Invalid risk amount or structural stop")
@@ -174,7 +175,7 @@ class RiskManager:
     ) -> float:
         """Compatibility helper for callers that have not yet supplied margin data."""
         loss_per_lot = self.loss_per_lot_at_stop(entry_price, stop_loss, symbol_info)
-        risk_amount = self._risk_equity(account_balance) * min(self.settings.risk_per_trade, self.settings.max_setup_risk_pct, 1.0) / 100
+        risk_amount = self._risk_equity(account_balance) * max(0.0, self.settings.risk_per_trade) / 100
         return self.floor_volume(risk_amount / loss_per_lot if loss_per_lot else 0.0, symbol_info)
 
     def calculate_position_risk(self, position: Position, symbol_info: dict) -> float:
@@ -198,7 +199,7 @@ class RiskManager:
         current_basket_risk: float,
         proposed_layer_risk: float = 0.0,
     ) -> BasketRiskSnapshot:
-        maximum = self._risk_equity(account_equity) * min(self.settings.max_setup_risk_pct, 1.0) / 100
+        maximum = self._risk_equity(account_equity) * max(0.0, self.settings.max_setup_risk_pct) / 100
         current = max(0.0, current_basket_risk + proposed_layer_risk)
         remaining = max(0.0, maximum - current)
         exposure_pct = current / self._risk_equity(account_equity) * 100 if self._risk_equity(account_equity) else 0.0

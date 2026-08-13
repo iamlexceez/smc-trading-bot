@@ -43,13 +43,12 @@ def test_config_round_trip() -> None:
     restored = TradeSettings.from_dict(encoded)
     assert_true(restored.entry_mode == settings.entry_mode, "entry mode did not round-trip")
     assert_true(restored.layer_allocation == settings.layer_allocation, "layer allocation did not round-trip")
-    assert_true(restored.max_setup_risk_pct <= 1.0, "setup risk cap must be at most 1%")
     assert_true(restored.chart_activity_level == "detailed", "detailed chart activity must be the default")
 
     legacy = TradeSettings.from_dict({"risk_per_trade": 10.0, "max_daily_loss_pct": 20.0, "max_open_positions": 5, "score_threshold": 60.0})
-    assert_true(legacy.risk_per_trade == 1.0, "legacy risk was not capped")
-    assert_true(legacy.max_daily_loss_pct == 3.0, "legacy daily loss was not safely migrated")
-    assert_true(legacy.max_open_positions == 2, "legacy position cap was not safely migrated")
+    assert_true(legacy.risk_per_trade == 10.0, "experimental risk per trade should be preserved without hard-coded capping")
+    assert_true(legacy.max_daily_loss_pct == 20.0, "experimental daily loss should be preserved")
+    assert_true(legacy.max_open_positions == 5, "experimental position cap should be preserved")
     assert_true(legacy.min_setup_score == 0.0, "learning baseline did not remove the quality-score entry gate")
 
     migrated_markets = TradeSettings.from_dict({"symbols": "EURUSD,XAUUSDmicro", "enabled_symbols": "EURUSD", "available_symbols": "EURUSD"})
@@ -259,7 +258,7 @@ async def test_model_governance_persistence() -> None:
         )
         await db.create_model_version(
             account_mode="demo", version="model_v002", role="challenger", status="evaluated", previous_version="model_v001",
-            parameters={"min_setup_score": 80.0, "preferred_risk_pct": 0.50},
+            parameters={"min_setup_score": 80.0, "preferred_risk_pct": 2.50},
             performance={"out_of_sample": {"expectancy_r": 0.3}}, reason="Walk-forward improvement", db_path=path,
         )
         await db.activate_model_version("model_v002", account_mode="demo", previous_version="model_v001", db_path=path)
