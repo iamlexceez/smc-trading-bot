@@ -734,19 +734,6 @@ class MarketScheduler:
             logger.debug("Auto-trade disabled or paused — skipping scan")
             return
             
-        # Check Cycle Target
-        if self.settings.target_balance:
-            account = await self.executor.get_account_info()
-            current_equity = account.get("equity", 0)
-            if current_equity >= self.settings.target_balance:
-                logger.info(f"🎯 CYCLE TARGET REACHED: ${current_equity:,.2f}. Stopping bot.")
-                await self.executor.close_all_positions()
-                self.settings.auto_trade = False
-                self.settings.target_balance = None
-                await db.save_settings(self.settings)
-                await self._notify(f"🏆 **CYCLE TARGET REACHED!**\nBalance: **${current_equity:,.2f}**\nAll positions closed and Auto-Trade turned OFF.")
-                return
-
         if not self.settings.enabled_symbols:
             logger.warning("No broker-verified Deriv symbols are active; skipping scan")
             return
@@ -755,40 +742,15 @@ class MarketScheduler:
         for symbol in self.settings.enabled_symbols:
             logger.info(f"Analyzing {symbol}...")
             try:
-                # ─── ARBITRAGE CHECK ──────────────────────────
-                if self.settings.arbitrage_enabled and self.arb_monitor:
-                    arb_opp = await self.arb_monitor.check_arbitrage(symbol)
-                    if arb_opp:
-                        await self._notify(
-                            f"⚡️ **ARBITRAGE OPPORTUNITY FOUND**\n"
-                            f"Symbol: `{symbol}`\n"
-                            f"Buy: `{arb_opp['buy_broker']}` @ `{arb_opp['buy_price']}`\n"
-                            f"Sell: `{arb_opp['sell_broker']}` @ `{arb_opp['sell_price']}`\n"
-                            f"Profit: `{arb_opp['profit_pct']:.2f}%`\n\n"
-                            f"Executing multi-broker hedge..."
-                        )
-                        success = await self.arb_monitor.execute_arbitrage(arb_opp)
-                        if success:
-                            await self._notify(f"✅ **ARBITRAGE EXECUTED**\nProfit locked across `{arb_opp['buy_broker']}` and `{arb_opp['sell_broker']}`.")
-                        else:
-                            await self._notify(f"❌ **ARBITRAGE FAILED**\nCheck terminal logs for execution errors.")
-
                 # Check session filter
                 session_info = check_trading_session(self.settings.enabled_sessions)
                 if not session_info.is_trading_time:
                     logger.debug(f"Outside trading session: {session_info.reason}")
                     continue
 
-                # Check news filter
-                if self.settings.news_filter_enabled:
-                    news_result = await self.news_filter.check_news(symbol)
-                    if news_result.is_blackout:
-                        logger.info(f"News blackout for {symbol}: {news_result.reason}")
-                        continue
-
                 # For the background loop, we analyze and execute
                 signal = await self.analyze_symbol(symbol)
-                if not signal or not signal.passed or signal.score < self.settings.min_setup_score:
+                if not signal or not signal.passed:
                     continue
                 
                 # Notify potential setup found
