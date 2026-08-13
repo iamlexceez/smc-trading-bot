@@ -1,4 +1,5 @@
-# MetaTrader5 — install ONLY on Windows VPS or Linux+Wine
-# This package requires the MT5 terminal application running.
-# Do NOT install on standard Linux/Docker (paper mode doesn't need it).
-MetaTrader5==5.0.45
+# MetaTrader5 — install ONLY on 64-bit Windows VPS or Linux+Wine.
+# Current PyPI release provides Windows wheels for CPython 3.12, 3.13, and 3.14.
+# The MT5 terminal must be installed and running for terminal operations.
+# Do NOT install on standard Linux/Docker (paper mode does not need it).
+MetaTrader5==5.0.6090
