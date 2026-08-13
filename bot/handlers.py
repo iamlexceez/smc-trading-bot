@@ -121,12 +121,21 @@ class BotHandlers:
     # ─── Commands ──────────────────────────────────────────
 
     async def _render_menu(self, update: Update, text: str, markup=None) -> None:
-        """Render one monitoring view for either a command or an inline callback."""
+        """Render one Markdown monitoring view for a command or inline callback."""
         markup = markup or keyboards.main_menu()
         if update.callback_query:
             await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
         elif update.message:
             await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+    async def _render_plain_menu(self, update: Update, text: str, markup=None) -> None:
+        """Render untrusted broker metadata without Markdown entity parsing."""
+        markup = markup or keyboards.main_menu()
+        safe_text = str(text)[:3900]
+        if update.callback_query:
+            await update.callback_query.edit_message_text(safe_text, reply_markup=markup)
+        elif update.message:
+            await update.message.reply_text(safe_text, reply_markup=markup)
 
     async def _dashboard_text(self) -> str:
         performance = await db.get_performance_summary(self.settings.trading_mode, days=1)
@@ -221,24 +230,28 @@ class BotHandlers:
         accepted = universe.accepted_records
         rejected = universe.rejected_records
         audit_paths = self.scheduler.last_universe_audit_paths
+        accepted_preview = accepted[:20]
+        rejected_preview = rejected[:10]
         lines = [
-            "💹 **MT5 BROKER-VERIFIED UNIVERSE**",
-            f"Mode: `{self.settings.trading_mode.upper()}` | Returned: `{len(universe.records)}` | ACCEPTED: `{len(accepted)}` | REJECTED: `{len(rejected)}`",
+            "MT5 BROKER-VERIFIED UNIVERSE",
+            f"Mode: {self.settings.trading_mode.upper()} | Returned: {len(universe.records)} | ACCEPTED: {len(accepted)} | REJECTED: {len(rejected)}",
             "",
-            "**ACCEPTED — executable Deriv Synthetic Indices / Gold**",
-            *( [f"• `{record.symbol}` — {record.category}; `{record.trade_mode_name}`; volume `{record.volume_min}`–`{record.volume_max}` step `{record.volume_step}`" for record in accepted] or ["None. Execution remains fail-closed."] ),
+            "ACCEPTED — executable Deriv Synthetic Indices / Gold",
+            *( [f"- {record.symbol} — {record.category}; {record.trade_mode_name}; volume {record.volume_min}–{record.volume_max} step {record.volume_step}" for record in accepted_preview] or ["None. Execution remains fail-closed."] ),
             "",
-            "**REJECTED — first 12 decisions**",
-            *( [f"• `{record.symbol}` — {record.decision_reason}" for record in rejected[:12]] or ["None."] ),
+            "REJECTED — first 10 decisions",
+            *( [f"- {record.symbol} — {record.decision_reason}" for record in rejected_preview] or ["None."] ),
         ]
-        if len(rejected) > 12:
-            lines.append(f"… plus `{len(rejected) - 12}` more rejected records in the full audit.")
+        if len(accepted) > len(accepted_preview):
+            lines.append(f"… plus {len(accepted) - len(accepted_preview)} more accepted records in the full audit.")
+        if len(rejected) > len(rejected_preview):
+            lines.append(f"… plus {len(rejected) - len(rejected_preview)} more rejected records in the full audit.")
         if universe.last_refresh_error:
-            lines.extend(["", f"**MT5 retrieval warning:** {universe.last_refresh_error}"])
+            lines.extend(["", f"MT5 retrieval warning: {universe.last_refresh_error}"])
         if audit_paths:
-            lines.extend(["", f"Complete metadata audit: `{audit_paths[1]}`", f"Machine-readable audit: `{audit_paths[0]}`"])
+            lines.extend(["", f"Complete metadata audit: {audit_paths[1]}", f"Machine-readable audit: {audit_paths[0]}"])
         lines.extend(["", "No non-broker or guessed instrument is enabled. Forex, crypto, and all unsupported products remain rejected."])
-        await self._render_menu(update, "\n".join(lines))
+        await self._render_plain_menu(update, "\n".join(lines))
 
     @admin_only
     async def cmd_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
