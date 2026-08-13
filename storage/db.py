@@ -575,6 +575,35 @@ async def record_execution_event(
         return cursor.lastrowid
 
 
+async def get_latest_sizing_rejection(
+    *,
+    account_mode: str,
+    symbol: str,
+    db_path: str = DB_PATH,
+) -> Optional[dict]:
+    """Return the latest persisted sizing-rejected setup plus its event evidence; read-only."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT e.*, s.direction, s.entry_price, s.stop_loss, s.take_profit, s.rr_ratio,
+                      s.timeframe, s.policy_version, s.experiment_id, s.rejection_reason AS setup_rejection_reason
+               FROM execution_events e
+               LEFT JOIN setup_records s ON s.id = e.setup_id
+               WHERE e.account_mode = ? AND e.symbol = ? AND e.status = 'sizing_rejected'
+               ORDER BY e.created_at DESC, e.id DESC LIMIT 1""",
+            (account_mode, symbol),
+        )
+        row = await cursor.fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    try:
+        result["details"] = json.loads(result.pop("details_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        result["details"] = {}
+    return result
+
+
 async def upsert_symbol_profile(
     *,
     account_mode: str,

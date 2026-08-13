@@ -146,6 +146,7 @@ async def main():
         BotCommand("demo_auto_resume", "Set verified DEMO reset auto-resume on or off"),
         BotCommand("markets", "Broker-verified Deriv universe"),
         BotCommand("brokercheck", "Read-only MT5 price, volume, contract, and margin audit"),
+        BotCommand("sizingtest", "Read-only full broker lot-size calculation for latest rejected setup"),
         BotCommand("engine", "Actual scheduler, scanner, analysis, execution, and task diagnostics"),
         BotCommand("learning", "Measured learning status"),
         BotCommand("experiments", "Policy experiment lifecycle"),

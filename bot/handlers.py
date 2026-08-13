@@ -187,6 +187,7 @@ class BotHandlers:
             "`/dashboard` — current autonomous-system status\n"
             "`/markets` — broker-verified Deriv universe\n"
             "`/brokercheck` — read-only MT5 price, volume, contract, and margin audit\n"
+            "`/sizingtest <symbol>` — read-only full broker lot-size calculation for the latest rejected setup\n"
             "`/engine` — actual scheduler, scanner, analysis, execution, and task diagnostics\n"
             "`/positions` — active broker positions and recorded policy actions\n"
             "`/learning` — measured observations and next objective\n"
@@ -311,6 +312,84 @@ class BotHandlers:
             f"Orders: {lifetime.get('orders_submitted', 0)} submitted / {lifetime.get('orders_filled', 0)} filled / {lifetime.get('orders_rejected', 0)} rejected",
             f"Positions: {lifetime.get('positions_checked', 0)} checked / {lifetime.get('positions_modified', 0)} modified / {lifetime.get('positions_closed', 0)} closed",
         ])
+        await self._render_plain_menu(update, "\n".join(lines))
+
+    @admin_only
+    async def cmd_sizingtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Report the latest rejected setup's full sizing calculation without creating an order."""
+        symbol = " ".join(context.args).strip() if context.args else "XAUUSDmicro"
+        if not self.scheduler:
+            await self._render_plain_menu(update, "SIZING TEST\n\nScheduler is unavailable; no broker-authoritative calculation can run.")
+            return
+        report = await self.scheduler.sizing_diagnostic(symbol)
+        if not report.get("available"):
+            await self._render_plain_menu(
+                update,
+                f"SIZING TEST — {symbol}\n\n{report.get('reason', 'No sizing evidence is available.')}\n\nNo order was submitted. Run this after a persisted sizing rejection.",
+            )
+            return
+        account = report.get("account") or {}
+        spec = report.get("broker_spec") or {}
+        sizing = report.get("sizing") or {}
+        min_probe = report.get("minimum_margin_probe") or {}
+        calc_probe = report.get("calculated_margin_probe")
+        currency = str(account.get("currency") or "USD")
+        def number(value, digits=8):
+            return "NOT CALCULATED" if value is None else f"{float(value):.{digits}g}"
+        def money_probe(probe):
+            if not probe:
+                return "NOT CALCULATED"
+            value = probe.get("margin")
+            if value is None:
+                return f"NOT CALCULATED ({probe.get('error') or 'MT5 returned no margin'})"
+            return f"{currency} {float(value):,.2f}"
+        reason_code = str(sizing.get("sizing_code") or "UNSPECIFIED")
+        classification = {
+            "MINIMUM_LOT_EXCEEDS_POLICY_RISK": "A + B — calculated volume is below broker minimum, and minimum-volume loss exceeds the active policy budget.",
+            "MINIMUM_LOT_MARGIN_UNAFFORDABLE": "D — broker minimum volume requires more margin than available free margin.",
+            "NO_STEP_NORMALIZED_LOT": "C — the calculated volume cannot be safely floored to the broker volume step at the broker minimum.",
+            "BROKER_MARGIN_UNAVAILABLE": "E — MT5 margin evidence was unavailable; no margin assumption is used.",
+            "BROKER_VOLUME_SPEC_INVALID": "F — the broker did not expose valid minimum-volume or step specifications.",
+            "INVALID_STOP_SPEC": "H — entry/stop data cannot form a valid stop-loss distance.",
+        }.get(reason_code, "H — see the exact sizing code and reason below.")
+        history_note = "Historical policy inputs were persisted with this rejection." if report.get("historical_inputs_complete") else "Historical policy inputs were not present in this older rejection; current active policy was used for this read-only recomputation and is labelled non-historical."
+        lines = [
+            f"SIZING TEST — {symbol} — READ-ONLY",
+            f"Rejected setup recorded: {report.get('recorded_at') or 'unknown'}",
+            history_note,
+            "", "ACCOUNT / POLICY",
+            f"1. Account equity: {currency} {float(account.get('equity') or account.get('balance') or 0.0):,.2f}",
+            f"   Effective capital: {currency} {float(report.get('effective_capital') or 0.0):,.2f}",
+            f"2. Free margin: {currency} {float(account.get('free_margin') or 0.0):,.2f}",
+            f"8. Configured risk: {float(report.get('risk_pct') or 0.0):.6g}% | Model: {report.get('risk_model')}",
+            f"9. Maximum risk: {currency} {float(sizing.get('risk_amount') or 0.0):,.2f}",
+            "", "SETUP",
+            f"Direction: {report.get('direction')}",
+            f"3. Entry: {number(report.get('entry_price'))}",
+            f"4. Stop loss: {number(report.get('stop_loss'))}",
+            f"5. Stop distance: {number(report.get('stop_distance'))}",
+            f"6. Take profit: {number(report.get('take_profit'))}",
+            f"7. RR: {number(report.get('rr_ratio'), 6)}",
+            "", "BROKER SPECIFICATION",
+            f"10. Minimum volume: {number(sizing.get('broker_min_lot'))}",
+            f"11. Maximum volume: {number(sizing.get('broker_max_lot'))}",
+            f"12. Volume step: {number(sizing.get('broker_volume_step'))}",
+            f"13. Contract size: {number(spec.get('trade_contract_size') or spec.get('contract_size'))}",
+            f"14. Tick size: {number(spec.get('trade_tick_size') or spec.get('tick_size'))}",
+            f"15. Tick value: {number(spec.get('trade_tick_value') or spec.get('tick_value'))}",
+            "", "LOT / LOSS / MARGIN CALCULATION",
+            f"16. Theoretical policy-required volume: {number(sizing.get('policy_required_lot'))}",
+            f"17. Broker-rounded executable volume: {number(sizing.get('required_lot'))}",
+            f"18. Expected loss at broker minimum: {currency} {float(sizing.get('minimum_lot_loss') or 0.0):,.2f}",
+            f"19. Expected loss at calculated executable volume: {currency} {float(sizing.get('expected_loss') or 0.0):,.2f}" if float(sizing.get('required_lot') or 0.0) > 0 else "19. Expected loss at calculated executable volume: NOT CALCULATED",
+            f"20. Required margin at broker minimum: {money_probe(min_probe)}",
+            f"21. Required margin at calculated executable volume: {money_probe(calc_probe)}",
+            "", "DECISION",
+            f"22. Code: {reason_code}",
+            f"Exact reason: {sizing.get('reason') or report.get('historical_record', {}).get('reason') or 'No rejection reason recorded'}",
+            f"Classification: {classification}",
+            "", "No order was submitted. Broker volume and margin validation were not bypassed.",
+        ]
         await self._render_plain_menu(update, "\n".join(lines))
 
     @admin_only
@@ -1635,6 +1714,8 @@ class BotHandlers:
             await self.cmd_markets(update, context)
         elif data == "brokercheck":
             await self.cmd_brokercheck(update, context)
+        elif data == "sizingtest":
+            await self.cmd_sizingtest(update, context)
         elif data == "engine":
             await self.cmd_engine(update, context)
         elif data == "learning":
@@ -2011,6 +2092,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("markets", self.cmd_markets))
         app.add_handler(CommandHandler("brokercheck", self.cmd_brokercheck))
+        app.add_handler(CommandHandler("sizingtest", self.cmd_sizingtest))
         app.add_handler(CommandHandler("engine", self.cmd_engine))
         app.add_handler(CommandHandler("account", self.cmd_account))
         app.add_handler(CommandHandler("positions", self.cmd_positions))

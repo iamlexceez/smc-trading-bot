@@ -103,6 +103,12 @@ class BaseExecutor(ABC):
         """
         return {}
 
+    async def get_broker_margin_for_volume(
+        self, symbol: str, direction: str, volume: float, price: float | None = None
+    ) -> dict:
+        """Read-only broker margin calculation for one requested volume; never submits an order."""
+        return {"symbol": symbol, "requested_volume": volume, "margin": None, "error": "Executor does not expose broker margin calculation"}
+
     async def list_symbols(self) -> list[dict]:
         """Return raw symbols exposed by the connected broker.
 

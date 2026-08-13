@@ -417,6 +417,47 @@ class MT5Executor(BaseExecutor):
             result["margin_error"] = f"MT5 order_calc_margin raised {type(exc).__name__}: {exc}"
         return result
 
+    async def get_broker_margin_for_volume(
+        self, symbol: str, direction: str, volume: float, price: float | None = None
+    ) -> dict:
+        """Use MT5 order_calc_margin for one broker-normalized test volume without sending an order."""
+        result: dict = {"symbol": symbol, "requested_volume": volume, "normalized_volume": None, "price": price, "margin": None}
+        if not MT5_AVAILABLE:
+            result["error"] = "MetaTrader5 package not installed"
+            return result
+        if not await self._ensure_connected():
+            result["error"] = f"MT5 connection unavailable: {mt5.last_error()}"
+            return result
+        if not mt5.symbol_select(symbol, True):
+            result["error"] = f"MT5 symbol_select failed: {mt5.last_error()}"
+            return result
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            result["error"] = f"MT5 symbol_info returned no data: {mt5.last_error()}"
+            return result
+        normalized = self._normalise_broker_volume(volume, getattr(info, "volume_min", None), getattr(info, "volume_max", None), getattr(info, "volume_step", None))
+        result["normalized_volume"] = normalized
+        if normalized is None:
+            result["error"] = "Requested volume cannot be normalized to broker min/max/step"
+            return result
+        tick = mt5.symbol_info_tick(symbol)
+        buy = str(direction).upper() != "SELL"
+        fallback_price = getattr(tick, "ask", None) if buy else getattr(tick, "bid", None)
+        test_price = float(price) if isinstance(price, (int, float)) and float(price) > 0 else fallback_price
+        if test_price is None or float(test_price) <= 0:
+            result["error"] = "No positive broker price available for margin calculation"
+            return result
+        try:
+            order_type = getattr(mt5, "ORDER_TYPE_BUY", 0) if buy else getattr(mt5, "ORDER_TYPE_SELL", 1)
+            result["price"] = float(test_price)
+            margin = mt5.order_calc_margin(order_type, symbol, float(normalized), float(test_price))
+            result["margin"] = float(margin) if margin is not None else None
+            if margin is None:
+                result["error"] = f"MT5 order_calc_margin returned no data: {mt5.last_error()}"
+        except Exception as exc:
+            result["error"] = f"MT5 order_calc_margin raised {type(exc).__name__}: {exc}"
+        return result
+
     async def get_symbol_info(self, symbol: str) -> dict:
         """Get detailed 'Symbol DNA' for precise lot and pip calculations."""
         if not MT5_AVAILABLE:

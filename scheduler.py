@@ -610,6 +610,67 @@ class MarketScheduler:
         })
         return spec
 
+    async def sizing_diagnostic(self, symbol: str) -> dict:
+        """Recompute the latest sizing rejection using broker facts only; never sends an order."""
+        record = await db.get_latest_sizing_rejection(account_mode=self.settings.trading_mode, symbol=symbol)
+        if not record:
+            return {"available": False, "symbol": symbol, "reason": "No persisted sizing-rejected setup exists for this account mode and symbol."}
+        details = dict(record.get("details") or {})
+        stored_inputs = dict(details.get("sizing_inputs") or {})
+        entry = record.get("entry_price") or stored_inputs.get("entry_price") or record.get("requested_price")
+        stop = record.get("stop_loss") or stored_inputs.get("stop_loss")
+        take_profit = record.get("take_profit") or stored_inputs.get("take_profit")
+        direction = str(record.get("direction") or stored_inputs.get("direction") or "BUY").upper()
+        if not all(isinstance(value, (int, float)) and float(value) > 0 for value in (entry, stop, take_profit)):
+            return {"available": False, "symbol": symbol, "record": record, "reason": "The historical sizing rejection lacks complete entry, stop-loss, and take-profit prices."}
+        account = await self.executor.get_account_info()
+        equity = float(account.get("equity", account.get("balance", 0.0)) or 0.0)
+        free_margin = float(account.get("free_margin", 0.0) or 0.0)
+        leverage = float(account.get("leverage", 0.0) or 0.0)
+        active_policy, _, _ = await self.optimizer.active_policy(self.settings.trading_mode)
+        policy = dict(stored_inputs.get("experimental_policy") or active_policy.to_dict())
+        risk_pct = float(stored_inputs.get("risk_pct", policy.get("risk_pct", self.settings.risk_per_trade)) or 0.0)
+        risk_model = str(stored_inputs.get("risk_model", policy.get("risk_model", "fixed_pct")))
+        fixed_volume = stored_inputs.get("fixed_volume", policy.get("fixed_volume"))
+        spec = await self._execution_symbol_spec(symbol, direction)
+        sizing = self.risk_manager.calculate_position_sizing(
+            account_equity=equity,
+            free_margin=free_margin,
+            entry_price=float(entry),
+            stop_loss=float(stop),
+            symbol_info=spec,
+            leverage=leverage,
+            risk_pct=risk_pct,
+            risk_model=risk_model,
+            fixed_volume=fixed_volume,
+        )
+        min_margin_probe = await self.executor.get_broker_margin_for_volume(symbol, direction, sizing.broker_min_lot, float(entry))
+        candidate_probe = None
+        if sizing.required_lot > 0:
+            candidate_probe = await self.executor.get_broker_margin_for_volume(symbol, direction, sizing.required_lot, float(entry))
+        return {
+            "available": True,
+            "symbol": symbol,
+            "recorded_at": record.get("created_at"),
+            "historical_inputs_complete": bool(stored_inputs),
+            "historical_record": record,
+            "account": account,
+            "effective_capital": self.risk_manager._risk_equity(equity),
+            "entry_price": float(entry),
+            "stop_loss": float(stop),
+            "take_profit": float(take_profit),
+            "stop_distance": abs(float(entry) - float(stop)),
+            "rr_ratio": record.get("rr_ratio"),
+            "direction": direction,
+            "risk_pct": risk_pct,
+            "risk_model": risk_model,
+            "fixed_volume": fixed_volume,
+            "broker_spec": spec,
+            "sizing": sizing.evidence(),
+            "minimum_margin_probe": min_margin_probe,
+            "calculated_margin_probe": candidate_probe,
+        }
+
     async def fetch_candles(self, symbol: str, timeframe: str, count: int = 200) -> "pd.DataFrame":
         """Fetch broker-native, closed OHLCV data and record the actual outcome."""
         self.telemetry.increment("candle_requests")
@@ -1072,7 +1133,24 @@ class MarketScheduler:
                         status="sizing_rejected",
                         requested_price=signal.entry_price,
                         reason=signal.rejection_reason,
-                        details={"free_margin": free_margin, "sizing": sizing.evidence()},
+                        details={
+                            "sizing": sizing.evidence(),
+                            "sizing_inputs": {
+                                "account_equity": equity,
+                                "effective_capital": self.risk_manager._risk_equity(equity),
+                                "free_margin": free_margin,
+                                "leverage": leverage,
+                                "entry_price": signal.entry_price,
+                                "stop_loss": signal.stop_loss,
+                                "take_profit": signal.take_profit,
+                                "direction": signal.direction,
+                                "risk_pct": float(signal.experimental_policy.get("risk_pct", signal.suggested_risk)),
+                                "risk_model": str(signal.experimental_policy.get("risk_model", "fixed_pct")),
+                                "fixed_volume": signal.experimental_policy.get("fixed_volume"),
+                                "experimental_policy": dict(signal.experimental_policy),
+                                "broker_spec": sym_info,
+                            },
+                        },
                     )
                 await self._chart_activity(
                     "execution_rejected", symbol,

@@ -552,6 +552,24 @@ async def test_broker_authoritative_capital_state() -> None:
         assert_true(verified["state"] == AccountCapitalState.ACCOUNT_VERIFIED and verified["broker_metadata"]["target_count"] == 1, "completed broker-universe handoff did not reach account validation")
 
 
+async def test_sizing_rejection_diagnostic_persistence() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "sizing.db")
+        await db.init_db(path)
+        setup_id = await db.record_setup(
+            account_mode="demo", symbol="XAUUSDmicro", timeframe="M5", direction="BUY", setup_type="test",
+            status="sizing_rejected", entry_price=100.0, stop_loss=99.0, take_profit=103.0, rr_ratio=3.0,
+            db_path=path,
+        )
+        await db.record_execution_event(
+            account_mode="demo", symbol="XAUUSDmicro", setup_id=setup_id, status="sizing_rejected",
+            requested_price=100.0, reason="fixture", details={"sizing": {"sizing_code": "MINIMUM_LOT_EXCEEDS_POLICY_RISK"}, "sizing_inputs": {"risk_pct": 1.0, "entry_price": 100.0}}, db_path=path,
+        )
+        latest = await db.get_latest_sizing_rejection(account_mode="demo", symbol="XAUUSDmicro", db_path=path)
+        assert_true(latest is not None and latest["entry_price"] == 100.0, "latest sizing rejection did not retain setup geometry")
+        assert_true(latest["details"]["sizing_inputs"]["risk_pct"] == 1.0, "latest sizing rejection lost sizing inputs")
+
+
 async def test_demo_live_partitioning() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "modes.db")
@@ -588,6 +606,7 @@ def run() -> None:
     asyncio.run(test_chart_activity_notifications())
     asyncio.run(test_capital_reduction_isolation())
     asyncio.run(test_broker_authoritative_capital_state())
+    asyncio.run(test_sizing_rejection_diagnostic_persistence())
     asyncio.run(test_demo_live_partitioning())
     print("PASS: upgrade smoke tests")
 
