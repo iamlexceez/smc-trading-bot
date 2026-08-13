@@ -19,7 +19,7 @@ class RuntimeTelemetry:
     """Single-event-loop telemetry ledger with resettable heartbeat windows."""
 
     COUNTERS = (
-        "scan_cycles_started", "scan_cycles_completed", "scan_cycles_failed",
+        "scan_cycles_started", "scan_cycles_completed", "scan_cycles_failed", "scan_cycles_skipped_overlap",
         "symbols_attempted", "symbols_analyzed",
         "candle_requests", "successful_candle_requests", "failed_candle_requests",
         "analysis_runs", "analysis_failures", "setups_detected", "setups_rejected",

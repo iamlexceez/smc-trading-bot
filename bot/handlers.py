@@ -305,7 +305,7 @@ class BotHandlers:
                 lines.append(f"  error: {task['last_error']}")
         lines.extend([
             "", "PROCESS-LIFETIME COUNTERS",
-            f"Scan cycles: {lifetime.get('scan_cycles_started', 0)} started / {lifetime.get('scan_cycles_completed', 0)} completed / {lifetime.get('scan_cycles_failed', 0)} failed",
+            f"Scan cycles: {lifetime.get('scan_cycles_started', 0)} started / {lifetime.get('scan_cycles_completed', 0)} completed / {lifetime.get('scan_cycles_failed', 0)} failed / {lifetime.get('scan_cycles_skipped_overlap', 0)} overlap-skipped",
             f"Symbols: {lifetime.get('symbols_attempted', 0)} attempted / {lifetime.get('symbols_analyzed', 0)} analyzed | Candles: {lifetime.get('candle_requests', 0)} requested / {lifetime.get('failed_candle_requests', 0)} failed",
             f"Analysis: {lifetime.get('analysis_runs', 0)} runs / {lifetime.get('setups_detected', 0)} detected / {lifetime.get('setups_rejected', 0)} rejected",
             f"Orders: {lifetime.get('orders_submitted', 0)} submitted / {lifetime.get('orders_filled', 0)} filled / {lifetime.get('orders_rejected', 0)} rejected",

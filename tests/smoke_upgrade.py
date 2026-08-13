@@ -63,6 +63,30 @@ def test_runtime_telemetry() -> None:
     assert_true(telemetry.snapshot()["components"]["analysis_engine"]["state"] == "FAILED", "component failure was not exposed")
 
 
+async def test_single_flight_scan_guard() -> None:
+    engine = object.__new__(scheduler.MarketScheduler)
+    engine._scan_lock = asyncio.Lock()
+    engine.telemetry = RuntimeTelemetry()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_scan():
+        entered.set()
+        await release.wait()
+        return {"completed": True}
+
+    engine._scan_and_execute = slow_scan
+    first = asyncio.create_task(engine.scan_and_execute())
+    await entered.wait()
+    second = await engine.scan_and_execute()
+    release.set()
+    await first
+    counters = engine.telemetry.snapshot()["lifetime"]["counters"]
+    assert_true(second.get("skipped") == "scan already running", "overlapping scan was not explicitly skipped")
+    assert_true(counters["scan_cycles_started"] == 1 and counters["scan_cycles_completed"] == 1, "single-flight guard allowed an extra scan cycle")
+    assert_true(counters["scan_cycles_skipped_overlap"] == 1, "overlap skip was not recorded")
+
+
 def test_scanner_eligibility_handoff() -> None:
     engine = object.__new__(scheduler.MarketScheduler)
     engine._analysis_eligible_symbols = ()
@@ -540,6 +564,7 @@ async def test_demo_live_partitioning() -> None:
 
 def run() -> None:
     test_runtime_telemetry()
+    asyncio.run(test_single_flight_scan_guard())
     test_scanner_eligibility_handoff()
     test_config_round_trip()
     test_account_monitor_aggregates()

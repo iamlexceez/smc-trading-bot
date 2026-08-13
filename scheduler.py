@@ -90,6 +90,9 @@ class MarketScheduler:
         # It is intentionally separate from settings because settings reloads
         # discard broker symbol lists to prevent stale post-restart execution.
         self._analysis_eligible_symbols: tuple[str, ...] = ()
+        # One full scan can be lengthy across a broker-verified universe. All
+        # triggers share this guard, preventing duplicate analysis or execution.
+        self._scan_lock = asyncio.Lock()
 
     def _set_analysis_eligible_symbols(self, audit: Optional[dict]) -> tuple[str, ...]:
         audit = audit or {}
@@ -148,8 +151,11 @@ class MarketScheduler:
         except Exception as exc:
             self.telemetry.task_failed(name, exc)
             logger.exception("Background task %s failed", name)
+        else:
+            self.telemetry.task_succeeded(name)
 
     def _start_background_task(self, name: str, coroutine) -> asyncio.Task:
+        self.telemetry.task_started(name, interval="immediate")
         task = asyncio.create_task(coroutine, name=name)
         task.add_done_callback(lambda completed: self._observe_background_task(name, completed))
         return task
@@ -421,7 +427,7 @@ class MarketScheduler:
                 "", "SYSTEM",
                 f"Heartbeat: {self._component_label(heartbeat)} | MT5: {'🟢 CONNECTED' if capital.get('current') else '🔴 UNAVAILABLE'} | Account: {str(account.get('broker_account_mode') or self.settings.trading_mode).upper()}",
                 "", "MARKET ENGINE",
-                f"Scanner: {scanner_label} | Scan cycles: {counters.get('scan_cycles_completed', 0)} complete / {counters.get('scan_cycles_failed', 0)} failed",
+                f"Scanner: {scanner_label} | Scan cycles: {counters.get('scan_cycles_completed', 0)} complete / {counters.get('scan_cycles_failed', 0)} failed / {counters.get('scan_cycles_skipped_overlap', 0)} overlap-skipped",
                 f"Last scan: {scanner.get('last_success') or 'never'} | Symbols attempted: {counters.get('symbols_attempted', 0)} | Analyzed: {counters.get('symbols_analyzed', 0)}",
                 f"Candle requests: {counters.get('candle_requests', 0)} | Success: {counters.get('successful_candle_requests', 0)} | Failures: {counters.get('failed_candle_requests', 0)}",
                 f"Timeframes actually requested: {timeframe_text}",
@@ -1301,22 +1307,27 @@ class MarketScheduler:
             raise
 
     async def scan_and_execute(self):
-        """Instrumented market-scan entry point called by scheduler and activation."""
-        started = perf_counter()
-        self.telemetry.component_started("market_scanner")
-        self.telemetry.increment("scan_cycles_started")
-        logger.info("[SCANNER START] timestamp=%s", datetime.utcnow().isoformat())
-        try:
-            result = await self._scan_and_execute()
-        except Exception as exc:
-            self.telemetry.increment("scan_cycles_failed")
-            self.telemetry.component_failed("market_scanner", exc)
-            logger.exception("[SCANNER FAILURE] duration=%.3fs", perf_counter() - started)
-            raise
-        self.telemetry.increment("scan_cycles_completed")
-        self.telemetry.component_succeeded("market_scanner", waiting=False)
-        logger.info("[SCANNER COMPLETE] timestamp=%s duration=%.3fs", datetime.utcnow().isoformat(), perf_counter() - started)
-        return result
+        """Run at most one real market scan across every trigger source at a time."""
+        if self._scan_lock.locked():
+            self.telemetry.increment("scan_cycles_skipped_overlap")
+            logger.warning("[SCANNER SKIPPED] reason=overlap active_scan_started=%s", self.telemetry.snapshot().get("components", {}).get("market_scanner", {}).get("last_started"))
+            return {"skipped": "scan already running"}
+        async with self._scan_lock:
+            started = perf_counter()
+            self.telemetry.component_started("market_scanner")
+            self.telemetry.increment("scan_cycles_started")
+            logger.info("[SCANNER START] timestamp=%s", datetime.utcnow().isoformat())
+            try:
+                result = await self._scan_and_execute()
+            except Exception as exc:
+                self.telemetry.increment("scan_cycles_failed")
+                self.telemetry.component_failed("market_scanner", exc)
+                logger.exception("[SCANNER FAILURE] duration=%.3fs", perf_counter() - started)
+                raise
+            self.telemetry.increment("scan_cycles_completed")
+            self.telemetry.component_succeeded("market_scanner", waiting=False)
+            logger.info("[SCANNER COMPLETE] timestamp=%s duration=%.3fs", datetime.utcnow().isoformat(), perf_counter() - started)
+            return result
 
     async def _scan_and_execute(self):
         """Main scan implementation: validate account, manage positions, then scan usable markets."""
