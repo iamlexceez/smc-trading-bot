@@ -120,24 +120,32 @@ class RiskManager:
         symbol_info: dict,
         leverage: float,
         risk_pct: Optional[float] = None,
-        margin_safety_buffer_pct: float = 0.10,
+        risk_model: str = "fixed_pct",
+        fixed_volume: Optional[float] = None,
+        margin_safety_buffer_pct: float = 0.0,
     ) -> PositionSizingResult:
-        """Derive a valid final volume from risk and margin constraints.
+        """Derive broker-valid volume from policy-selected risk and free margin.
 
-        The smaller of risk-limited and margin-limited volume is chosen and
-        rounded down. A lower margin capacity therefore reduces volume instead
-        of unnecessarily rejecting a valid setup.
+        The smaller of policy-risk and broker-margin capacity is chosen and
+        rounded down. Broker volume steps and margin are integrity constraints;
+        risk percentage is supplied by the active experiment.
         """
         equity = self._risk_equity(account_equity)
         configured_risk_pct = self.settings.risk_per_trade if risk_pct is None else float(risk_pct)
-        # Experimental policy discovery: risk per trade is driven by the bot's
-        # discovered policy rather than hard predetermined ceilings.
-        risk_amount = equity * max(0.0, configured_risk_pct) / 100
         loss_per_lot = self.loss_per_lot_at_stop(entry_price, stop_loss, symbol_info)
-        if risk_amount <= 0 or loss_per_lot <= 0:
-            return PositionSizingResult(0, 0, 0, risk_amount, 0, 0, free_margin, loss_per_lot, "Invalid risk amount or structural stop")
+        if loss_per_lot <= 0:
+            return PositionSizingResult(0, 0, 0, 0, 0, 0, free_margin, loss_per_lot, "Invalid broker stop-loss specification")
+        if risk_model == "fixed_volume":
+            ideal_volume = max(0.0, float(fixed_volume or 0.0))
+            risk_amount = ideal_volume * loss_per_lot
+        else:
+            # Experimental policy discovery: risk percentage is supplied by the
+            # active policy rather than a hard predetermined ceiling.
+            risk_amount = equity * max(0.0, configured_risk_pct) / 100
+            ideal_volume = risk_amount / loss_per_lot if risk_amount > 0 else 0.0
+        if ideal_volume <= 0:
+            return PositionSizingResult(0, 0, 0, risk_amount, 0, 0, free_margin, loss_per_lot, "Policy did not specify a positive executable size")
 
-        ideal_volume = risk_amount / loss_per_lot
         margin_per_lot = self.estimate_margin_per_lot(entry_price, symbol_info, leverage)
         available_margin = max(0.0, free_margin * (1 - max(0.0, margin_safety_buffer_pct)))
         margin_limited_volume = available_margin / margin_per_lot if margin_per_lot > 0 else ideal_volume
@@ -149,8 +157,8 @@ class RiskManager:
             reason = "No broker-valid volume fits the risk and margin constraints"
         elif required_margin > available_margin + 1e-9:
             reason = "Final volume exceeds available margin after safety buffer"
-        elif expected_loss > risk_amount + 1e-6:
-            reason = "Final volume exceeds the setup risk budget"
+        elif risk_model != "fixed_volume" and expected_loss > risk_amount + 1e-6:
+            reason = "Final volume exceeds the selected policy risk budget"
         else:
             reason = ""
 
@@ -214,15 +222,18 @@ class RiskManager:
         *,
         account_equity: Optional[float] = None,
         allocation: Optional[list[float]] = None,
+        max_layers: Optional[int] = None,
+        layer_style: str = "confirmation",
     ) -> list[dict]:
-        """Return planned layer volumes within one fixed basket-risk budget.
+        """Return a policy-selected layer plan within the one basket-risk budget.
 
-        The plan is metadata only: callers execute layer one initially and may
-        add later layers only after fresh structural revalidation. No layer is
-        created to average a losing position.
+        Layering remains broker-volume-valid and later layers require fresh
+        revalidation. The selected experiment, rather than a hidden global
+        maximum, decides whether and how many layers it tests.
         """
         raw_allocation = allocation or self.settings.layer_allocation
-        normalized_allocation = [max(float(value), 0.0) for value in raw_allocation[: self.settings.max_layers]]
+        selected_max_layers = max_layers if max_layers is not None else self.settings.max_layers
+        normalized_allocation = [max(float(value), 0.0) for value in raw_allocation[: max(0, int(selected_max_layers) + 1)]]
         total_allocation = sum(normalized_allocation)
         if total_lot <= 0 or total_allocation <= 0:
             return []
@@ -240,10 +251,10 @@ class RiskManager:
                 continue
             allocated_volume += volume
             triggers = {
-                1: "Initial validated entry",
-                2: "Fresh structural confirmation",
-                3: "Validated continuation or retest",
-                4: "Lower-timeframe continuation confirmation",
+                1: "Initial policy entry",
+                2: f"Policy layer: {layer_style}",
+                3: f"Policy layer: {layer_style}",
+                4: f"Policy layer: {layer_style}",
             }
             layers.append(
                 {
@@ -251,7 +262,7 @@ class RiskManager:
                     "lot": volume,
                     "allocation": share,
                     "expected_loss": volume * loss_per_lot,
-                    "comment": f"SMC L{index}/{len(normalized_allocation)}",
+                    "comment": f"EXP L{index}/{len(normalized_allocation)}",
                     "trigger": triggers.get(index, "Fresh revalidation required"),
                 }
             )
@@ -273,50 +284,55 @@ class RiskManager:
         *,
         proposed_setup_risk: float = 0.0,
         current_open_risk: float = 0.0,
-        safety_margin_buffer_pct: float = 0.10,
+        safety_margin_buffer_pct: float = 0.0,
         setup_valid: bool = True,
         is_layer: bool = False,
         consecutive_losses: int = 0,
+        policy: Optional[dict] = None,
     ) -> RiskCheckResult:
-        """Run immutable financial and operational gates before execution."""
+        """Run integrity checks plus the *selected* policy—never hidden global caps.
+
+        The input policy is immutable experiment data.  Omitting a policy limit
+        deliberately means that policy does not impose that type of trading
+        restriction; it does not disable broker validation or emergency pause.
+        """
         checks: list[tuple[str, bool, str]] = []
+        policy = dict(policy or {})
         equity = self._risk_equity(account_equity)
 
+        # Software/infrastructure integrity checks.
         checks.append(("Auto-trade enabled", self.settings.auto_trade and not self.settings.is_paused, f"auto_trade={self.settings.auto_trade}, paused={self.settings.is_paused}"))
-        checks.append(("Setup validity", setup_valid, "Mandatory SMC sequence passed" if setup_valid else "Mandatory SMC validity failed"))
-        checks.append(("Symbol allowed", symbol in self.settings.enabled_symbols, f"{symbol} enabled"))
+        checks.append(("Executable market data", setup_valid, "Valid closed-candle price, stop, and target" if setup_valid else "Invalid candidate geometry"))
+        checks.append(("Broker-verified enabled symbol", symbol in self.settings.enabled_symbols, f"{symbol} enabled"))
+        safe_free_margin = max(0.0, free_margin * (1 - max(0.0, safety_margin_buffer_pct)))
+        checks.append(("Free margin", required_margin <= safe_free_margin + 1e-6, f"required=${required_margin:.2f}; available=${safe_free_margin:.2f}"))
 
-        in_cooldown = await db.is_symbol_in_cooldown(symbol, self.settings.symbol_cooldown_minutes)
-        checks.append(("Symbol not in cooldown", is_layer or not in_cooldown, f"cooldown={self.settings.symbol_cooldown_minutes} minutes" + (" (existing basket layer)" if is_layer else "")))
-
-        daily_loss_amount = equity * self.settings.max_daily_loss_pct / 100
-        emergency_loss_amount = equity * self.settings.absolute_daily_stop_pct / 100
-        daily_loss_ok = today_pnl > -daily_loss_amount - 1e-6 and today_pnl > -emergency_loss_amount - 1e-6
-        checks.append(("Daily loss limit", daily_loss_ok, f"PnL=${today_pnl:.2f}; normal stop=-${daily_loss_amount:.2f}; emergency=-${emergency_loss_amount:.2f}"))
-
-        profit_stop_amount = equity * self.settings.daily_profit_stop_pct / 100
-        profit_stop_ok = today_pnl < profit_stop_amount - 1e-6
-        checks.append(("Daily profit stop", profit_stop_ok, f"PnL=${today_pnl:.2f}; stop=+${profit_stop_amount:.2f}"))
-
-        checks.append(("Daily trade count", is_layer or today_trade_count < self.settings.max_trades_per_day, f"{today_trade_count}/{self.settings.max_trades_per_day}" + (" (existing basket layer)" if is_layer else "")))
-        checks.append(("Loss-streak circuit breaker", consecutive_losses < self.settings.max_consecutive_losses, f"{consecutive_losses}/{self.settings.max_consecutive_losses} consecutive losses"))
-        checks.append(("Max open positions", is_layer or open_position_count < self.settings.max_open_positions, f"{open_position_count}/{self.settings.max_open_positions}" + (" (existing basket layer)" if is_layer else "")))
-        checks.append(("Setup quality", score >= self.settings.min_setup_score - 0.01, f"score={score:.1f}; minimum={self.settings.min_setup_score:.1f}"))
-        checks.append(("Minimum RR", rr_ratio >= self.settings.min_rr_ratio - 0.001, f"RR=1:{rr_ratio:.2f}; minimum=1:{self.settings.min_rr_ratio:.2f}"))
-
-        max_setup_risk_amount = equity * min(self.settings.max_setup_risk_pct, 1.0) / 100
-        checks.append(("Setup risk budget", proposed_setup_risk <= max_setup_risk_amount + 1e-6, f"proposed=${proposed_setup_risk:.2f}; max=${max_setup_risk_amount:.2f}"))
-
-        max_open_risk_amount = equity * self.settings.max_total_open_risk_pct / 100
-        combined_open_risk = current_open_risk + proposed_setup_risk
-        checks.append(("Total open-risk ceiling", combined_open_risk <= max_open_risk_amount + 1e-6, f"open+proposed=${combined_open_risk:.2f}; ceiling=${max_open_risk_amount:.2f}"))
-
-        safe_free_margin = max(0.0, free_margin * (1 - safety_margin_buffer_pct))
-        checks.append(("Free margin", required_margin <= safe_free_margin + 1e-6, f"required=${required_margin:.2f}; safe free=${safe_free_margin:.2f}"))
+        # Experimental policy choices. These checks are applied only when the
+        # active policy explicitly elects to use them.
+        cooldown_minutes = policy.get("symbol_cooldown_minutes")
+        if cooldown_minutes is not None:
+            in_cooldown = await db.is_symbol_in_cooldown(symbol, int(cooldown_minutes))
+            checks.append(("Policy symbol cooldown", is_layer or not in_cooldown, f"cooldown={cooldown_minutes} minutes"))
+        daily_stop = policy.get("daily_stop_pct") if policy.get("daily_stop_model") != "none" else None
+        if daily_stop is not None:
+            checks.append(("Policy daily drawdown response", today_pnl > -(equity * float(daily_stop) / 100) - 1e-6, f"PnL=${today_pnl:.2f}; policy threshold=-{daily_stop}%"))
+        daily_target = policy.get("daily_target_pct") if policy.get("daily_target_model") != "none" else None
+        if daily_target is not None:
+            checks.append(("Policy daily profit response", today_pnl < equity * float(daily_target) / 100 - 1e-6, f"PnL=${today_pnl:.2f}; policy target=+{daily_target}%"))
+        max_trades = policy.get("max_trades_per_day")
+        if max_trades is not None:
+            checks.append(("Policy trade frequency", is_layer or today_trade_count < int(max_trades), f"{today_trade_count}/{max_trades}"))
+        max_positions = policy.get("max_positions")
+        if max_positions is not None:
+            checks.append(("Policy concurrent positions", is_layer or open_position_count < int(max_positions), f"{open_position_count}/{max_positions}"))
+        policy_risk_pct = policy.get("risk_pct")
+        if policy_risk_pct is not None and policy.get("risk_model") != "fixed_volume":
+            policy_risk_amount = equity * max(0.0, float(policy_risk_pct)) / 100
+            checks.append(("Policy setup risk", proposed_setup_risk <= policy_risk_amount + 1e-6, f"proposed=${proposed_setup_risk:.2f}; policy=${policy_risk_amount:.2f}"))
 
         all_passed = all(passed for _, passed, _ in checks)
         failed = [name for name, passed, _ in checks if not passed]
-        return RiskCheckResult(all_passed, f"Failed: {', '.join(failed)}" if failed else "All hard risk checks passed", checks)
+        return RiskCheckResult(all_passed, f"Failed: {', '.join(failed)}" if failed else "Integrity and active policy checks passed", checks)
 
 
 __all__ = [

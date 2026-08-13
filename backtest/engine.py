@@ -36,6 +36,7 @@ from execution.manager import ManagementState, TradeManager
 from strategy.setup_scorer import score_setup_quality
 from strategy.setup_validator import EntryMode, SetupValidator
 from analysis.sessions import check_trading_session, Session
+from analysis.policies import ExperimentalPolicy
 from config import TradeSettings
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,7 @@ class BacktestTrade:
     partial_percent: float = 0.0
     partial_realized_pnl: float = 0.0
     factors: list = field(default_factory=list)
+    experimental_policy: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -150,8 +152,10 @@ class BacktestEngine:
         initial_balance: float = 10000.0,
         commission_pips: float = 0.5,
         slippage_pips: float = 0.5,
+        policy: Optional[ExperimentalPolicy | dict] = None,
     ):
         self.settings = settings
+        self.policy = policy if isinstance(policy, ExperimentalPolicy) else ExperimentalPolicy.from_dict(policy or {})
         self.initial_balance = initial_balance
         self.commission_pips = commission_pips
         self.slippage_pips = slippage_pips
@@ -217,21 +221,15 @@ class BacktestEngine:
                 self.equity_curve.append(self.balance + self._unrealized_pnl(current_bar))
                 continue
 
-            # Check daily limits using the same asymmetric loss/profit stops as live execution.
-            if self.daily_trades >= self.settings.max_trades_per_day:
+            # Daily stopping behavior is an explicit policy variable. No static
+            # profit/loss/trade-count gate is inherited by an experiment.
+            if self.policy.max_trades_per_day is not None and self.daily_trades >= self.policy.max_trades_per_day:
                 self.equity_curve.append(self.balance)
                 continue
-            if self.daily_pnl <= -(self.balance * self.settings.max_daily_loss_pct / 100):
+            if self.policy.daily_stop_model != "none" and self.policy.daily_stop_pct is not None and self.daily_pnl <= -(self.balance * self.policy.daily_stop_pct / 100):
                 self.equity_curve.append(self.balance)
                 continue
-            if self.daily_pnl >= self.balance * self.settings.daily_profit_stop_pct / 100:
-                self.equity_curve.append(self.balance)
-                continue
-
-            # Check session filter
-            utc_time = current_time if current_time.tzinfo else current_time.tz_localize('UTC')
-            session_info = check_trading_session(["london", "new_york", "overlap"], utc_time)
-            if not session_info.is_trading_time:
+            if self.policy.daily_target_model != "none" and self.policy.daily_target_pct is not None and self.daily_pnl >= self.balance * self.policy.daily_target_pct / 100:
                 self.equity_curve.append(self.balance)
                 continue
 
@@ -259,26 +257,18 @@ class BacktestEngine:
                 if len(htf_slice) >= 20:
                     htf_structures.append(analyze_structure(htf_slice, lookback=3))
 
-            try:
-                entry_mode = EntryMode(self.settings.entry_mode.lower())
-            except (AttributeError, ValueError):
-                entry_mode = EntryMode.CONFIRMED
-            if entry_mode == EntryMode.AGGRESSIVE and not self.settings.allow_aggressive_entry:
-                entry_mode = EntryMode.CONFIRMED
-            if entry_mode == EntryMode.EXTREME and not self.settings.allow_extreme_entry:
-                entry_mode = EntryMode.AGGRESSIVE if self.settings.allow_aggressive_entry else EntryMode.CONFIRMED
-
+            entry_mode = EntryMode.CONFIRMED if self.policy.entry_model == "confirmation" else EntryMode.AGGRESSIVE
             validator = SetupValidator(
-                min_rr=self.settings.min_rr_ratio,
+                min_rr=0.0,
                 min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
                 displacement_body_ratio=self.settings.displacement_body_ratio_min,
                 displacement_range_ratio=self.settings.displacement_range_ratio_min,
-                stop_atr_buffer=self.settings.structural_stop_atr_buffer,
-                require_ltf_confirmation=self.settings.require_candle_confirmation,
+                stop_atr_buffer=self.policy.stop_atr_buffer if self.policy.stop_atr_buffer is not None else self.settings.structural_stop_atr_buffer,
+                require_ltf_confirmation=False,
             )
             candidates = []
             for direction in ("BUY", "SELL"):
-                validation = validator.validate(
+                validation = validator.observe(
                     symbol=symbol,
                     direction=direction,
                     timeframe=timeframe,
@@ -288,14 +278,23 @@ class BacktestEngine:
                     zones=zones,
                     entry_mode=entry_mode,
                     ltf_df=slice_df,
+                    target_rr=self.policy.rr_target,
+                    stop_model=self.policy.stop_model,
+                    target_model=self.policy.target_model,
                 )
-                quality = score_setup_quality(
-                    validation,
-                    structure,
-                    min_score=self.settings.min_setup_score,
-                    extreme_score=self.settings.extreme_setup_score,
-                )
-                if quality.approved:
+                if not validation.valid:
+                    continue
+                quality = score_setup_quality(validation, structure, min_score=0.0, extreme_score=self.settings.extreme_setup_score)
+                features = {check.name.lower().replace("/", "_").replace(" ", "_"): check.passed for check in validation.checks}
+                features.update({
+                    "bos_choch": features.get("bos_choch_confirmation", False),
+                    "zone_retest": features.get("retracement_into_valid_zone", False),
+                    "zone_order_block": getattr(getattr(validation, "zone", None), "source", "") == "order_block",
+                    "zone_fvg": getattr(getattr(validation, "zone", None), "source", "") == "fvg",
+                    "zone_supply_demand": getattr(getattr(validation, "zone", None), "source", "") == "supply_demand",
+                })
+                accepted, _ = self.policy.accepts(score=quality.score, rr_ratio=validation.rr_ratio, features=features)
+                if accepted:
                     candidates.append((validation, quality))
             if not candidates:
                 self.equity_curve.append(self.balance)
@@ -308,9 +307,9 @@ class BacktestEngine:
             tp = validation.take_profit
             atr_val = float(atr(slice_df, 14).iloc[-1])
 
-            # The backtest has no broker contract specification, so it retains
-            # its explicit approximation but uses the same capped setup budget.
-            risk_amount = self.balance * min(self.settings.risk_per_trade, self.settings.max_setup_risk_pct, 1.0) / 100
+            # The historical simulator declares its contract approximation but
+            # sizes from the supplied experimental policy, without legacy caps.
+            risk_amount = self.balance * max(0.0, float(self.policy.risk_pct or 0.0)) / 100
             sl_distance = abs(entry - sl)
             lot_size = risk_amount / (sl_distance / pip * pip * 100000) if pip > 0 else 0.01
             lot_size = max(round(lot_size, 2), 0.01)
@@ -332,6 +331,7 @@ class BacktestEngine:
                 score=quality.score,
                 rr_ratio=validation.rr_ratio,
                 factors=[{"name": factor.name, "points": factor.points, "maximum": factor.maximum} for factor in quality.factors],
+                experimental_policy=self.policy.to_dict(),
             )
             self.open_trade = trade
             self.daily_trades += 1
@@ -392,15 +392,7 @@ class BacktestEngine:
             state = ManagementState(trade.management_state)
         except ValueError:
             state = ManagementState.INITIAL
-        manager = TradeManager(
-            breakeven_at_rr=self.settings.breakeven_at_rr,
-            profit_lock_rr=self.settings.profit_lock_rr,
-            runner_rr=self.settings.runner_rr,
-            min_rr=self.settings.min_rr_ratio,
-            stop_atr_buffer=self.settings.trailing_buffer_atr,
-            allow_partial_tp=self.settings.allow_partial_tp,
-            allow_tp_extension=self.settings.allow_tp_extension,
-        )
+        manager = TradeManager(policy=trade.experimental_policy)
         action = manager.evaluate(
             direction=trade.direction,
             entry_price=trade.entry_price,

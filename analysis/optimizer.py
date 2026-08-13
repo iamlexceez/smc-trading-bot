@@ -1,8 +1,10 @@
-"""Bounded walk-forward learning and model governance.
+"""Evidence-gated DEMO research engine.
 
-The optimizer changes configuration parameters only after adequate, separated
-training/validation/out-of-sample evidence. It never rewrites source code and
-never changes immutable risk ceilings or setup-validity gates.
+The optimizer does not assume fixed risk, RR, setup features, layering, or trade
+management rules.  It generates explicit policy candidates, evaluates them on
+chronological training/validation/out-of-sample windows, forward-tests a
+challenger in DEMO, and only then permits a champion promotion.  LIVE remains
+observation-only and can never self-promote.
 """
 
 from __future__ import annotations
@@ -10,11 +12,17 @@ from __future__ import annotations
 import json
 import logging
 import math
-from dataclasses import asdict
-from datetime import datetime, timedelta
-from statistics import mean, pstdev
+from datetime import datetime
+from statistics import mean
 from typing import Any, Optional
 
+from analysis.policies import (
+    ExperimentalPolicy,
+    Hypothesis,
+    HypothesisEngine,
+    PolicyEvaluator,
+    PolicyGenerator,
+)
 from config import TradeSettings
 from storage import db
 
@@ -22,10 +30,12 @@ logger = logging.getLogger(__name__)
 
 
 class SelfOptimizer:
-    """Evaluate soft settings with causal, walk-forward trade evidence."""
+    """Run a transparent policy-research lifecycle from actual broker outcomes."""
 
     def __init__(self, settings: TradeSettings):
         self.settings = settings
+        self.hypotheses = HypothesisEngine()
+        self.generator = PolicyGenerator()
 
     @staticmethod
     def _version_number(version: str) -> int:
@@ -36,49 +46,11 @@ class SelfOptimizer:
 
     @staticmethod
     def _metric(rows: list[dict]) -> dict:
-        """Compute a risk-adjusted objective from completed trade R outcomes."""
-        values = [float(row["pnl_r"]) for row in rows if row.get("pnl_r") is not None]
-        if not values:
-            return {
-                "sample_size": 0,
-                "expectancy_r": 0.0,
-                "profit_factor": 0.0,
-                "win_rate": 0.0,
-                "max_drawdown_r": 0.0,
-                "stdev_r": 0.0,
-                "objective": float("-inf"),
-            }
-        wins = [value for value in values if value > 0]
-        losses = [value for value in values if value < 0]
-        gross_profit = sum(wins)
-        gross_loss = abs(sum(losses))
-        profit_factor = gross_profit / gross_loss if gross_loss else (3.0 if gross_profit else 0.0)
-        running, high_water, max_drawdown = 0.0, 0.0, 0.0
-        for value in values:
-            running += value
-            high_water = max(high_water, running)
-            max_drawdown = max(max_drawdown, high_water - running)
-        expectation = mean(values)
-        stdev = pstdev(values) if len(values) > 1 else 0.0
-        # Favor expected R and profitability, penalizing drawdown and unstable
-        # outcomes. Capping PF avoids an isolated loss-free sample dominating.
-        objective = expectation + 0.20 * min(profit_factor, 3.0) + 0.10 * (len(wins) / len(values)) - 0.30 * max_drawdown - 0.10 * stdev
-        return {
-            "sample_size": len(values),
-            "expectancy_r": expectation,
-            "profit_factor": profit_factor,
-            "win_rate": len(wins) / len(values) * 100,
-            "max_drawdown_r": max_drawdown,
-            "stdev_r": stdev,
-            "objective": objective,
-        }
-
-    @staticmethod
-    def _rows_for_threshold(rows: list[dict], threshold: float) -> list[dict]:
-        return [row for row in rows if float(row.get("score") or 0.0) >= threshold]
+        """Backward-compatible multi-metric evaluation based on completed R outcomes."""
+        return PolicyEvaluator.evaluate(rows).to_dict()
 
     def _windows(self, rows: list[dict]) -> Optional[tuple[list[dict], list[dict], list[dict], dict]]:
-        """Split chronologically into train, validation, and unseen OOS slices."""
+        """Split chronological outcomes into training, validation, and unseen OOS data."""
         ordered = sorted(rows, key=lambda item: item["timestamp"])
         minimum = max(self.settings.optimization_min_sample_size, self.settings.optimization_min_split_size * 3)
         if len(ordered) < minimum:
@@ -91,7 +63,7 @@ class SelfOptimizer:
         min_split = self.settings.optimization_min_split_size
         if min(len(train), len(validation), len(out_of_sample)) < min_split:
             return None
-        windows = {
+        return train, validation, out_of_sample, {
             "training_start": train[0]["timestamp"],
             "training_end": train[-1]["timestamp"],
             "validation_start": validation[0]["timestamp"],
@@ -99,293 +71,359 @@ class SelfOptimizer:
             "out_of_sample_start": out_of_sample[0]["timestamp"],
             "out_of_sample_end": out_of_sample[-1]["timestamp"],
         }
-        return train, validation, out_of_sample, windows
-
-    def _candidate_thresholds(self, rows: list[dict]) -> list[float]:
-        scores = sorted({float(row.get("score") or 0.0) for row in rows})
-        if not scores:
-            return [0.0]
-        quantiles = [0.0, 0.25, 0.50]
-        thresholds = {max(0.0, self.settings.min_setup_score)}
-        for quantile in quantiles:
-            index = min(len(scores) - 1, int((len(scores) - 1) * quantile))
-            thresholds.add(scores[index])
-        return sorted(thresholds)
-
-    def _bounded_parameters(self, threshold: float, validation_metric: dict) -> dict:
-        """Derive experimental policy variables for trade policy discovery.
-
-        The optimizer tests and evolves risk per trade, RR ratio, daily limits,
-        and entry scores based on walk-forward out-of-sample performance rather
-        than predetermined conservative assumptions.
-        """
-        expectancy = validation_metric["expectancy_r"]
-        drawdown = validation_metric["max_drawdown_r"]
-
-        if expectancy > 0.5 and drawdown < 2.0:
-            explored_risk = min(5.0, self.settings.risk_per_trade * 1.25)
-            explored_rr = min(5.0, self.settings.min_rr_ratio * 1.10)
-        elif expectancy <= 0 or drawdown > 3.0:
-            explored_risk = max(0.10, self.settings.risk_per_trade * 0.75)
-            explored_rr = max(1.5, self.settings.min_rr_ratio * 0.90)
-        else:
-            explored_risk = self.settings.risk_per_trade
-            explored_rr = self.settings.min_rr_ratio
-
-        return {
-            "min_setup_score": max(0.0, float(threshold)),
-            "preferred_risk_pct": float(explored_risk),
-            "risk_per_trade": float(explored_risk),
-            "min_rr_ratio": float(explored_rr),
-            "preferred_max_trades_per_day": max(1, int(self.settings.max_trades_per_day)),
-        }
 
     @staticmethod
-    def _apply_parameters(settings: TradeSettings, parameters: dict) -> None:
-        """Apply experimentally discovered trading policy variables."""
-        settings.min_setup_score = max(0.0, float(parameters.get("min_setup_score", settings.min_setup_score)))
-        settings.score_threshold = settings.min_setup_score
-        settings.preferred_risk_pct = max(0.05, float(parameters.get("preferred_risk_pct", settings.preferred_risk_pct)))
-        settings.risk_per_trade = settings.preferred_risk_pct
-        settings.min_rr_ratio = max(1.0, float(parameters.get("min_rr_ratio", settings.min_rr_ratio)))
-        settings.preferred_max_trades_per_day = max(1, int(parameters.get("preferred_max_trades_per_day", settings.preferred_max_trades_per_day)))
+    def _policy_rows(rows: list[dict], policy: ExperimentalPolicy) -> list[dict]:
+        eligible: list[dict] = []
+        for row in rows:
+            accepted, _ = policy.accepts(
+                score=float(row.get("score") or 0.0),
+                rr_ratio=float(row.get("rr_ratio") or 0.0),
+                features=row.get("features") or {},
+            )
+            if accepted:
+                eligible.append(row)
+        return eligible
+
+    @staticmethod
+    def _historical_simulation(rows: list[dict], policy: ExperimentalPolicy) -> dict:
+        """Report a clearly hypothetical risk-sizing simulation from actual R outcomes.
+
+        Actual trade outcomes are never relabeled as policy outcomes.  This is
+        only used to rank candidates before forward DEMO testing.
+        """
+        risk_pct = policy.risk_pct or 0.0
+        scaled = [{**row, "pnl_r": float(row["pnl_r"]) * risk_pct} for row in rows if row.get("pnl_r") is not None]
+        evaluation = PolicyEvaluator.evaluate(scaled).to_dict()
+        evaluation["basis"] = "hypothetical_risk_scaling_from_actual_R_outcomes"
+        evaluation["risk_pct"] = risk_pct
+        return evaluation
+
+    def _evaluate_policy(self, policy: ExperimentalPolicy, train: list[dict], validation: list[dict], oos: list[dict]) -> dict:
+        slices = {"training": train, "validation": validation, "out_of_sample": oos}
+        evidence: dict[str, Any] = {"policy": policy.to_dict(), "policy_fingerprint": policy.fingerprint}
+        for name, rows in slices.items():
+            eligible = self._policy_rows(rows, policy)
+            evidence[name] = PolicyEvaluator.evaluate(eligible).to_dict()
+            evidence[f"{name}_hypothetical_risk_simulation"] = self._historical_simulation(eligible, policy)
+        return evidence
+
+    @staticmethod
+    def _finite_objective(metric: dict) -> float:
+        value = float(metric.get("objective", float("-inf")))
+        return value if math.isfinite(value) else float("-inf")
 
     async def _ensure_champion(self, account_mode: str) -> dict:
         champion = await db.get_active_model(account_mode)
         if champion:
             return champion
-        parameters = {
-            "min_setup_score": self.settings.min_setup_score,
-            "preferred_risk_pct": min(self.settings.preferred_risk_pct, self.settings.max_setup_risk_pct, 1.0),
-            "preferred_max_trades_per_day": self.settings.preferred_max_trades_per_day,
-        }
+        # This seed starts research; it is not a permanent restriction or a
+        # claim that its policy is optimal.
+        seed = ExperimentalPolicy(
+            entry_model="hybrid", required_features=(), score_floor=None,
+            rr_target=None, risk_model="fixed_pct", risk_pct=self.settings.risk_per_trade,
+            stop_model="structural", target_model="liquidity", max_layers=0,
+            trailing_model="structural", breakeven_model="rr", breakeven_trigger_r=1.0,
+        )
         version = "model_v001"
         await db.create_model_version(
             account_mode=account_mode,
             version=version,
             role="champion",
             status="active",
-            parameters=parameters,
-            performance={"sample_size": 0, "objective": None},
-            reason="Initial baseline; no optimization evidence yet.",
+            parameters=seed.to_dict(),
+            performance={"sample_size": 0, "objective": None, "basis": "research_seed"},
+            reason="Research seed; no policy superiority has yet been established.",
             promoted=True,
         )
         self.settings.active_model_version = version
         await db.save_settings(self.settings)
-        return await db.get_active_model(account_mode) or {"version": version, "parameters": parameters, "performance": {}}
+        return await db.get_active_model(account_mode) or {"version": version, "parameters": seed.to_dict(), "performance": {}}
+
+    async def active_policy(self, account_mode: Optional[str] = None) -> tuple[ExperimentalPolicy, Optional[int], str]:
+        """Return the forward-DEMO challenger when assigned, otherwise champion policy."""
+        account_mode = account_mode or self.settings.trading_mode
+        if account_mode == "demo":
+            experiment = await db.get_active_forward_experiment(account_mode)
+            if experiment:
+                return ExperimentalPolicy.from_dict(experiment["policy"]), int(experiment["id"]), str(experiment.get("model_version") or "")
+        champion = await self._ensure_champion(account_mode)
+        return ExperimentalPolicy.from_dict(champion["parameters"]), None, champion["version"]
+
+    async def _persist_hypotheses(self, account_mode: str, rows: list[dict]) -> list[tuple[Hypothesis, int]]:
+        result: list[tuple[Hypothesis, int]] = []
+        for hypothesis in self.hypotheses.generate(rows):
+            hypothesis_id = await db.upsert_research_hypothesis(
+                account_mode=account_mode,
+                hypothesis_key=hypothesis.key,
+                statement=hypothesis.statement,
+                source=hypothesis.source,
+                feature_name=hypothesis.feature,
+                candidate_values=hypothesis.candidate_values,
+                evidence=hypothesis.evidence,
+            )
+            result.append((hypothesis, hypothesis_id))
+        return result
+
+    async def _evaluate_forward_experiment(self, champion: dict, experiment: dict) -> Optional[dict]:
+        """Promote/reject only after actual broker-realized DEMO results are sufficient."""
+        rows = await db.get_policy_trade_outcomes(
+            account_mode="demo", experiment_id=int(experiment["id"]), days=365
+        )
+        minimum = self.settings.optimization_min_split_size
+        if len(rows) < minimum:
+            return {
+                "decision": "forward_demo_collecting",
+                "champion": champion["version"],
+                "experiment_id": experiment["id"],
+                "observations": len(rows),
+                "required": minimum,
+                "reason": "Forward DEMO evidence is still accumulating from broker-realized trade outcomes.",
+            }
+        experiment_policy = ExperimentalPolicy.from_dict(experiment.get("policy") or {})
+        realized = self._historical_simulation(rows, experiment_policy)
+        historical = experiment.get("evaluation") or {}
+        champion_performance = champion.get("performance") or {}
+        benchmark = float(
+            champion_performance.get("forward_demo", {}).get(
+                "objective",
+                champion_performance.get("out_of_sample_hypothetical_risk_simulation", {}).get("objective", float("-inf")),
+            )
+        )
+        if not math.isfinite(benchmark):
+            benchmark = float("-inf")
+        candidate_objective = self._finite_objective(realized)
+        promoted = candidate_objective >= benchmark + self.settings.optimization_min_improvement and realized["expectancy_r"] > 0
+        if promoted:
+            performance = {**historical, "forward_demo": realized}
+            await db.activate_model_version(experiment["model_version"], account_mode="demo", previous_version=champion["version"])
+            await db.update_policy_experiment(
+                int(experiment["id"]), status="promoted", evaluation=performance,
+                reason="Forward DEMO results improved the champion benchmark using actual broker outcomes.",
+                model_version=experiment["model_version"],
+            )
+            self.settings.active_model_version = experiment["model_version"]
+            await db.save_settings(self.settings)
+            result = {
+                "decision": "promoted",
+                "champion": champion["version"],
+                "challenger": experiment["model_version"],
+                "experiment_id": experiment["id"],
+                "forward_demo": realized,
+                "reason": "Challenger promotion follows sufficient positive broker-realized DEMO evidence.",
+            }
+        else:
+            await db.update_policy_experiment(
+                int(experiment["id"]), status="rejected", evaluation={**historical, "forward_demo": realized},
+                reason="Forward DEMO did not demonstrate the required improvement over the current champion.",
+            )
+            result = {
+                "decision": "rejected",
+                "champion": champion["version"],
+                "challenger": experiment["model_version"],
+                "experiment_id": experiment["id"],
+                "forward_demo": realized,
+                "reason": "Challenger was rejected after actual forward-DEMO evidence, not because it looked aggressive or unfamiliar.",
+            }
+        await db.log_optimization_run(
+            account_mode="demo", decision=result["decision"], details=result,
+            champion_version=champion["version"], challenger_version=experiment.get("model_version"),
+        )
+        return result
 
     async def run_optimization(self, account_mode: Optional[str] = None) -> dict:
-        """Run one evidence-gated champion/challenger evaluation cycle."""
+        """Advance one transparent research cycle. No LIVE policy changes are allowed."""
         account_mode = account_mode or self.settings.trading_mode
         champion = await self._ensure_champion(account_mode)
         if account_mode != "demo":
             result = {
                 "decision": "live_optimization_blocked",
-                "reason": "Model experimentation and promotion are restricted to DEMO/backtesting; LIVE remains observational.",
                 "champion": champion["version"],
+                "reason": "Policy experimentation, promotion, and forward testing are restricted to DEMO; LIVE is observational only.",
             }
             await db.log_optimization_run(account_mode=account_mode, decision=result["decision"], details=result, champion_version=champion["version"])
             return result
         if not self.settings.self_optimization_enabled:
-            result = {"decision": "disabled", "reason": "Self-optimization is disabled by settings.", "champion": champion["version"]}
-            await db.log_optimization_run(account_mode=account_mode, decision="disabled", details=result, champion_version=champion["version"])
+            return {"decision": "disabled", "champion": champion["version"], "reason": "Research engine is disabled by settings."}
+
+        active = await db.get_active_forward_experiment("demo")
+        if active:
+            result = await self._evaluate_forward_experiment(champion, active)
+            assert result is not None
             return result
 
-        rows = [
-            row for row in await db.get_recent_trades(days=365, account_mode=account_mode)
-            if row.get("pnl_r") is not None and row.get("status") == "closed"
-        ]
+        rows = await db.get_policy_trade_outcomes(account_mode="demo", days=365)
+        hypotheses = await self._persist_hypotheses("demo", rows)
         split = self._windows(rows)
         if split is None:
+            required = max(self.settings.optimization_min_sample_size, self.settings.optimization_min_split_size * 3)
             result = {
                 "decision": "no_change_insufficient_evidence",
-                "reason": f"Need at least {max(self.settings.optimization_min_sample_size, self.settings.optimization_min_split_size * 3)} completed R-recorded trades for a walk-forward test.",
-                "observations": len(rows),
                 "champion": champion["version"],
+                "observations": len(rows),
+                "required": required,
+                "hypotheses_generated": len(hypotheses),
+                "reason": "Hypotheses have been recorded; more completed broker-realized DEMO outcomes are required for chronological policy evaluation.",
             }
-            await db.log_optimization_run(account_mode=account_mode, decision=result["decision"], details=result, champion_version=champion["version"])
+            await db.log_optimization_run(account_mode="demo", decision=result["decision"], details=result, champion_version=champion["version"])
             return result
 
         train, validation, oos, windows = split
-        baseline_threshold = float(champion["parameters"].get("min_setup_score", self.settings.min_setup_score))
-        baseline = {
-            "training": self._metric(self._rows_for_threshold(train, baseline_threshold)),
-            "validation": self._metric(self._rows_for_threshold(validation, baseline_threshold)),
-            "out_of_sample": self._metric(self._rows_for_threshold(oos, baseline_threshold)),
-        }
-
+        champion_policy = ExperimentalPolicy.from_dict(champion["parameters"])
+        baseline = self._evaluate_policy(champion_policy, train, validation, oos)
+        candidates = self.generator.generate([hypothesis for hypothesis, _ in hypotheses])
+        min_split = self.settings.optimization_min_split_size
         best: Optional[dict] = None
-        for threshold in self._candidate_thresholds(train):
-            metrics = {
-                "training": self._metric(self._rows_for_threshold(train, threshold)),
-                "validation": self._metric(self._rows_for_threshold(validation, threshold)),
-                "out_of_sample": self._metric(self._rows_for_threshold(oos, threshold)),
-            }
-            if min(metrics[name]["sample_size"] for name in metrics) < self.settings.optimization_min_split_size:
+        for policy in candidates:
+            if policy.fingerprint == champion_policy.fingerprint:
                 continue
-            if metrics["validation"]["objective"] <= 0:
+            evidence = self._evaluate_policy(policy, train, validation, oos)
+            if min(evidence[name]["sample_size"] for name in ("training", "validation", "out_of_sample")) < min_split:
                 continue
-            candidate = {"threshold": threshold, "metrics": metrics}
-            if best is None or candidate["metrics"]["validation"]["objective"] > best["metrics"]["validation"]["objective"]:
-                best = candidate
-
+            validation_metric = evidence["validation_hypothetical_risk_simulation"]
+            if self._finite_objective(validation_metric) <= 0:
+                continue
+            if best is None or self._finite_objective(validation_metric) > self._finite_objective(best["evidence"]["validation_hypothetical_risk_simulation"]):
+                best = {"policy": policy, "evidence": evidence}
         if best is None:
             result = {
                 "decision": "no_change_no_valid_challenger",
-                "reason": "No threshold produced sufficient positive validation evidence across all chronological windows.",
                 "champion": champion["version"],
                 "baseline": baseline,
+                "reason": "No independently specified policy had sufficient positive validation evidence across all chronological windows.",
             }
-            await db.log_optimization_run(account_mode=account_mode, decision=result["decision"], details=result, champion_version=champion["version"])
+            await db.log_optimization_run(account_mode="demo", decision=result["decision"], details=result, champion_version=champion["version"])
             return result
 
-        parameters = self._bounded_parameters(best["threshold"], best["metrics"]["validation"])
-        current_number = self._version_number(champion["version"])
-        challenger_version = f"model_v{current_number + 1:03d}"
-        challenger_performance = {"baseline": baseline, **best["metrics"]}
-        improvement = best["metrics"]["out_of_sample"]["objective"] - baseline["out_of_sample"]["objective"]
-        drawdown_ok = best["metrics"]["out_of_sample"]["max_drawdown_r"] <= baseline["out_of_sample"]["max_drawdown_r"] + self.settings.optimization_rollback_tolerance
-        promote = (
-            improvement >= self.settings.optimization_min_improvement
-            and drawdown_ok
-            and best["metrics"]["out_of_sample"]["expectancy_r"] > 0
-        )
+        improvement = self._finite_objective(best["evidence"]["out_of_sample_hypothetical_risk_simulation"]) - self._finite_objective(baseline["out_of_sample_hypothetical_risk_simulation"])
+        if improvement < self.settings.optimization_min_improvement:
+            result = {
+                "decision": "rejected_historical",
+                "champion": champion["version"],
+                "baseline": baseline,
+                "challenger": best["evidence"],
+                "improvement": improvement,
+                "reason": "Candidate did not improve the unseen historical objective enough to justify forward-DEMO allocation.",
+            }
+            await db.log_optimization_run(account_mode="demo", decision=result["decision"], details=result, champion_version=champion["version"])
+            return result
+
+        version = f"model_v{self._version_number(champion['version']) + 1:03d}"
         await db.create_model_version(
-            account_mode=account_mode,
-            version=challenger_version,
-            role="challenger",
-            status="evaluated",
-            previous_version=champion["version"],
-            parameters=parameters,
-            performance=challenger_performance,
-            reason="Walk-forward challenger evaluated against active champion.",
-            windows=windows,
-            promoted=False,
+            account_mode="demo", version=version, role="challenger", status="forward_demo",
+            previous_version=champion["version"], parameters=best["policy"].to_dict(),
+            performance=best["evidence"], reason="Historical train/validation/OOS candidate assigned to isolated forward-DEMO test.",
+            windows=windows, promoted=False,
         )
-
-        if promote:
-            await db.activate_model_version(challenger_version, account_mode=account_mode, previous_version=champion["version"])
-            self._apply_parameters(self.settings, parameters)
-            self.settings.active_model_version = challenger_version
-            self.settings.last_optimization_date = datetime.utcnow().isoformat()
-            await db.save_settings(self.settings)
-            decision = "promoted"
-            reason = "Challenger improved the unseen risk-adjusted objective with acceptable drawdown."
-        else:
-            decision = "rejected"
-            reason = "Challenger did not demonstrate sufficient unseen risk-adjusted improvement or drawdown control."
-
+        experiment_id = await db.create_policy_experiment(
+            account_mode="demo", policy_fingerprint=best["policy"].fingerprint,
+            policy=best["policy"].to_dict(), status="forward_demo", model_version=version,
+            reason="Independent challenger reached the forward-DEMO stage after chronological historical evidence.",
+        )
+        await db.update_policy_experiment(
+            experiment_id, status="forward_demo", evaluation=best["evidence"],
+            reason="Forward DEMO active: collect broker-realized outcomes before promotion decision.", model_version=version,
+        )
         result = {
-            "decision": decision,
-            "reason": reason,
+            "decision": "forward_demo_started",
             "champion": champion["version"],
-            "challenger": challenger_version,
-            "improvement": improvement,
+            "challenger": version,
+            "experiment_id": experiment_id,
+            "hypotheses_generated": len(hypotheses),
             "baseline": baseline,
-            "challenger_metrics": best["metrics"],
-            "parameters": parameters,
+            "challenger_evidence": best["evidence"],
+            "improvement": improvement,
+            "reason": "The challenger passed chronological historical evidence and is now isolated for DEMO forward testing; it is not a champion yet.",
         }
         await db.log_optimization_run(
-            account_mode=account_mode,
-            decision=decision,
-            details=result,
-            champion_version=champion["version"],
-            challenger_version=challenger_version,
+            account_mode="demo", decision=result["decision"], details=result,
+            champion_version=champion["version"], challenger_version=version,
         )
         return result
 
     async def evaluate_rollback(self, account_mode: Optional[str] = None) -> Optional[dict]:
-        """Rollback a promoted model only after enough post-promotion outcomes."""
+        """Rollback a promoted DEMO champion when subsequent actual evidence deteriorates."""
         account_mode = account_mode or self.settings.trading_mode
-        champion = await db.get_active_model(account_mode)
+        if account_mode != "demo":
+            return None
+        champion = await db.get_active_model("demo")
         if not champion or not champion.get("previous_version") or not champion.get("promoted_at"):
             return None
         rows = [
-            row for row in await db.get_recent_trades(days=365, account_mode=account_mode)
-            if row.get("pnl_r") is not None and row.get("status") == "closed" and row["timestamp"] >= champion["promoted_at"]
+            row for row in await db.get_policy_trade_outcomes(account_mode="demo", days=365, policy_version=champion["version"])
+            if row["timestamp"] >= champion["promoted_at"]
         ]
         if len(rows) < self.settings.optimization_min_split_size:
             return None
-        realized = self._metric(rows)
-        benchmark = float((champion.get("performance") or {}).get("out_of_sample", {}).get("expectancy_r", 0.0))
+        champion_policy = ExperimentalPolicy.from_dict(champion.get("parameters") or {})
+        realized = self._historical_simulation(rows, champion_policy)
+        benchmark = float((champion.get("performance") or {}).get("forward_demo", {}).get("expectancy_r", 0.0))
         if realized["expectancy_r"] >= benchmark - self.settings.optimization_rollback_tolerance and realized["expectancy_r"] >= 0:
             return None
-        previous = await db.get_model_version(champion["previous_version"], account_mode)
+        previous = await db.get_model_version(champion["previous_version"], "demo")
         if not previous:
             return None
-        await db.activate_model_version(previous["version"], account_mode=account_mode, previous_version=champion["version"])
-        self._apply_parameters(self.settings, previous["parameters"])
+        await db.activate_model_version(previous["version"], account_mode="demo", previous_version=champion["version"])
         self.settings.active_model_version = previous["version"]
         await db.save_settings(self.settings)
         result = {
-            "decision": "rolled_back",
-            "from_version": champion["version"],
-            "to_version": previous["version"],
-            "realized": realized,
-            "benchmark_expectancy_r": benchmark,
+            "decision": "rolled_back", "from_version": champion["version"], "to_version": previous["version"],
+            "realized": realized, "benchmark_expectancy_r": benchmark,
+            "reason": "Post-promotion actual DEMO evidence deteriorated relative to the approved forward-DEMO benchmark.",
         }
         await db.log_optimization_run(
-            account_mode=account_mode,
-            decision="rolled_back",
-            details=result,
-            champion_version=previous["version"],
-            challenger_version=champion["version"],
+            account_mode="demo", decision="rolled_back", details=result,
+            champion_version=previous["version"], challenger_version=champion["version"],
         )
         return result
 
     async def generate_daily_journal(self, account_mode: Optional[str] = None) -> str:
-        """Produce a factual daily learning report, combining internal telemetry and web wisdom."""
+        """Generate a factual, plain-English daily research report from stored evidence."""
         account_mode = account_mode or self.settings.trading_mode
         performance = await db.get_performance_summary(account_mode, days=1)
-        recent = await db.get_recent_trades(days=1, account_mode=account_mode)
-        model = await self._ensure_champion(account_mode)
+        recent = await db.get_policy_trade_outcomes(account_mode=account_mode, days=1)
+        champion = await self._ensure_champion(account_mode)
+        challenger = await db.get_active_forward_experiment(account_mode)
         decisions = await db.get_recent_optimization_runs(account_mode, limit=1)
+        hypotheses = await db.get_open_hypotheses(account_mode)
 
-        from analysis.wisdom import GlobalWisdomEngine
-        wisdom = GlobalWisdomEngine().fetch_market_wisdom()
-
-        symbol_pnl: dict[str, float] = {}
-        setup_outcomes: dict[str, list[float]] = {}
+        by_symbol: dict[str, list[float]] = {}
+        by_setup: dict[str, list[float]] = {}
         for trade in recent:
-            if trade.get("status") != "closed":
-                continue
-            symbol_pnl[trade["symbol"]] = symbol_pnl.get(trade["symbol"], 0.0) + float(trade.get("pnl") or 0.0)
+            by_symbol.setdefault(trade["symbol"], []).append(float(trade["pnl_r"]))
             try:
                 raw = json.loads(trade.get("raw_signal") or "{}")
-                setup = raw.get("setup_type", "Unclassified")
-                if trade.get("pnl_r") is not None:
-                    setup_outcomes.setdefault(setup, []).append(float(trade["pnl_r"]))
+                by_setup.setdefault(raw.get("setup_type", "Unclassified"), []).append(float(trade["pnl_r"]))
             except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-
-        best_symbol = max(symbol_pnl, key=symbol_pnl.get) if symbol_pnl else "No closed trades"
-        worst_symbol = min(symbol_pnl, key=symbol_pnl.get) if symbol_pnl else "No closed trades"
-        best_setup = max(setup_outcomes, key=lambda key: mean(setup_outcomes[key])) if setup_outcomes else "Insufficient completed outcomes"
-        decision_text = decisions[0]["decision"] if decisions else "No optimization run recorded"
-        profit_factor = "N/A" if math.isinf(performance["profit_factor"]) else f"{performance['profit_factor']:.2f}"
+                by_setup.setdefault("Unclassified", []).append(float(trade["pnl_r"]))
+        best_symbol = max(by_symbol, key=lambda key: mean(by_symbol[key])) if by_symbol else "Insufficient completed outcomes"
+        worst_symbol = min(by_symbol, key=lambda key: mean(by_symbol[key])) if by_symbol else "Insufficient completed outcomes"
+        best_setup = max(by_setup, key=lambda key: mean(by_setup[key])) if by_setup else "Insufficient completed outcomes"
+        worst_setup = min(by_setup, key=lambda key: mean(by_setup[key])) if by_setup else "Insufficient completed outcomes"
+        daily_metric = PolicyEvaluator.evaluate(recent).to_dict()
+        profit_factor = "N/A" if not math.isfinite(daily_metric["profit_factor"]) else f"{daily_metric['profit_factor']:.2f}"
+        decision = decisions[0]["decision"] if decisions else "No research decision recorded"
+        policy = ExperimentalPolicy.from_dict(champion["parameters"])
+        challenger_text = challenger.get("model_version", "No forward challenger") if challenger else "No forward challenger"
+        next_hypothesis = hypotheses[0]["statement"] if hypotheses else "Generate additional evidence from completed DEMO trades."
 
         return "\n".join([
-            f"📖 **TRADER'S DAILY JOURNAL & LEARNING LOG — {datetime.utcnow().date().isoformat()}**",
-            f"Mode: `{account_mode.upper()}` | Apprentice Level | Model: `{model['version']}`",
+            f"📖 **MORNING LEARNING REPORT — {datetime.utcnow().date().isoformat()}**",
+            f"Mode: `{account_mode.upper()}` | Equity P/L: `${performance['pnl']:.2f}` | Closed trades: `{performance['trades']}`",
+            f"Expectancy: `{daily_metric['expectancy_r']:.2f}R` | Profit factor: `{profit_factor}` | Drawdown: `{daily_metric['max_drawdown_r']:.2f}R`",
             "",
-            "**Today's Journey & Market Reflections**",
-            f"Today, I immersed myself in the charts across our active Deriv Synthetic Indices and XAUUSDmicro. Every candle told a story of liquidity, displacement, and structural intent. I traded actively, tested setup variants, and recorded every win and lesson.",
+            "**Market Evidence**",
+            f"Best market today: `{best_symbol}`. Most difficult market today: `{worst_symbol}`.",
+            f"Best observed setup: `{best_setup}`. Weakest observed setup: `{worst_setup}`.",
             "",
-            "**Measured Performance & Metrics**",
-            f"Closed trades: `{performance['trades']}` | Net P/L: `${performance['pnl']:.2f}` | Win rate: `{performance['win_rate']:.1f}%`",
-            f"Average trade P/L: `${performance['average_pnl']:.2f}` | Profit factor: `{profit_factor}` | Max drawdown: `${performance['max_drawdown']:.2f}`",
+            "**Policy Research State**",
+            f"Current Champion: `{champion['version']}`. Forward challenger: `{challenger_text}`.",
+            f"Champion policy: entry `{policy.entry_model}`, risk `{policy.risk_model}` at `{policy.risk_pct}%`, RR `{policy.rr_target or 'market-derived'}`, layers `{policy.max_layers}`, management `{policy.trailing_model}`.",
+            f"Latest research decision: `{decision}`.",
             "",
-            "**What I Learned Today (Self-Reflection)**",
-            f"• Strongest market behavior observed on: `{best_symbol}`.",
-            f"• Most challenging market conditions on: `{worst_symbol}`.",
-            f"• Most consistent setup archetype: `{best_setup}`.",
-            "",
-            "**Global Wisdom & Web Ingestion**",
-            f"• Gold (XAUUSD): {wisdom.get('gold_insight')}",
-            f"• Deriv Synthetics: {wisdom.get('synthetics_insight')}",
-            "",
-            "**Strategy & Adaptation Status**",
-            f"Latest optimization decision: `{decision_text}`. I am evolving step-by-step from day-one apprentice toward professional mastery, learning from both internal trade telemetry and global web intelligence.",
+            "**What Changed and What Did Not**",
+            "A policy only changes after chronological historical evidence and actual broker-realized forward-DEMO results. No LIVE policy has been changed automatically.",
+            f"Next falsifiable experiment: {next_hypothesis}",
         ])
 
 

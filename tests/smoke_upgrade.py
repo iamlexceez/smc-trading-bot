@@ -28,6 +28,7 @@ from storage import db
 from data.universe import DerivMarketUniverse
 from data.provider import DataProvider
 from analysis.optimizer import SelfOptimizer
+from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
 from bot.handlers import BotHandlers  # noqa: F401 — validates Telegram control imports.
 
@@ -78,6 +79,11 @@ def test_risk_sizing_and_layers() -> None:
     )
     assert_true(sizing.valid, f"sizing failed: {sizing.reason}")
     assert_true(sizing.expected_loss <= sizing.risk_amount + 1e-6, "sizing exceeded budget")
+    fixed_volume = manager.calculate_position_sizing(
+        account_equity=10_000, free_margin=8_000, entry_price=100.0, stop_loss=98.0,
+        symbol_info=symbol_info, leverage=100, risk_model="fixed_volume", fixed_volume=2.5,
+    )
+    assert_true(fixed_volume.valid and fixed_volume.final_volume == 2.5, "fixed-volume policy was not broker-normalized correctly")
     layers = manager.get_layering_plan(sizing.final_volume, 100.0, 98.0, symbol_info)
     assert_true(bool(layers), "layer plan is empty")
     assert_true(sum(layer["lot"] for layer in layers) <= sizing.final_volume + 1e-6, "layers exceed total volume")
@@ -275,6 +281,41 @@ async def test_model_governance_persistence() -> None:
     assert_true(metric["expectancy_r"] == 0.25 and metric["max_drawdown_r"] == 0.5, "risk-adjusted objective metrics are incorrect")
 
 
+async def test_experiment_engine_persistence() -> None:
+    policy = ExperimentalPolicy(
+        entry_model="hybrid", required_features=("liquidity_sweep",),
+        risk_pct=7.5, rr_target=1.25, max_layers=2,
+        layer_style="retracement", max_trades_per_day=None,
+        daily_stop_model="none", daily_target_model="none",
+    )
+    accepted, _ = policy.accepts(score=0.0, rr_ratio=1.5, features={"liquidity_sweep": True})
+    rejected, _ = policy.accepts(score=0.0, rr_ratio=1.5, features={"liquidity_sweep": False})
+    assert_true(accepted and not rejected, "policy feature hypotheses were not applied explicitly")
+    policies = PolicyGenerator().generate(HypothesisEngine().generate([]), limit=100)
+    assert_true(any(item.risk_pct == 7.5 for item in policies), "risk search space omitted aggressive experimental values")
+    evaluation = PolicyEvaluator.evaluate([{"pnl_r": 2.0}, {"pnl_r": -1.0}, {"pnl_r": 1.0}])
+    assert_true(evaluation.sample_size == 3 and evaluation.expectancy_r > 0, "policy evaluation did not use actual R outcomes")
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "experiments.db")
+        await db.init_db(path)
+        hypothesis_id = await db.upsert_research_hypothesis(
+            account_mode="demo", hypothesis_key="rr_policy", statement="Test RR values",
+            source="smoke", feature_name=None, candidate_values=[1.0, 2.0], db_path=path,
+        )
+        experiment_id = await db.create_policy_experiment(
+            account_mode="demo", policy_fingerprint=policy.fingerprint, policy=policy.to_dict(),
+            hypothesis_id=hypothesis_id, status="forward_demo", model_version="model_v002",
+            reason="Smoke forward DEMO", db_path=path,
+        )
+        await db.update_policy_experiment(
+            experiment_id, status="forward_demo", evaluation={"out_of_sample": evaluation.to_dict()},
+            reason="Collecting actual DEMO outcomes", model_version="model_v002", db_path=path,
+        )
+        active = await db.get_active_forward_experiment("demo", path)
+        assert_true(active and active["id"] == experiment_id and active["policy"]["risk_pct"] == 7.5, "forward DEMO policy assignment was not persisted")
+
+
 async def test_chart_activity_notifications() -> None:
     class FakeBot:
         def __init__(self) -> None:
@@ -335,6 +376,7 @@ def run() -> None:
     asyncio.run(test_basket_persistence())
     asyncio.run(test_learning_telemetry_persistence())
     asyncio.run(test_model_governance_persistence())
+    asyncio.run(test_experiment_engine_persistence())
     asyncio.run(test_chart_activity_notifications())
     asyncio.run(test_demo_live_partitioning())
     print("PASS: upgrade smoke tests")

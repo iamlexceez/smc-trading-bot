@@ -193,9 +193,10 @@ class MarketScheduler:
         }
 
     @staticmethod
-    def _feature_snapshot(df, structure, htf_structures, atr_value: float) -> dict:
-        """Capture observable market state only at the closed-candle decision point."""
+    def _feature_snapshot(df, structure, htf_structures, atr_value: float, validation=None) -> dict:
+        """Capture observable closed-candle state and testable SMC feature flags."""
         event = structure.last_event
+        checks = {check.name: bool(check.passed) for check in getattr(validation, "checks", [])}
         return {
             "bar_time": str(df.iloc[-1]["time"]),
             "close": float(df.iloc[-1]["close"]),
@@ -206,6 +207,16 @@ class MarketScheduler:
             "structure_event_index": int(event.index),
             "htf_trends": [item.trend.value for item in htf_structures],
             "htf_events": [item.last_event.event_type.value for item in htf_structures],
+            "htf_context": checks.get("HTF context", False),
+            "meaningful_liquidity": checks.get("Meaningful liquidity", False),
+            "liquidity_sweep": checks.get("Liquidity sweep", False),
+            "directional_displacement": checks.get("Directional displacement", False),
+            "bos_choch": checks.get("BOS/CHOCH confirmation", False),
+            "zone_retest": checks.get("Retracement into valid zone", False),
+            "zone_order_block": getattr(getattr(validation, "zone", None), "source", "") == "order_block",
+            "zone_fvg": getattr(getattr(validation, "zone", None), "source", "") == "fvg",
+            "zone_supply_demand": getattr(getattr(validation, "zone", None), "source", "") == "supply_demand",
+            "ltf_confirmation": checks.get("LTF confirmation", False),
         }
 
     async def _evaluate_counterfactuals(self, symbol: str, timeframe: str, df) -> None:
@@ -269,6 +280,8 @@ class MarketScheduler:
         Returns a TradeSignal if a tradeable setup is found, else None.
         """
         await self._reload_settings()
+        self.optimizer.settings = self.settings
+        policy, experiment_id, policy_version = await self.optimizer.active_policy(self.settings.trading_mode)
         if symbol not in self.settings.enabled_symbols:
             logger.warning("Skipping non-active broker symbol %s", symbol)
             return None
@@ -344,18 +357,12 @@ class MarketScheduler:
             else:
                 return None  # No clear direction
 
-        # Select the permitted entry model. Earlier modes do not relax the
-        # required HTF → sweep → displacement → structure → zone → real-target
-        # chain; they only change whether an additional LTF candle confirmation
-        # is mandatory.
+        # The active experimental policy chooses how the observed market features
+        # are used.  No global SMC sequence is universally required in DEMO.
         try:
-            entry_mode = EntryMode(self.settings.entry_mode.lower())
+            entry_mode = EntryMode.CONFIRMED if policy.entry_model == "confirmation" else EntryMode.AGGRESSIVE
         except (AttributeError, ValueError):
-            entry_mode = EntryMode.CONFIRMED
-        if entry_mode == EntryMode.AGGRESSIVE and not self.settings.allow_aggressive_entry:
-            entry_mode = EntryMode.CONFIRMED
-        if entry_mode == EntryMode.EXTREME and not self.settings.allow_extreme_entry:
-            entry_mode = EntryMode.AGGRESSIVE if self.settings.allow_aggressive_entry else EntryMode.CONFIRMED
+            entry_mode = EntryMode.AGGRESSIVE
 
         # Confirmed models use a lower timeframe where available. M1 is already
         # the lowest supported timeframe, so it validates on its own closed bars.
@@ -370,14 +377,14 @@ class MarketScheduler:
             atr_val = current_price * 0.002
 
         validator = SetupValidator(
-            min_rr=self.settings.min_rr_ratio,
+            min_rr=0.0,
             min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
             displacement_body_ratio=self.settings.displacement_body_ratio_min,
             displacement_range_ratio=self.settings.displacement_range_ratio_min,
-            stop_atr_buffer=self.settings.structural_stop_atr_buffer,
-            require_ltf_confirmation=self.settings.require_candle_confirmation,
+            stop_atr_buffer=policy.stop_atr_buffer if policy.stop_atr_buffer is not None else self.settings.structural_stop_atr_buffer,
+            require_ltf_confirmation=False,
         )
-        validation = validator.validate(
+        validation = validator.observe(
             symbol=symbol,
             direction=direction,
             timeframe=primary_tf,
@@ -387,6 +394,9 @@ class MarketScheduler:
             zones=zones,
             entry_mode=entry_mode,
             ltf_df=ltf_df,
+            target_rr=policy.rr_target,
+            stop_model=policy.stop_model,
+            target_model=policy.target_model,
         )
         setup_id = None
         if record_learning:
@@ -403,46 +413,49 @@ class MarketScheduler:
                 take_profit=validation.take_profit or None,
                 rr_ratio=validation.rr_ratio or None,
                 validation=self._validation_snapshot(validation),
-                features=self._feature_snapshot(df, structure, htf_structures, float(atr_val)),
+                features=self._feature_snapshot(df, structure, htf_structures, float(atr_val), validation),
+                policy_version=policy_version or self.settings.active_model_version,
+                experiment_id=experiment_id,
             )
         if not validation.valid:
-            logger.debug("Invalid setup for %s: %s", symbol, validation.rejection_reason)
-            failed = next((check for check in validation.checks if not check.passed), None)
-            failed_detail = f"{failed.name}: {failed.detail}" if failed else validation.rejection_reason
+            # Malformed price/stop/target data is an operational integrity fault,
+            # not a failed SMC hypothesis. It must never reach the broker.
+            reason = "Candidate lacks broker-executable stop/target geometry"
+            if setup_id is not None:
+                await db.update_setup_record(setup_id, status="invalidated", rejection_reason=reason)
             await self._chart_activity(
                 "validation_rejected", symbol,
-                f"⛔ **SETUP REJECTED — {symbol}**\nDirection assessed: `{direction}` | Timeframe: `{primary_tf}`\nFirst blocking hard gate: {failed_detail}\nNo order will be considered from this candle.",
-                fingerprint=f"{bar_time}:{direction}:{validation.rejection_reason}",
+                f"⛔ **CANDIDATE INVALID — {symbol}**\nReason: {reason}\nNo order will be considered from this closed candle.",
+                fingerprint=f"{bar_time}:{direction}:invalid_geometry",
             )
             return None
 
+        # Scoring remains descriptive telemetry. The active policy determines
+        # eligibility instead of a global score, RR, or SMC gate.
         quality = score_setup_quality(
-            validation,
-            structure,
-            min_score=self.settings.min_setup_score,
-            extreme_score=self.settings.extreme_setup_score,
-            # Historical backing ranks only; it cannot override a failed gate.
-            historical_expectancy_r=None,
+            validation, structure, min_score=0.0,
+            extreme_score=self.settings.extreme_setup_score, historical_expectancy_r=None,
         )
-        if not quality.approved:
+        features = self._feature_snapshot(df, structure, htf_structures, float(atr_val), validation)
+        policy_ok, policy_reason = policy.accepts(
+            score=quality.score, rr_ratio=validation.rr_ratio, features=features,
+        )
+        if not policy_ok:
             if setup_id is not None:
-                await db.update_setup_record(setup_id, status="rejected", rejection_reason=quality.rejection_reason)
-            logger.debug("Valid but low-quality setup for %s: %s", symbol, quality.rejection_reason)
+                await db.update_setup_record(setup_id, status="rejected", rejection_reason=policy_reason)
             await self._chart_activity(
-                "quality_deferred", symbol,
-                f"⏳ **VALID SETUP DEFERRED — {symbol}**\nAll hard gates passed, but the configured entry model requires additional quality evidence.\nReason: {quality.rejection_reason}",
-                fingerprint=f"{bar_time}:{direction}:{quality.rejection_reason}",
+                "policy_rejected", symbol,
+                f"🧪 **POLICY SAMPLE DEFERRED — {symbol}**\nThe candidate remains stored for counterfactual analysis.\nActive policy: `{policy_version or self.settings.active_model_version}`\nReason: {policy_reason}",
+                fingerprint=f"{bar_time}:{direction}:{policy.fingerprint}:{policy_reason}",
             )
             return None
 
         await self._chart_activity(
             "setup_validated", symbol,
-            f"✅ **SETUP VALIDATED — {symbol}**\nDirection: `{direction}` | Timeframe: `{primary_tf}` | Quality rank: `{quality.score:.1f}/100`\nEntry: `{validation.entry_price:.5f}` | Structural SL: `{validation.stop_loss:.5f}` | Liquidity TP: `{validation.take_profit:.5f}`\nMarket-derived RR: `1:{validation.rr_ratio:.2f}`\nNext: final broker, portfolio, margin, and risk review.",
-            fingerprint=f"{bar_time}:{direction}:{validation.entry_price}:{validation.stop_loss}:{validation.take_profit}",
+            f"✅ **EXPERIMENT CANDIDATE ACCEPTED — {symbol}**\nPolicy: `{policy_version or self.settings.active_model_version}` | Direction: `{direction}` | Timeframe: `{primary_tf}`\nFeature rank: `{quality.score:.1f}/100` | Entry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}` | TP: `{validation.take_profit:.5f}` | RR: `1:{validation.rr_ratio:.2f}`",
+            fingerprint=f"{bar_time}:{direction}:{policy.fingerprint}:{validation.entry_price}:{validation.stop_loss}:{validation.take_profit}",
         )
 
-        # Signal transport contains only prices derived by the causal validator
-        # and the transparent post-validity quality rank.
         signal = TradeSignal(
             symbol=symbol,
             direction=direction,
@@ -451,21 +464,24 @@ class MarketScheduler:
             take_profit=validation.take_profit,
             score=quality.score,
             rr_ratio=validation.rr_ratio,
-            suggested_risk=min(self.settings.risk_per_trade, self.settings.max_setup_risk_pct),
+            suggested_risk=float(policy.risk_pct or self.settings.risk_per_trade),
             structure=structure,
             zones=zones,
             timeframe=primary_tf,
-            entry_mode=entry_mode.value,
-            setup_type="Liquidity Sweep Reversal",
+            entry_mode=policy.entry_model,
+            setup_type="Experimental Market Candidate",
             created_at=datetime.utcnow().isoformat(),
             expires_at=(datetime.utcnow() + timedelta(minutes=self.settings.max_signal_age_minutes)).isoformat(),
             validation=validation,
             quality_factors=quality.factors,
-            target_source=validation.target_pool.kind.value if validation.target_pool else "",
+            target_source=validation.target_pool.kind.value if validation.target_pool else "policy_rr_fallback",
             setup_id=setup_id,
-            passed=quality.approved,
-            rejection_reason=quality.rejection_reason,
+            passed=True,
+            rejection_reason="",
         )
+        signal.policy_version = policy_version or self.settings.active_model_version
+        signal.experiment_id = experiment_id
+        signal.experimental_policy = policy.to_dict()
         return signal
 
     async def scan_markets(self) -> list[TradeSignal]:
@@ -474,7 +490,7 @@ class MarketScheduler:
         for symbol in self.settings.enabled_symbols:
             try:
                 signal = await self.analyze_symbol(symbol)
-                if signal and signal.passed and signal.score >= self.settings.min_setup_score:
+                if signal and signal.passed:
                     signals.append(signal)
             except Exception as e:
                 logger.error(f"Error analyzing {symbol}: {e}")
@@ -553,7 +569,9 @@ class MarketScheduler:
                 stop_loss=signal.stop_loss,
                 symbol_info=sym_info,
                 leverage=leverage,
-                risk_pct=min(self.settings.risk_per_trade, self.settings.max_setup_risk_pct),
+                risk_pct=float(signal.experimental_policy.get("risk_pct", signal.suggested_risk)),
+                risk_model=str(signal.experimental_policy.get("risk_model", "fixed_pct")),
+                fixed_volume=signal.experimental_policy.get("fixed_volume"),
             )
             if not sizing.valid:
                 signal.passed = False
@@ -585,6 +603,9 @@ class MarketScheduler:
                 signal.stop_loss,
                 sym_info,
                 account_equity=equity,
+                allocation=list(signal.experimental_policy.get("layer_allocation") or [1.0]),
+                max_layers=int(signal.experimental_policy.get("max_layers", 0)),
+                layer_style=str(signal.experimental_policy.get("layer_style", "none")),
             )
             if not layers:
                 signal.passed = False
@@ -623,6 +644,7 @@ class MarketScheduler:
                 current_open_risk=current_open_risk,
                 setup_valid=bool(signal.validation and signal.validation.valid),
                 consecutive_losses=consecutive_losses,
+                policy=signal.experimental_policy,
             )
             if not risk_result.passed:
                 logger.info(f"Signal rejected for {symbol}: {risk_result.reason}")
@@ -675,6 +697,9 @@ class MarketScheduler:
                         "expected_loss": sizing.expected_loss,
                         "required_margin": sizing.required_margin,
                     },
+                    "policy_version": signal.policy_version,
+                    "experiment_id": signal.experiment_id,
+                    "experimental_policy": signal.experimental_policy,
                     "quality_factors": [
                         {"name": factor.name, "points": factor.points, "maximum": factor.maximum, "detail": factor.detail}
                         for factor in signal.quality_factors
@@ -696,6 +721,8 @@ class MarketScheduler:
                     ticket=result.ticket,
                     setup_id=signal.setup_id,
                     initial_risk=sizing.expected_loss,
+                    policy_version=signal.policy_version,
+                    experiment_id=signal.experiment_id,
                 )
                 if signal.setup_id is not None:
                     await db.update_setup_record(signal.setup_id, status="executed", trade_id=trade_id)
@@ -726,8 +753,13 @@ class MarketScheduler:
                         "setup_type": signal.setup_type,
                         "quality_score": signal.score,
                         "rr_ratio": signal.rr_ratio,
+                        "policy_version": signal.policy_version,
+                        "experiment_id": signal.experiment_id,
+                        "experimental_policy": signal.experimental_policy,
                     },
                     account_mode=self.settings.trading_mode,
+                    policy_version=signal.policy_version,
+                    experiment_id=signal.experiment_id,
                 )
                 await db.record_trade_layer(
                     basket_id=basket_id,
@@ -824,13 +856,10 @@ class MarketScheduler:
         for symbol in self.settings.enabled_symbols:
             logger.info(f"Analyzing {symbol}...")
             try:
-                # Check session filter
-                session_info = check_trading_session(self.settings.enabled_sessions)
-                if not session_info.is_trading_time:
-                    logger.debug(f"Outside trading session: {session_info.reason}")
-                    continue
-
-                # For the background loop, we analyze and execute
+                # Session participation is intentionally not a global execution
+                # gate. A candidate policy may later include a session feature
+                # when broker-realized evidence supports it.
+                # For the background loop, we analyze and execute.
                 signal = await self.analyze_symbol(symbol)
                 if not signal or not signal.passed:
                     continue
@@ -842,7 +871,7 @@ class MarketScheduler:
                 )
 
                 # Fetch data for the chart if signal passed
-                primary_tf = "M1" if self.settings.aggressive_mode else "M15"
+                primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"
                 df = await self.fetch_candles(symbol, primary_tf, 500)
                 
                 # Execute
@@ -986,16 +1015,7 @@ class MarketScheduler:
             await self._reconcile_closed_trades(live_tickets)
             if not positions:
                 return
-            logger.info("Structurally managing %s open position(s)...", len(positions))
-            manager = TradeManager(
-                breakeven_at_rr=self.settings.breakeven_at_rr,
-                profit_lock_rr=self.settings.profit_lock_rr,
-                runner_rr=self.settings.runner_rr,
-                min_rr=self.settings.min_rr_ratio,
-                stop_atr_buffer=self.settings.trailing_buffer_atr,
-                allow_partial_tp=self.settings.allow_partial_tp,
-                allow_tp_extension=self.settings.allow_tp_extension,
-            )
+            logger.info("Managing %s open position(s) using their recorded experimental policies", len(positions))
 
             for position in positions:
                 basket = await db.get_basket_for_ticket(position.ticket, self.settings.trading_mode)
@@ -1006,12 +1026,21 @@ class MarketScheduler:
                     except ValueError:
                         state = ManagementState.INITIAL
                     partial_done = await db.basket_has_action(basket["id"], "Partial Take Profit")
+                    policy_data = dict(basket.get("metadata", {}).get("experimental_policy") or {})
                 else:
                     # Manual positions are monitored defensively, but the bot
                     # will not create layers without a recorded basket plan.
                     initial_stop = position.sl
                     state = ManagementState.INITIAL
                     partial_done = False
+                    active_policy, _, _ = await self.optimizer.active_policy(self.settings.trading_mode)
+                    policy_data = active_policy.to_dict()
+
+                manager = TradeManager(
+                    policy=policy_data,
+                    min_sl_update_distance=self.settings.min_sl_update_distance_atr,
+                    min_tp_update_distance=self.settings.min_tp_update_distance_atr,
+                )
 
                 if initial_stop <= 0:
                     logger.warning("Skipping unprotected position #%s; no initial structural stop is known", position.ticket)
@@ -1146,14 +1175,16 @@ class MarketScheduler:
         if position.ticket != primary_ticket:
             return False
         initial_stop = float(basket["initial_stop"])
+        policy_data = dict(basket.get("metadata", {}).get("experimental_policy") or {})
+        layer_style = str(policy_data.get("layer_style", "none"))
         current_price_df = await self.fetch_candles(position.symbol, "M5", 200)
         if current_price_df.empty:
             return False
         current_price = float(current_price_df.iloc[-1]["close"])
         initial_risk = abs(position.entry_price - initial_stop)
         current_r = ((current_price - position.entry_price) if position.direction == "BUY" else (position.entry_price - current_price)) / initial_risk if initial_risk > 0 else 0.0
-        if current_r <= 0:
-            return False  # Explicit anti-averaging-down rule.
+        if current_r <= 0 and layer_style not in {"averaging", "retracement"}:
+            return False  # The selected policy has not elected adverse/pullback scaling.
 
         refreshed = await self.analyze_symbol(position.symbol)
         if not refreshed or not refreshed.passed or refreshed.direction != basket["direction"]:
@@ -1219,6 +1250,7 @@ class MarketScheduler:
             setup_valid=bool(refreshed.validation and refreshed.validation.valid),
             is_layer=True,
             consecutive_losses=consecutive_losses,
+            policy=policy_data,
         )
         if not risk_result.passed:
             return False
@@ -1230,7 +1262,7 @@ class MarketScheduler:
             sl=refreshed.stop_loss,
             tp=refreshed.take_profit,
             magic=self.settings.magic_number,
-            comment=f"SMC L{next_layer['layer_number']}/{self.settings.max_layers}",
+            comment=f"EXP L{next_layer['layer_number']}/{len(layers)}",
         )
         if not result.success:
             return False
@@ -1262,7 +1294,7 @@ class MarketScheduler:
             )
         await self._notify(
             f"🟢 **LAYER ADDED — {position.symbol}**\n"
-            f"Layer: `{next_layer['layer_number']}/{self.settings.max_layers}`\n"
+            f"Layer: `{next_layer['layer_number']}/{len(layers)}`\n"
             f"Volume: `{result.lot_size}`\n"
             f"Basket risk: `${basket_current_risk + sizing.expected_loss:.2f}` / `${float(basket['max_risk']):.2f}`\n"
             f"Reason: _{next_layer['trigger']}_"
@@ -1295,14 +1327,15 @@ class MarketScheduler:
         except ValueError:
             state = ManagementState.INITIAL
         partial_done = await db.basket_has_action(basket["id"], "Partial Take Profit") if basket else False
+        if basket:
+            policy_data = dict(basket.get("metadata", {}).get("experimental_policy") or {})
+        else:
+            active_policy, _, _ = await self.optimizer.active_policy(self.settings.trading_mode)
+            policy_data = active_policy.to_dict()
         manager = TradeManager(
-            breakeven_at_rr=self.settings.breakeven_at_rr,
-            profit_lock_rr=self.settings.profit_lock_rr,
-            runner_rr=self.settings.runner_rr,
-            min_rr=self.settings.min_rr_ratio,
-            stop_atr_buffer=self.settings.trailing_buffer_atr,
-            allow_partial_tp=self.settings.allow_partial_tp,
-            allow_tp_extension=self.settings.allow_tp_extension,
+            policy=policy_data,
+            min_sl_update_distance=self.settings.min_sl_update_distance_atr,
+            min_tp_update_distance=self.settings.min_tp_update_distance_atr,
         )
         action = manager.evaluate(
             direction=position.direction,

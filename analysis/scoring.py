@@ -44,6 +44,9 @@ class TradeSignal:
     quality_factors: list[Any] = field(default_factory=list)
     target_source: str = ""
     setup_id: Optional[int] = None
+    policy_version: str = ""
+    experiment_id: Optional[int] = None
+    experimental_policy: dict[str, Any] = field(default_factory=dict)
     passed: bool = False
     rejection_reason: str = ""
 

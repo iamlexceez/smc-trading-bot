@@ -157,6 +157,40 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS research_hypotheses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_mode TEXT NOT NULL,
+                hypothesis_key TEXT NOT NULL,
+                statement TEXT NOT NULL,
+                source TEXT NOT NULL,
+                feature_name TEXT,
+                candidate_values_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL,
+                archived_at TEXT,
+                UNIQUE(account_mode, hypothesis_key, statement)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS policy_experiments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_mode TEXT NOT NULL,
+                policy_fingerprint TEXT NOT NULL,
+                policy_json TEXT NOT NULL,
+                hypothesis_id INTEGER,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                forward_started_at TEXT,
+                completed_at TEXT,
+                evaluation_json TEXT NOT NULL DEFAULT '{}',
+                reason TEXT NOT NULL,
+                model_version TEXT,
+                FOREIGN KEY(hypothesis_id) REFERENCES research_hypotheses(id),
+                UNIQUE(account_mode, policy_fingerprint)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS symbol_cooldowns (
                 symbol TEXT PRIMARY KEY,
                 last_trade_time TEXT NOT NULL
@@ -219,11 +253,19 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await _ensure_column(db, "trades", "pnl_r", "REAL")
         await _ensure_column(db, "trades", "max_favorable_r", "REAL DEFAULT 0")
         await _ensure_column(db, "trades", "max_adverse_r", "REAL DEFAULT 0")
+        await _ensure_column(db, "trades", "policy_version", "TEXT")
+        await _ensure_column(db, "trades", "experiment_id", "INTEGER")
+        await _ensure_column(db, "setup_records", "policy_version", "TEXT")
+        await _ensure_column(db, "setup_records", "experiment_id", "INTEGER")
+        await _ensure_column(db, "trade_baskets", "policy_version", "TEXT")
+        await _ensure_column(db, "trade_baskets", "experiment_id", "INTEGER")
         await _ensure_column(db, "trade_baskets", "account_mode", "TEXT NOT NULL DEFAULT 'demo'")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode_status ON trades(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_setups_mode_status ON setup_records(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_trade ON execution_events(trade_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_model_versions_mode_role ON model_versions(account_mode, role, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_hypotheses_mode_status ON research_hypotheses(account_mode, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_experiments_mode_status ON policy_experiments(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_layers_ticket ON trade_layers(ticket)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_baskets_status ON trade_baskets(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_baskets_mode_status ON trade_baskets(account_mode, status)")
@@ -254,16 +296,19 @@ async def record_trade(
     symbol: str, direction: str, entry_price: float, sl_price: float,
     tp_price: float, lot_size: float, score: float, rr_ratio: float,
     executor: str, raw_signal: str, account_mode: str = "demo", ticket: Optional[int] = None,
-    setup_id: Optional[int] = None, initial_risk: float = 0.0, db_path: str = DB_PATH
+    setup_id: Optional[int] = None, initial_risk: float = 0.0,
+    policy_version: Optional[str] = None, experiment_id: Optional[int] = None, db_path: str = DB_PATH
 ) -> int:
     async with aiosqlite.connect(db_path) as db:
         now = datetime.utcnow().isoformat()
         cursor = await db.execute(
             """INSERT INTO trades (timestamp, symbol, direction, entry_price, sl_price, tp_price,
-               lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk, raw_signal)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk,
+               raw_signal, policy_version, experiment_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (now, symbol, direction, entry_price, sl_price, tp_price,
-             lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk, raw_signal)
+             lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk,
+             raw_signal, policy_version, experiment_id)
         )
         await db.commit()
         return cursor.lastrowid
@@ -336,6 +381,8 @@ async def record_setup(
     quality_score: Optional[float] = None,
     validation: Optional[dict] = None,
     features: Optional[dict] = None,
+    policy_version: Optional[str] = None,
+    experiment_id: Optional[int] = None,
     db_path: str = DB_PATH,
 ) -> int:
     """Store every qualifying, rejected, and executed setup hypothesis."""
@@ -345,12 +392,13 @@ async def record_setup(
             """INSERT INTO setup_records
                (detected_at, updated_at, account_mode, symbol, timeframe, direction, setup_type,
                 status, rejection_reason, entry_price, stop_loss, take_profit, rr_ratio,
-                quality_score, validation_json, features_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                quality_score, validation_json, features_json, policy_version, experiment_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 now, now, account_mode, symbol, timeframe, direction, setup_type, status,
                 rejection_reason, entry_price, stop_loss, take_profit, rr_ratio, quality_score,
                 json.dumps(validation or {}, sort_keys=True), json.dumps(features or {}, sort_keys=True),
+                policy_version, experiment_id,
             ),
         )
         await conn.commit()
@@ -622,6 +670,168 @@ async def get_recent_optimization_runs(account_mode: str = "demo", limit: int = 
     return rows
 
 
+async def upsert_research_hypothesis(
+    *,
+    account_mode: str,
+    hypothesis_key: str,
+    statement: str,
+    source: str,
+    feature_name: Optional[str],
+    candidate_values: list | tuple,
+    evidence: Optional[dict] = None,
+    db_path: str = DB_PATH,
+) -> int:
+    """Persist a falsifiable research hypothesis without overwriting prior evidence."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """INSERT INTO research_hypotheses
+               (account_mode, hypothesis_key, statement, source, feature_name,
+                candidate_values_json, evidence_json, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+               ON CONFLICT(account_mode, hypothesis_key, statement) DO UPDATE SET
+                 evidence_json = excluded.evidence_json,
+                 status = CASE WHEN research_hypotheses.status = 'archived' THEN 'archived' ELSE 'open' END""",
+            (
+                account_mode, hypothesis_key, statement, source, feature_name,
+                json.dumps(list(candidate_values)), json.dumps(evidence or {}, sort_keys=True), now,
+            ),
+        )
+        cursor = await conn.execute(
+            """SELECT id FROM research_hypotheses
+               WHERE account_mode = ? AND hypothesis_key = ? AND statement = ?""",
+            (account_mode, hypothesis_key, statement),
+        )
+        row = await cursor.fetchone()
+        await conn.commit()
+    return int(row[0])
+
+
+async def get_open_hypotheses(account_mode: str = "demo", db_path: str = DB_PATH) -> list[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT * FROM research_hypotheses
+               WHERE account_mode = ? AND status = 'open' ORDER BY created_at ASC""",
+            (account_mode,),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    for row in rows:
+        row["candidate_values"] = json.loads(row.pop("candidate_values_json") or "[]")
+        row["evidence"] = json.loads(row.pop("evidence_json") or "{}")
+    return rows
+
+
+async def create_policy_experiment(
+    *,
+    account_mode: str,
+    policy_fingerprint: str,
+    policy: dict,
+    reason: str,
+    hypothesis_id: Optional[int] = None,
+    status: str = "candidate",
+    model_version: Optional[str] = None,
+    db_path: str = DB_PATH,
+) -> int:
+    """Create an immutable policy experiment, returning its stable id."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """INSERT INTO policy_experiments
+               (account_mode, policy_fingerprint, policy_json, hypothesis_id, status,
+                created_at, reason, model_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(account_mode, policy_fingerprint) DO NOTHING""",
+            (account_mode, policy_fingerprint, json.dumps(policy, sort_keys=True), hypothesis_id, status, now, reason, model_version),
+        )
+        cursor = await conn.execute(
+            """SELECT id FROM policy_experiments
+               WHERE account_mode = ? AND policy_fingerprint = ?""",
+            (account_mode, policy_fingerprint),
+        )
+        row = await cursor.fetchone()
+        await conn.commit()
+    return int(row[0])
+
+
+async def update_policy_experiment(
+    experiment_id: int,
+    *,
+    status: str,
+    evaluation: Optional[dict] = None,
+    reason: Optional[str] = None,
+    model_version: Optional[str] = None,
+    db_path: str = DB_PATH,
+) -> None:
+    """Advance a policy experiment while retaining its immutable policy payload."""
+    now = datetime.utcnow().isoformat()
+    fields = ["status = ?"]
+    values: list = [status]
+    if evaluation is not None:
+        fields.append("evaluation_json = ?")
+        values.append(json.dumps(evaluation, sort_keys=True))
+    if reason is not None:
+        fields.append("reason = ?")
+        values.append(reason)
+    if model_version is not None:
+        fields.append("model_version = ?")
+        values.append(model_version)
+    if status == "forward_demo":
+        fields.append("forward_started_at = ?")
+        values.append(now)
+    elif status in {"promoted", "rejected", "archived", "completed"}:
+        fields.append("completed_at = ?")
+        values.append(now)
+    values.append(experiment_id)
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(f"UPDATE policy_experiments SET {', '.join(fields)} WHERE id = ?", values)
+        await conn.commit()
+
+
+async def get_policy_experiment(experiment_id: int, db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM policy_experiments WHERE id = ?", (experiment_id,))
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["policy"] = json.loads(result.pop("policy_json") or "{}")
+    result["evaluation"] = json.loads(result.pop("evaluation_json") or "{}")
+    return result
+
+
+async def get_active_forward_experiment(account_mode: str = "demo", db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT * FROM policy_experiments WHERE account_mode = ? AND status = 'forward_demo'
+               ORDER BY forward_started_at DESC, created_at DESC LIMIT 1""",
+            (account_mode,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["policy"] = json.loads(result.pop("policy_json") or "{}")
+    result["evaluation"] = json.loads(result.pop("evaluation_json") or "{}")
+    return result
+
+
+async def list_policy_experiments(account_mode: str = "demo", limit: int = 20, db_path: str = DB_PATH) -> list[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT * FROM policy_experiments WHERE account_mode = ?
+               ORDER BY created_at DESC LIMIT ?""", (account_mode, limit)
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    for row in rows:
+        row["policy"] = json.loads(row.pop("policy_json") or "{}")
+        row["evaluation"] = json.loads(row.pop("evaluation_json") or "{}")
+    return rows
+
+
 async def get_pending_counterfactual_setups(
     account_mode: str,
     symbol: str,
@@ -726,6 +936,43 @@ async def get_recent_trades(days: int = 7, account_mode: str = "demo", db_path: 
         return [dict(r) for r in rows]
 
 
+async def get_policy_trade_outcomes(
+    *,
+    account_mode: str = "demo",
+    days: int = 365,
+    policy_version: Optional[str] = None,
+    experiment_id: Optional[int] = None,
+    db_path: str = DB_PATH,
+) -> list[dict]:
+    """Return completed R outcomes joined to their observed setup features.
+
+    It is deliberately outcome-only: synthetic counterfactual results remain in
+    setup records and must never be blended into broker-realized performance.
+    """
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    clauses = ["t.account_mode = ?", "t.status = 'closed'", "t.pnl_r IS NOT NULL", "t.timestamp >= ?"]
+    values: list = [account_mode, since]
+    if policy_version is not None:
+        clauses.append("t.policy_version = ?")
+        values.append(policy_version)
+    if experiment_id is not None:
+        clauses.append("t.experiment_id = ?")
+        values.append(experiment_id)
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            f"""SELECT t.*, s.features_json, s.validation_json
+                FROM trades t LEFT JOIN setup_records s ON s.id = t.setup_id
+                WHERE {' AND '.join(clauses)} ORDER BY t.timestamp ASC, t.id ASC""",
+            values,
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    for row in rows:
+        row["features"] = json.loads(row.pop("features_json") or "{}")
+        row["validation"] = json.loads(row.pop("validation_json") or "{}")
+    return rows
+
+
 async def get_performance_summary(account_mode: str, days: Optional[int] = None, db_path: str = DB_PATH) -> dict:
     """Compute closed-trade performance for exactly one account mode."""
     clauses = ["status = 'closed'", "account_mode = ?"]
@@ -805,6 +1052,8 @@ async def create_trade_basket(
     planned_layers: list[dict],
     metadata: Optional[dict] = None,
     account_mode: str = "demo",
+    policy_version: Optional[str] = None,
+    experiment_id: Optional[int] = None,
     db_path: str = DB_PATH,
 ) -> int:
     """Persist one setup-level risk budget and its future layer plan."""
@@ -813,8 +1062,9 @@ async def create_trade_basket(
         cursor = await conn.execute(
             """INSERT INTO trade_baskets
                (created_at, updated_at, symbol, direction, entry_price, initial_stop,
-                initial_target, max_risk, reserved_risk, account_mode, planned_layers, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                initial_target, max_risk, reserved_risk, account_mode, planned_layers, metadata,
+                policy_version, experiment_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 now,
                 now,
@@ -828,6 +1078,8 @@ async def create_trade_basket(
                 account_mode,
                 json.dumps(planned_layers),
                 json.dumps(metadata or {}),
+                policy_version,
+                experiment_id,
             ),
         )
         await conn.commit()

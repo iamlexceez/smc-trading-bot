@@ -204,6 +204,119 @@ class SetupValidator:
         self.stop_atr_buffer = float(stop_atr_buffer)
         self.require_ltf_confirmation = bool(require_ltf_confirmation)
 
+    def observe(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        timeframe: str,
+        df: pd.DataFrame,
+        structure: MarketStructure,
+        htf_structures: list[MarketStructure],
+        zones: list[SupplyDemandZone],
+        entry_mode: EntryMode = EntryMode.AGGRESSIVE,
+        ltf_df: Optional[pd.DataFrame] = None,
+        target_rr: Optional[float] = None,
+        stop_model: str = "structural",
+        target_model: str = "liquidity",
+    ) -> SetupValidationResult:
+        """Build a broker-valid candidate while retaining SMC evidence as features.
+
+        Unlike :meth:`validate`, this research method does not turn absent SMC
+        features (sweep, FVG/OB zone, displacement, BOS, or confirmation) into a
+        universal rejection.  It still refuses malformed data, invalid stops, or
+        invalid targets.  Policy selection later decides which observed features
+        are required by the current DEMO experiment.
+        """
+        requested_direction = direction.upper()
+        result = SetupValidationResult(valid=False, direction=requested_direction, entry_mode=entry_mode)
+        if df.empty or len(df) < 30:
+            result.checks.append(ValidationCheck("Market data", False, "Insufficient closed candles"))
+            return result
+        entry = float(df.iloc[-1]["close"])
+        result.entry_price = entry
+        if entry <= 0:
+            result.checks.append(ValidationCheck("Market price", False, "Non-positive close"))
+            return result
+
+        htf_valid, htf_detail = _htf_context_matches(htf_structures, requested_direction)
+        result.checks.append(ValidationCheck("HTF context", htf_valid, htf_detail))
+        pools = build_liquidity_pools(df, structure.swing_highs, structure.swing_lows, timeframe)
+        result.liquidity_pools = pools
+        required_side = "sell-side" if requested_direction == "BUY" else "buy-side"
+        has_liquidity = any(pool.side.value == required_side and not pool.swept for pool in pools)
+        result.checks.append(ValidationCheck("Meaningful liquidity", has_liquidity, f"Looking for {required_side} liquidity"))
+        sweep = detect_latest_sweep(df, pools, requested_direction, min_penetration_atr=self.min_sweep_penetration_atr)
+        result.sweep = sweep
+        result.checks.append(ValidationCheck("Liquidity sweep", sweep is not None, f"Sweep found" if sweep else "No closed-candle sweep found"))
+        displacement = detect_displacement(
+            df, requested_direction,
+            body_ratio_min=self.displacement_body_ratio,
+            range_ratio_min=self.displacement_range_ratio,
+        )
+        result.displacement = displacement
+        displacement_after_sweep = bool(sweep and displacement.confirmed and displacement.index >= sweep.index)
+        result.checks.append(ValidationCheck("Directional displacement", displacement_after_sweep, displacement.detail))
+        event = structure.last_event
+        structure_valid = _event_matches_direction(event.event_type, requested_direction)
+        result.checks.append(ValidationCheck("BOS/CHOCH confirmation", structure_valid, event.event_type.value))
+        candidate_zones = _valid_zones_at_entry(structure, zones, requested_direction, entry)
+        selected_zone = candidate_zones[0] if candidate_zones else None
+        result.zone = selected_zone
+        result.checks.append(ValidationCheck("Retracement into valid zone", selected_zone is not None, selected_zone.detail if selected_zone else "No matching zone at entry"))
+        confirmation_df = ltf_df if ltf_df is not None and not ltf_df.empty else df
+        if selected_zone is not None:
+            confirmation = get_confirmation(
+                confirmation_df, requested_direction, zone_top=selected_zone.top, zone_bottom=selected_zone.bottom,
+                require_retest=True, require_candle=True, require_displacement=False,
+            )
+        else:
+            confirmation = ConfirmationResult(False, ConfirmationType.NONE, "No zone available for confirmation test")
+        result.confirmation = confirmation
+        result.checks.append(ValidationCheck("LTF confirmation", confirmation.confirmed, confirmation.detail))
+
+        atr_value = float(atr(df, 14).iloc[-1])
+        if atr_value <= 0 or atr_value != atr_value:
+            atr_value = max(entry * 0.001, 1e-9)
+        buffer = max(atr_value * self.stop_atr_buffer, 0.0)
+        if stop_model == "atr":
+            stop_loss = entry - buffer if requested_direction == "BUY" else entry + buffer
+        elif stop_model == "zone" and selected_zone is not None:
+            stop_loss = selected_zone.bottom - buffer if requested_direction == "BUY" else selected_zone.top + buffer
+        elif selected_zone is not None and sweep is not None:
+            stop_loss = _derive_structural_stop(requested_direction, structure, selected_zone, sweep, atr_value, self.stop_atr_buffer)
+        elif requested_direction == "BUY":
+            candidates = [float(df["low"].tail(20).min())]
+            if structure.protected_low > 0:
+                candidates.append(float(structure.protected_low))
+            stop_loss = min(candidates) - buffer
+        else:
+            candidates = [float(df["high"].tail(20).max())]
+            if structure.protected_high > 0:
+                candidates.append(float(structure.protected_high))
+            stop_loss = max(candidates) + buffer
+        result.stop_loss = stop_loss
+        stop_valid = (requested_direction == "BUY" and 0 < stop_loss < entry) or (requested_direction == "SELL" and stop_loss > entry)
+        result.checks.append(ValidationCheck("Executable stop", stop_valid, f"SL {stop_loss:.5f}" if stop_valid else "Could not derive valid stop"))
+        risk = abs(entry - stop_loss)
+        target_pool = select_market_target(pools, requested_direction, entry)
+        result.target_pool = target_pool
+        liquidity_target_valid = target_pool is not None and ((requested_direction == "BUY" and target_pool.level > entry) or (requested_direction == "SELL" and target_pool.level < entry))
+        if target_model in {"liquidity", "structure", "dynamic", "adaptive"} and liquidity_target_valid:
+            take_profit = float(target_pool.level)
+        elif risk > 0:
+            rr = float(target_rr or 1.0)
+            take_profit = entry + risk * rr if requested_direction == "BUY" else entry - risk * rr
+        else:
+            take_profit = 0.0
+        result.take_profit = take_profit
+        target_valid = (requested_direction == "BUY" and take_profit > entry) or (requested_direction == "SELL" and 0 < take_profit < entry)
+        result.checks.append(ValidationCheck("Executable target", target_valid, f"TP {take_profit:.5f}" if target_valid else "Could not derive valid target"))
+        result.rr_ratio = abs(take_profit - entry) / risk if risk > 0 and target_valid else 0.0
+        # Only data and broker-order shape are mandatory in research candidate generation.
+        result.valid = stop_valid and target_valid
+        return result
+
     def validate(
         self,
         *,

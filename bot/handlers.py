@@ -135,14 +135,16 @@ class BotHandlers:
         active_count = len(self.settings.enabled_symbols)
         available_count = len(self.settings.available_symbols)
         model_text = model["version"] if model else "baseline pending"
+        forward = await db.get_active_forward_experiment(self.settings.trading_mode)
+        experiment_text = forward.get("model_version", "none") if forward else "none"
         return "\n".join([
-            "🤖 **DERIV SMC LEARNING SYSTEM**",
+            "🤖 **DERIV AUTONOMOUS RESEARCH SYSTEM**",
             f"Mode: `{self.settings.trading_mode.upper()}` | Autonomous execution: `{'ON' if self.settings.auto_trade and not self.settings.is_paused else 'OFF'}`",
             f"Broker universe: `{active_count}` active / `{available_count}` available Deriv Synthetic Indices or Gold",
-            f"Safety: `{self.settings.risk_per_trade:.2f}%` preferred risk (hard cap `{self.settings.max_setup_risk_pct:.2f}%`) | min RR `1:{self.settings.min_rr_ratio:.1f}`",
             f"Today: `{performance['trades']}` closed trades | P/L `${performance['pnl']:.2f}` | win rate `{performance['win_rate']:.1f}%`",
-            f"Model: `{model_text}` | DEMO learning is {'enabled' if self.settings.self_optimization_enabled else 'disabled'}",
-            "\nUse the monitoring controls below. LIVE always requires a separate explicit confirmation.",
+            f"Champion: `{model_text}` | Forward-DEMO challenger: `{experiment_text}`",
+            f"Research engine: `{'enabled' if self.settings.self_optimization_enabled else 'disabled'}` — policy variables are learned from evidence, not fixed global caps.",
+            "\nUse the research controls below. LIVE always requires a separate explicit confirmation.",
         ])
 
     @admin_only
@@ -161,28 +163,21 @@ class BotHandlers:
         """Show the deliberately small operational command surface."""
         await self._render_menu(
             update,
-            "**Operational commands**\n\n"
+            "**Research commands**\n\n"
             "`/dashboard` — current autonomous-system status\n"
             "`/markets` — broker-verified Deriv universe\n"
-            "`/positions` — active broker positions and management actions\n"
+            "`/positions` — active broker positions and recorded policy actions\n"
             "`/learning` — measured observations and next objective\n"
+            "`/experiments` — immutable policy experiment lifecycle\n"
+            "`/champion` — current validated policy and its evidence\n"
+            "`/challengers` — independent candidates in forward DEMO\n"
+            "`/research` — falsifiable hypotheses and candidate values\n"
             "`/performance` — DEMO/LIVE-isolated statistics\n"
-            "`/backtest <symbol> <tf> <days>` — broker-history causal backtest\n"
-            "`/safety` — hard limits and circuit breakers\n"
-            "`/model` — active model and governance decision\n"
+            "`/backtest <symbol> <tf> <days>` — causal policy backtest\n"
             "`/activity [detailed|essential|off]` — chart-study notification mode\n"
+            "`/settings` — autonomy, alerts, and explicit DEMO/LIVE controls\n"
             "`/emergency` — pause new execution and optionally close positions\n\n"
-            "**Parameter Tweak Commands**\n"
-            "`/risk <pct>` — set risk per setup\n"
-            "`/loss_limit <pct>` — set daily loss stop limit\n"
-            "`/open_risk <pct>` — set total open risk ceiling\n"
-            "`/layers <1-4>` — set max confirmation layers\n"
-            "`/rr <ratio>` — set minimum RR ratio\n"
-            "`/score <0-100>` — set minimum quality score\n"
-            "`/cooldown <mins>` — set symbol cooldown\n"
-            "`/entry_mode <mode>` — set confirmed/aggressive/extreme\n"
-            "`/aggressive [on|off]` — toggle aggressive growth\n"
-            "`/scalping [on|off]` — toggle M1/M5 scalping mode",
+            "Trading-policy controls are intentionally not manual commands. DEMO research evaluates risk, RR, feature combinations, layering, and management through versioned experiments. Broker validity, synchronization, and emergency controls remain mandatory.",
         )
 
     @admin_only
@@ -272,7 +267,7 @@ class BotHandlers:
             *(profile_lines or ["No in-memory profile yet. The next broker-candle scan will build observable profiles; completed outcomes are required before outcome statistics affect settings."]),
             "",
             "**Next objective**",
-            f"Collect at least `{self.settings.optimization_min_sample_size}` completed DEMO R-recorded outcomes, then run a separated train/validation/out-of-sample challenger test. Hard gates and hard risk caps are never optimized.",
+            f"Collect at least `{self.settings.optimization_min_sample_size}` completed DEMO R-recorded outcomes, then compare independently specified policies through train, validation, out-of-sample, and forward-DEMO evidence. Broker and software integrity remain mandatory; risk, RR, features, layering, and management are experimental.",
         ]
         await self._render_menu(update, "\n".join(text))
 
@@ -296,6 +291,86 @@ class BotHandlers:
                 f"Stored OOS evidence: `{oos.get('sample_size', 0)}` trades | expectancy `{oos.get('expectancy_r', 0):.2f}R` | maximum drawdown `{oos.get('max_drawdown_r', 0):.2f}R`",
                 "A challenger may be promoted only in DEMO after positive unseen evidence and acceptable drawdown. LIVE self-promotion is blocked.",
             ])
+        await self._render_menu(update, text)
+
+    @admin_only
+    async def cmd_experiments(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show immutable experiment lifecycle records for the current account mode."""
+        experiments = await db.list_policy_experiments(self.settings.trading_mode, limit=8)
+        if not experiments:
+            text = "🧪 **EXPERIMENTS**\n\nNo policy experiment has been created yet. The research engine will first collect completed DEMO outcomes, generate hypotheses, then begin chronological comparisons."
+        else:
+            lines = ["🧪 **EXPERIMENTS**", ""]
+            for item in experiments:
+                policy = item.get("policy", {})
+                evaluation = item.get("evaluation", {})
+                oos = evaluation.get("out_of_sample", {})
+                lines.append(
+                    f"• `#{item['id']}` `{item['status'].upper()}` — `{item.get('model_version') or 'unversioned'}`\n"
+                    f"  Entry `{policy.get('entry_model', 'n/a')}` | Risk `{policy.get('risk_pct', 'n/a')}%` | RR `{policy.get('rr_target') or 'market-derived'}` | Layers `{policy.get('max_layers', 0)}`\n"
+                    f"  OOS sample `{oos.get('sample_size', 0)}` | expectancy `{oos.get('expectancy_r', 0):.2f}R`\n"
+                )
+            text = "\n".join(lines)
+        await self._render_menu(update, text)
+
+    @admin_only
+    async def cmd_champion(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the current validated champion as a transparent policy object."""
+        model = await db.get_active_model(self.settings.trading_mode)
+        if not model:
+            text = "🏆 **CHAMPION**\n\nNo champion has been seeded yet. DEMO research will create a non-privileged baseline first."
+        else:
+            policy = model.get("parameters", {})
+            evidence = model.get("performance", {})
+            forward = evidence.get("forward_demo", {})
+            oos = evidence.get("out_of_sample", {})
+            metric = forward or oos
+            text = "\n".join([
+                "🏆 **CURRENT CHAMPION POLICY**",
+                f"Version: `{model['version']}` | Created: `{model.get('created_at', 'n/a')}`",
+                f"Entry: `{policy.get('entry_model', 'hybrid')}` | Required features: `{', '.join(policy.get('required_features', [])) or 'none'}`",
+                f"Risk: `{policy.get('risk_model', 'n/a')}` at `{policy.get('risk_pct', 'n/a')}%` | RR: `{policy.get('rr_target') or 'market-derived'}`",
+                f"SL: `{policy.get('stop_model', 'n/a')}` | TP: `{policy.get('target_model', 'n/a')}` | Layers: `{policy.get('max_layers', 0)}` / `{policy.get('layer_style', 'none')}`",
+                f"Management: BE `{policy.get('breakeven_model', 'none')}`, trailing `{policy.get('trailing_model', 'none')}`, partial `{policy.get('partial_exit_model', 'none')}`",
+                f"Evidence: sample `{metric.get('sample_size', 0)}` | expectancy `{metric.get('expectancy_r', 0):.2f}R` | drawdown `{metric.get('max_drawdown_r', 0):.2f}R`",
+                "LIVE is never activated or changed by policy research.",
+            ])
+        await self._render_menu(update, text)
+
+    @admin_only
+    async def cmd_challengers(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show candidates independently awaiting or undergoing forward-DEMO evidence."""
+        experiments = await db.list_policy_experiments(self.settings.trading_mode, limit=20)
+        challengers = [item for item in experiments if item.get("status") in {"candidate", "forward_demo", "rejected_historical"}]
+        if not challengers:
+            text = "⚔️ **CHALLENGERS**\n\nNo active challengers. The engine will generate new falsifiable candidates from completed DEMO evidence."
+        else:
+            lines = ["⚔️ **CHALLENGERS**", ""]
+            for item in challengers:
+                policy = item.get("policy", {})
+                lines.append(
+                    f"`#{item['id']}` `{item['status'].upper()}` — `{item.get('model_version') or 'candidate'}`\n"
+                    f"Risk `{policy.get('risk_pct', 'n/a')}%`, RR `{policy.get('rr_target') or 'market-derived'}`, entry `{policy.get('entry_model', 'hybrid')}`\n"
+                    f"Reason: {item.get('reason', 'n/a')}\n"
+                )
+            text = "\n".join(lines)
+        await self._render_menu(update, text)
+
+    @admin_only
+    async def cmd_research(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show unresolved falsifiable hypotheses and the next research question."""
+        hypotheses = await db.get_open_hypotheses(self.settings.trading_mode)
+        if not hypotheses:
+            text = "🔬 **RESEARCH QUEUE**\n\nNo stored hypotheses yet. The next completed DEMO outcomes will seed the hypothesis engine."
+        else:
+            lines = ["🔬 **RESEARCH QUEUE**", ""]
+            for item in hypotheses[:8]:
+                evidence = item.get("evidence", {})
+                lines.append(
+                    f"• `{item['hypothesis_key']}` — {item['statement']}\n"
+                    f"  Candidates: `{item.get('candidate_values', [])}` | evidence sample `{evidence.get('sample_size', 0)}`\n"
+                )
+            text = "\n".join(lines)
         await self._render_menu(update, text)
 
     @admin_only
@@ -512,21 +587,15 @@ class BotHandlers:
 
     def _format_settings(self) -> str:
         return (
-            "⚙️ **Current Settings**\n\n"
-            f"Entry mode: {self.settings.entry_mode.upper()}\n"
-            f"Risk/setup: {self.settings.risk_per_trade}% (cap {self.settings.max_setup_risk_pct}%)\n"
-            f"Open-risk ceiling: {self.settings.max_total_open_risk_pct}%\n"
-            f"Daily loss / profit stop: -{self.settings.max_daily_loss_pct}% / +{self.settings.daily_profit_stop_pct}%\n"
-            f"Max trades/day: {self.settings.max_trades_per_day}\n"
-            f"Max positions / layers: {self.settings.max_open_positions} / {self.settings.max_layers}\n"
-            f"Min RR: 1:{self.settings.min_rr_ratio}\n"
-            f"Minimum setup quality: {self.settings.min_setup_score}%\n"
-            f"Max spread: {self.settings.max_spread_pips} pips\n"
-            f"Cooldown: {self.settings.symbol_cooldown_minutes} min\n"
+            "⚙️ **SYSTEM SETTINGS**\n\n"
+            "Trading policy is selected by the versioned DEMO research engine; this screen intentionally does not impose risk, RR, score, drawdown, layering, or management limits.\n\n"
             f"Auto-trade: {'ON' if self.settings.auto_trade else 'OFF'}\n"
-            f"Mode: {self.settings.trading_mode.upper()}\n"
-            f"Symbols: {', '.join(self.settings.symbols)}\n"
-            f"Timeframes: {', '.join(self.settings.timeframes)}"
+            f"Emergency pause: {'ON' if self.settings.is_paused else 'OFF'}\n"
+            f"Mode: {self.settings.trading_mode.upper()} (LIVE requires explicit confirmation)\n"
+            f"Chart activity: {self.settings.chart_activity_level.upper()}\n"
+            f"Broker universe: {len(self.settings.enabled_symbols)} enabled Deriv Synthetic Indices / Gold instruments\n"
+            f"Timeframes: {', '.join(self.settings.timeframes)}\n"
+            f"Research: {'ON' if self.settings.self_optimization_enabled else 'OFF'} | minimum evidence: {self.settings.optimization_min_sample_size} completed DEMO R outcomes"
         )
 
     @admin_only
@@ -1154,8 +1223,14 @@ class BotHandlers:
             await self.cmd_learning(update, context)
         elif data == "performance":
             await self.cmd_performance(update, context)
-        elif data == "model":
-            await self.cmd_model(update, context)
+        elif data in {"model", "champion"}:
+            await self.cmd_champion(update, context)
+        elif data == "experiments":
+            await self.cmd_experiments(update, context)
+        elif data == "challengers":
+            await self.cmd_challengers(update, context)
+        elif data == "research":
+            await self.cmd_research(update, context)
         elif data == "backtest_help":
             await self.cmd_backtest_help(update, context)
         elif data == "emergency":
@@ -1512,21 +1587,13 @@ class BotHandlers:
         app.add_handler(CommandHandler("markets", self.cmd_markets))
         app.add_handler(CommandHandler("positions", self.cmd_positions))
         app.add_handler(CommandHandler("learning", self.cmd_learning))
+        app.add_handler(CommandHandler("experiments", self.cmd_experiments))
+        app.add_handler(CommandHandler("champion", self.cmd_champion))
+        app.add_handler(CommandHandler("challengers", self.cmd_challengers))
+        app.add_handler(CommandHandler("research", self.cmd_research))
         app.add_handler(CommandHandler("performance", self.cmd_performance))
         app.add_handler(CommandHandler("settings", self.cmd_settings))
-        app.add_handler(CommandHandler("safety", self.cmd_safety))
-        app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("activity", self.cmd_activity))
-        app.add_handler(CommandHandler("risk", self.cmd_risk))
-        app.add_handler(CommandHandler("loss_limit", self.cmd_loss_limit))
-        app.add_handler(CommandHandler("open_risk", self.cmd_open_risk))
-        app.add_handler(CommandHandler("layers", self.cmd_layers))
-        app.add_handler(CommandHandler("rr", self.cmd_rr))
-        app.add_handler(CommandHandler("score", self.cmd_score))
-        app.add_handler(CommandHandler("cooldown", self.cmd_cooldown))
-        app.add_handler(CommandHandler("entry_mode", self.cmd_entry_mode))
-        app.add_handler(CommandHandler("aggressive", self.cmd_aggressive))
-        app.add_handler(CommandHandler("scalping", self.cmd_scalping))
         app.add_handler(CommandHandler("emergency", self.cmd_emergency))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))
         app.add_handler(CallbackQueryHandler(self.handle_callback))
