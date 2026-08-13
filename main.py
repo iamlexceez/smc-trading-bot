@@ -135,6 +135,9 @@ async def main():
         BotCommand("safety", "Hard limits and circuit breakers"),
         BotCommand("model", "Champion model and governance"),
         BotCommand("activity", "Chart-study notification mode"),
+        BotCommand("risk", "Tweak risk per trade percentage"),
+        BotCommand("loss_limit", "Tweak daily loss limit percentage"),
+        BotCommand("layers", "Tweak max confirmation layers"),
         BotCommand("emergency", "Pause execution; optionally close positions"),
         BotCommand("help", "Operational command guide"),
     ]

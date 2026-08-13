@@ -81,8 +81,8 @@ def classify_deriv_symbol(raw: dict[str, Any]) -> MarketSymbol:
     # for this bot, plus the standard XAUUSD Gold pair (not micro or alternate
     # metal variants).
     symbol_key = _normalise(symbol)
-    is_standard_gold = symbol_key == "xauusd"
-    if is_standard_gold:
+    is_gold = symbol_key == "xauusd" or symbol_key == "xauusdmicro"
+    if is_gold:
         category = "gold"
     elif any(token in text for token in SYNTHETIC_NAME_TOKENS) or re.search(r"\b(?:dex|jump)\s+\d+", text):
         category = "synthetic_index"

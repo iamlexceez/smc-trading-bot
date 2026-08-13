@@ -172,7 +172,17 @@ class BotHandlers:
             "`/model` — active model and governance decision\n"
             "`/activity [detailed|essential|off]` — chart-study notification mode\n"
             "`/emergency` — pause new execution and optionally close positions\n\n"
-            "Use `/settings` only for mode, entry model, and safety controls.",
+            "**Parameter Tweak Commands**\n"
+            "`/risk <pct>` — set risk per setup\n"
+            "`/loss_limit <pct>` — set daily loss stop limit\n"
+            "`/open_risk <pct>` — set total open risk ceiling\n"
+            "`/layers <1-4>` — set max confirmation layers\n"
+            "`/rr <ratio>` — set minimum RR ratio\n"
+            "`/score <0-100>` — set minimum quality score\n"
+            "`/cooldown <mins>` — set symbol cooldown\n"
+            "`/entry_mode <mode>` — set confirmed/aggressive/extreme\n"
+            "`/aggressive [on|off]` — toggle aggressive growth\n"
+            "`/scalping [on|off]` — toggle M1/M5 scalping mode",
         )
 
     @admin_only
@@ -1511,6 +1521,16 @@ class BotHandlers:
         app.add_handler(CommandHandler("safety", self.cmd_safety))
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("activity", self.cmd_activity))
+        app.add_handler(CommandHandler("risk", self.cmd_risk))
+        app.add_handler(CommandHandler("loss_limit", self.cmd_loss_limit))
+        app.add_handler(CommandHandler("open_risk", self.cmd_open_risk))
+        app.add_handler(CommandHandler("layers", self.cmd_layers))
+        app.add_handler(CommandHandler("rr", self.cmd_rr))
+        app.add_handler(CommandHandler("score", self.cmd_score))
+        app.add_handler(CommandHandler("cooldown", self.cmd_cooldown))
+        app.add_handler(CommandHandler("entry_mode", self.cmd_entry_mode))
+        app.add_handler(CommandHandler("aggressive", self.cmd_aggressive))
+        app.add_handler(CommandHandler("scalping", self.cmd_scalping))
         app.add_handler(CommandHandler("emergency", self.cmd_emergency))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))
         app.add_handler(CallbackQueryHandler(self.handle_callback))

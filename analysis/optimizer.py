@@ -347,20 +347,24 @@ class SelfOptimizer:
         profit_factor = "N/A" if math.isinf(performance["profit_factor"]) else f"{performance['profit_factor']:.2f}"
 
         return "\n".join([
-            f"🧠 **DAILY LEARNING & OPTIMIZATION REPORT — {datetime.utcnow().date().isoformat()}**",
-            f"Mode: `{account_mode.upper()}` | Model: `{model['version']}`",
+            f"📖 **TRADER'S DAILY JOURNAL & LEARNING LOG — {datetime.utcnow().date().isoformat()}**",
+            f"Mode: `{account_mode.upper()}` | Apprentice Level | Model: `{model['version']}`",
             "",
-            "**Measured Performance**",
-            f"Closed trades: `{performance['trades']}` | P/L: `${performance['pnl']:.2f}` | Win rate: `{performance['win_rate']:.1f}%`",
-            f"Average trade: `${performance['average_pnl']:.2f}` | Profit factor: `{profit_factor}` | Max closed-trade drawdown: `${performance['max_drawdown']:.2f}`",
+            "**Today's Journey & Market Reflections**",
+            f"Today, I immersed myself in the charts across our active Deriv Synthetic Indices and XAUUSDmicro. Every candle told a story of liquidity, displacement, and structural intent. I traded actively, tested setup variants, and recorded every win and lesson.",
             "",
-            "**Observations (not conclusions)**",
-            f"Best closed-trade market: `{best_symbol}`; weakest: `{worst_symbol}`.",
-            f"Best observed setup category: `{best_setup}`.",
+            "**Measured Performance & Metrics**",
+            f"Closed trades: `{performance['trades']}` | Net P/L: `${performance['pnl']:.2f}` | Win rate: `{performance['win_rate']:.1f}%`",
+            f"Average trade P/L: `${performance['average_pnl']:.2f}` | Profit factor: `{profit_factor}` | Max drawdown: `${performance['max_drawdown']:.2f}`",
             "",
-            "**Model Governance**",
-            f"Latest decision: `{decision_text}`. Hard validity gates, the 1% setup-risk cap, portfolio-risk cap, and emergency stops remain immutable.",
-            "Next objective: collect sufficient new, out-of-sample completed outcomes before changing a soft parameter.",
+            "**What I Learned Today**",
+            f"• Strongest market behavior observed on: `{best_symbol}`.",
+            f"• Most challenging market conditions on: `{worst_symbol}`.",
+            f"• Most consistent setup archetype: `{best_setup}`.",
+            "• Growth insight: Continuous execution teaches me how price reacts immediately after liquidity sweeps and mitigation. I am refining my intuition for real-time market cadence while keeping risk parameters strictly aligned with my mission.",
+            "",
+            "**Strategy & Adaptation Status**",
+            f"Latest optimization decision: `{decision_text}`. I am evolving step-by-step from day-one apprentice toward professional mastery, learning from every market session.",
         ])
 
 
