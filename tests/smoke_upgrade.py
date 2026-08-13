@@ -33,6 +33,7 @@ from analysis.account_monitor import summarize_history, exposure_summary
 from execution.capital_reduction import CapitalReductionEngine
 from analysis.capital_state import AccountCapitalState, CapitalStateService
 from analysis.runtime_telemetry import RuntimeTelemetry
+from strategy.setup_validator import calculate_rr
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
 from bot.handlers import BotHandlers  # noqa: F401 — validates Telegram control imports.
 
@@ -61,6 +62,14 @@ def test_runtime_telemetry() -> None:
     telemetry.component_failed("analysis_engine", RuntimeError("fixture failure"))
     assert_true(after["components"]["market_scanner"]["last_success"], "component success state was not retained")
     assert_true(telemetry.snapshot()["components"]["analysis_engine"]["state"] == "FAILED", "component failure was not exposed")
+
+
+def test_full_precision_rr_validation() -> None:
+    risk, reward, rr = calculate_rr("SELL", 4350.274, 4402.92955, 4343.897)
+    assert_true(abs(risk - 52.65555) < 1e-6 and abs(reward - 6.377) < 1e-6, "SELL RR distances were calculated incorrectly")
+    assert_true(abs(rr - 0.121107841433619) < 1e-9 and rr < 3.0, "exact low-RR SELL fixture was not rejected by full precision")
+    buy_risk, buy_reward, buy_rr = calculate_rr("BUY", 100.0, 98.0, 106.0)
+    assert_true(buy_risk == 2.0 and buy_reward == 6.0 and buy_rr == 3.0, "BUY RR formula is incorrect")
 
 
 async def test_single_flight_scan_guard() -> None:
@@ -590,6 +599,7 @@ async def test_demo_live_partitioning() -> None:
 
 def run() -> None:
     test_runtime_telemetry()
+    test_full_precision_rr_validation()
     asyncio.run(test_single_flight_scan_guard())
     test_scanner_eligibility_handoff()
     test_config_round_trip()

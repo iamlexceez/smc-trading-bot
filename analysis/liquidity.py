@@ -217,22 +217,32 @@ def detect_latest_sweep(
     return latest
 
 
+def select_market_targets(
+    pools: list[LiquidityPool],
+    direction: str,
+    entry_price: float,
+) -> list[LiquidityPool]:
+    """Return legitimate opposing unswept liquidity targets nearest-first.
+
+    The result is a market-structure hierarchy, not a manufactured RR ladder.
+    Callers may evaluate farther structural targets only when nearer targets do
+    not meet the active policy's RR requirement.
+    """
+    if direction.upper() == "BUY":
+        candidates = [pool for pool in pools if pool.side == LiquiditySide.BUY_SIDE and not pool.swept and pool.level > entry_price]
+        return sorted(candidates, key=lambda pool: pool.level)
+    candidates = [pool for pool in pools if pool.side == LiquiditySide.SELL_SIDE and not pool.swept and pool.level < entry_price]
+    return sorted(candidates, key=lambda pool: pool.level, reverse=True)
+
+
 def select_market_target(
     pools: list[LiquidityPool],
     direction: str,
     entry_price: float,
 ) -> Optional[LiquidityPool]:
-    """Choose the nearest opposing *unswept* structural liquidity target.
-
-    This deliberately does not manufacture a target from the desired RR.  The
-    caller calculates RR only after a legitimate structural target is found.
-    """
-    if direction.upper() == "BUY":
-        candidates = [pool for pool in pools if pool.side == LiquiditySide.BUY_SIDE and not pool.swept and pool.level > entry_price]
-        return min(candidates, key=lambda pool: pool.level) if candidates else None
-
-    candidates = [pool for pool in pools if pool.side == LiquiditySide.SELL_SIDE and not pool.swept and pool.level < entry_price]
-    return max(candidates, key=lambda pool: pool.level) if candidates else None
+    """Return the nearest target for compatibility with existing callers."""
+    candidates = select_market_targets(pools, direction, entry_price)
+    return candidates[0] if candidates else None
 
 
 __all__ = [
@@ -243,4 +253,5 @@ __all__ = [
     "build_liquidity_pools",
     "detect_latest_sweep",
     "select_market_target",
+    "select_market_targets",
 ]

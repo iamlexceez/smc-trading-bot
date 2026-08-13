@@ -23,6 +23,8 @@ class RuntimeTelemetry:
         "symbols_attempted", "symbols_analyzed",
         "candle_requests", "successful_candle_requests", "failed_candle_requests",
         "analysis_runs", "analysis_failures", "setups_detected", "setups_rejected",
+        "setups_rr_checked", "setups_rr_passed", "setups_rr_rejected",
+        "sizing_checked", "sizing_rejected", "margin_checked", "execution_approved",
         "trade_candidates", "orders_submitted", "orders_filled", "orders_rejected",
         "positions_checked", "positions_modified", "positions_closed",
         "observations", "experiments", "optimization_runs",

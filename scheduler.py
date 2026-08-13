@@ -708,6 +708,9 @@ class MarketScheduler:
             "sweep": ({"pool_level": sweep.pool.level, "pool_side": sweep.pool.side.value, "index": sweep.index} if sweep else None),
             "displacement": ({"confirmed": bool(displacement.confirmed), "index": displacement.index, "detail": displacement.detail} if displacement else None),
             "target": ({"level": target.level, "side": target.side.value, "kind": target.kind.value} if target else None),
+            "target_source": str(getattr(validation, "target_source", "") or ""),
+            "target_reason": str(getattr(validation, "target_reason", "") or ""),
+            "target_candidates": list(getattr(validation, "target_candidates", []) or []),
         }
 
     @staticmethod
@@ -905,8 +908,10 @@ class MarketScheduler:
         if atr_val <= 0 or (isinstance(atr_val, float) and atr_val != atr_val):
             atr_val = current_price * 0.002
 
+        policy_rr_floor = float(policy.rr_target) if policy.rr_target is not None else 0.0
+        required_rr = max(float(self.settings.min_rr_ratio), policy_rr_floor)
         validator = SetupValidator(
-            min_rr=0.0,
+            min_rr=required_rr,
             min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
             displacement_body_ratio=self.settings.displacement_body_ratio_min,
             displacement_range_ratio=self.settings.displacement_range_ratio_min,
@@ -923,10 +928,11 @@ class MarketScheduler:
             zones=zones,
             entry_mode=entry_mode,
             ltf_df=ltf_df,
-            target_rr=policy.rr_target,
+            target_rr=required_rr,
             stop_model=policy.stop_model,
             target_model=policy.target_model,
         )
+        self.telemetry.increment("setups_detected")
         setup_id = None
         if record_learning:
             setup_id = await db.record_setup(
@@ -947,20 +953,33 @@ class MarketScheduler:
                 experiment_id=experiment_id,
             )
         if not validation.valid:
-            # Malformed price/stop/target data is an operational integrity fault,
-            # not a failed SMC hypothesis. It must never reach the broker.
-            reason = "Candidate lacks broker-executable stop/target geometry"
-            self.telemetry.increment("setups_rejected")
-            self.telemetry.record_rejection(reason)
+            # Full-precision RR is checked before a candidate can reach policy,
+            # execution, broker sizing, or margin validation.
+            rr_check = next((check for check in validation.checks if check.name == "Minimum RR"), None)
+            if rr_check is not None and not rr_check.passed:
+                reason = "RR_BELOW_MINIMUM"
+                self.telemetry.increment("setups_rr_checked")
+                self.telemetry.increment("setups_rr_rejected")
+                self.telemetry.increment("setups_rejected")
+                self.telemetry.record_rejection(reason)
+            else:
+                reason = "Candidate lacks broker-executable stop/target geometry"
+                self.telemetry.increment("setups_rejected")
+                self.telemetry.record_rejection(reason)
+            # Malformed geometry and RR-invalid candidates never reach the broker.
             if setup_id is not None:
-                await db.update_setup_record(setup_id, status="invalidated", rejection_reason=reason)
+                await db.update_setup_record(setup_id, status="rejected", rejection_reason=reason)
+            reward_distance = abs(validation.take_profit - validation.entry_price) if validation.take_profit else 0.0
+            risk_distance = abs(validation.entry_price - validation.stop_loss) if validation.stop_loss else 0.0
             await self._chart_activity(
                 "validation_rejected", symbol,
-                f"⛔ **CANDIDATE INVALID — {symbol}**\nReason: {reason}\nNo order will be considered from this closed candle.",
-                fingerprint=f"{bar_time}:{direction}:invalid_geometry",
+                f"⛔ **SETUP REJECTED — {symbol}**\nDirection: `{direction}`\nEntry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}` | TP: `{validation.take_profit:.5f}`\nRisk distance: `{risk_distance:.5f}` | Reward distance: `{reward_distance:.5f}`\nRR: `1:{validation.rr_ratio:.8f}` | Required minimum: `1:{required_rr:.8f}`\nReason: `{reason}`\nTP source: `{validation.target_source or 'none'}`\nTP detail: {validation.target_reason or 'No valid target source'}\nNo sizing performed. No order submitted.",
+                fingerprint=f"{bar_time}:{direction}:{reason}:{validation.rr_ratio:.8f}",
             )
             return None
 
+        self.telemetry.increment("setups_rr_checked")
+        self.telemetry.increment("setups_rr_passed")
         # Scoring remains descriptive telemetry. The active policy determines
         # eligibility instead of a global score, RR, or SMC gate.
         quality = score_setup_quality(
@@ -1007,7 +1026,7 @@ class MarketScheduler:
             expires_at=(datetime.utcnow() + timedelta(minutes=self.settings.max_signal_age_minutes)).isoformat(),
             validation=validation,
             quality_factors=quality.factors,
-            target_source=validation.target_pool.kind.value if validation.target_pool else "policy_rr_fallback",
+            target_source=validation.target_source or (validation.target_pool.kind.value if validation.target_pool else "policy_rr_fallback"),
             setup_id=setup_id,
             passed=True,
             rejection_reason="",
@@ -1044,6 +1063,27 @@ class MarketScheduler:
         """Run risk checks and submit a broker order only if the candidate remains valid."""
         symbol = signal.symbol
         try:
+            # Defensive assertion: an RR-invalid signal must never reach final
+            # revalidation, broker sizing, margin validation, or execution.
+            signal_rr_floor = max(
+                float(self.settings.min_rr_ratio),
+                float(signal.experimental_policy.get("rr_target") or 0.0),
+            )
+            if float(signal.rr_ratio) < signal_rr_floor:
+                signal.passed = False
+                signal.rejection_reason = "RR_VALIDATION_ERROR"
+                self.telemetry.increment("setups_rr_checked")
+                self.telemetry.increment("setups_rr_rejected")
+                self.telemetry.increment("setups_rejected")
+                self.telemetry.record_rejection(signal.rejection_reason)
+                if signal.setup_id is not None:
+                    await db.update_setup_record(signal.setup_id, status="rejected", rejection_reason=signal.rejection_reason)
+                await self._chart_activity(
+                    "execution_rejected", symbol,
+                    f"⛔ **SETUP REJECTED — {symbol}**\nReason: `{signal.rejection_reason}`\nRR: `1:{signal.rr_ratio:.8f}` | Required minimum: `1:{signal_rr_floor:.8f}`\nNo sizing performed. No order submitted.",
+                    fingerprint=f"{signal.setup_id}:rr-assert:{signal.rr_ratio:.8f}", essential=True,
+                )
+                return False
             # Final revalidation immediately before any market order. A signal
             # approval or prior scan never freezes market structure or pricing.
             setup_id = signal.setup_id
@@ -1109,6 +1149,8 @@ class MarketScheduler:
                     return False
                 current_open_risk += position_risk
 
+            self.telemetry.increment("sizing_checked")
+            self.telemetry.increment("margin_checked")
             sizing = self.risk_manager.calculate_position_sizing(
                 account_equity=equity,
                 free_margin=free_margin,
@@ -1121,6 +1163,7 @@ class MarketScheduler:
                 fixed_volume=signal.experimental_policy.get("fixed_volume"),
             )
             if not sizing.valid:
+                self.telemetry.increment("sizing_rejected")
                 signal.passed = False
                 signal.rejection_reason = f"Sizing rejected: {sizing.reason}"
                 self.telemetry.record_rejection(signal.rejection_reason)
@@ -1239,6 +1282,7 @@ class MarketScheduler:
                 )
                 return False
 
+            self.telemetry.increment("execution_approved")
             await self._chart_activity(
                 "broker_submission", symbol,
                 f"📤 **BROKER ORDER SUBMITTED — {symbol}**\nDirection: `{signal.direction}` | Required volume: `{initial_layer['lot']}`\n"

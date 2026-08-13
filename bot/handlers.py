@@ -309,7 +309,9 @@ class BotHandlers:
             f"Scan cycles: {lifetime.get('scan_cycles_started', 0)} started / {lifetime.get('scan_cycles_completed', 0)} completed / {lifetime.get('scan_cycles_failed', 0)} failed / {lifetime.get('scan_cycles_skipped_overlap', 0)} overlap-skipped",
             f"Symbols: {lifetime.get('symbols_attempted', 0)} attempted / {lifetime.get('symbols_analyzed', 0)} analyzed | Candles: {lifetime.get('candle_requests', 0)} requested / {lifetime.get('failed_candle_requests', 0)} failed",
             f"Analysis: {lifetime.get('analysis_runs', 0)} runs / {lifetime.get('setups_detected', 0)} detected / {lifetime.get('setups_rejected', 0)} rejected",
-            f"Orders: {lifetime.get('orders_submitted', 0)} submitted / {lifetime.get('orders_filled', 0)} filled / {lifetime.get('orders_rejected', 0)} rejected",
+            f"RR pipeline: {lifetime.get('setups_rr_checked', 0)} checked / {lifetime.get('setups_rr_passed', 0)} passed / {lifetime.get('setups_rr_rejected', 0)} rejected",
+            f"Sizing pipeline: {lifetime.get('sizing_checked', 0)} checked / {lifetime.get('sizing_rejected', 0)} rejected | Margin: {lifetime.get('margin_checked', 0)} checked",
+            f"Execution pipeline: {lifetime.get('execution_approved', 0)} approved / {lifetime.get('orders_submitted', 0)} submitted / {lifetime.get('orders_filled', 0)} filled / {lifetime.get('orders_rejected', 0)} rejected",
             f"Positions: {lifetime.get('positions_checked', 0)} checked / {lifetime.get('positions_modified', 0)} modified / {lifetime.get('positions_closed', 0)} closed",
         ])
         await self._render_plain_menu(update, "\n".join(lines))

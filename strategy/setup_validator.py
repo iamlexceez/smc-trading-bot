@@ -22,6 +22,7 @@ from analysis.liquidity import (
     build_liquidity_pools,
     detect_latest_sweep,
     select_market_target,
+    select_market_targets,
 )
 from analysis.structure import FairValueGap, MarketStructure, OrderBlock, StructureEventType, Trend
 from analysis.supply_demand import SupplyDemandZone, ZoneType
@@ -69,6 +70,9 @@ class SetupValidationResult:
     displacement: Optional[DisplacementResult] = None
     confirmation: Optional[ConfirmationResult] = None
     target_pool: Optional[LiquidityPool] = None
+    target_source: str = ""
+    target_reason: str = ""
+    target_candidates: list[dict] = field(default_factory=list)
 
     @property
     def rejection_reason(self) -> str:
@@ -78,6 +82,19 @@ class SetupValidationResult:
     @property
     def passed_checks(self) -> bool:
         return all(check.passed for check in self.checks)
+
+
+def calculate_rr(direction: str, entry_price: float, stop_loss: float, take_profit: float) -> tuple[float, float, float]:
+    """Return risk distance, reward distance, and full-precision RR for valid directional geometry."""
+    if str(direction).upper() == "BUY":
+        risk_distance = float(entry_price) - float(stop_loss)
+        reward_distance = float(take_profit) - float(entry_price)
+    else:
+        risk_distance = float(stop_loss) - float(entry_price)
+        reward_distance = float(entry_price) - float(take_profit)
+    if risk_distance <= 0 or reward_distance <= 0:
+        return max(0.0, risk_distance), max(0.0, reward_distance), 0.0
+    return risk_distance, reward_distance, reward_distance / risk_distance
 
 
 def _event_matches_direction(event_type: StructureEventType, direction: str) -> bool:
@@ -299,22 +316,52 @@ class SetupValidator:
         stop_valid = (requested_direction == "BUY" and 0 < stop_loss < entry) or (requested_direction == "SELL" and stop_loss > entry)
         result.checks.append(ValidationCheck("Executable stop", stop_valid, f"SL {stop_loss:.5f}" if stop_valid else "Could not derive valid stop"))
         risk = abs(entry - stop_loss)
-        target_pool = select_market_target(pools, requested_direction, entry)
+        target_candidates = select_market_targets(pools, requested_direction, entry)
+        required_rr = float(target_rr if target_rr is not None else self.min_rr)
+        result.target_candidates = [
+            {
+                "level": float(pool.level), "kind": pool.kind.value, "timeframe": pool.timeframe,
+                "rr_ratio": abs(float(pool.level) - entry) / risk if risk > 0 else 0.0,
+            }
+            for pool in target_candidates
+        ]
+        target_pool = None
+        if target_model in {"liquidity", "structure", "dynamic", "adaptive"}:
+            # Preserve the nearest legitimate target first, then evaluate farther
+            # opposing structural pools only if they meet the required RR.
+            for pool in target_candidates:
+                candidate_rr = abs(float(pool.level) - entry) / risk if risk > 0 else 0.0
+                if candidate_rr >= required_rr:
+                    target_pool = pool
+                    result.target_source = f"liquidity:{pool.kind.value}"
+                    result.target_reason = f"Selected opposing unswept {pool.kind.value} liquidity at {pool.level:.5f}; RR {candidate_rr:.8f} meets {required_rr:.8f}"
+                    break
+            if target_pool is None and target_candidates:
+                # Keep the nearest structural target as diagnostic evidence. It
+                # remains RR-invalid and cannot pass into sizing or execution.
+                nearest = target_candidates[0]
+                target_pool = nearest
+                result.target_source = f"liquidity:{nearest.kind.value}"
+                result.target_reason = f"Nearest opposing unswept {nearest.kind.value} liquidity at {nearest.level:.5f} has RR {abs(float(nearest.level) - entry) / risk if risk > 0 else 0.0:.8f}; no legitimate structural alternative met {required_rr:.8f}"
+        elif risk > 0 and target_rr is not None:
+            target_pool = None
+            result.target_source = "policy_rr_fallback"
+            result.target_reason = f"Policy fixed-RR target at {target_rr:.8f}R"
         result.target_pool = target_pool
-        liquidity_target_valid = target_pool is not None and ((requested_direction == "BUY" and target_pool.level > entry) or (requested_direction == "SELL" and target_pool.level < entry))
-        if target_model in {"liquidity", "structure", "dynamic", "adaptive"} and liquidity_target_valid:
+        if target_pool is not None:
             take_profit = float(target_pool.level)
-        elif risk > 0:
-            rr = float(target_rr or 1.0)
-            take_profit = entry + risk * rr if requested_direction == "BUY" else entry - risk * rr
+        elif target_model not in {"liquidity", "structure", "dynamic", "adaptive"} and risk > 0 and target_rr is not None:
+            take_profit = entry + risk * float(target_rr) if requested_direction == "BUY" else entry - risk * float(target_rr)
         else:
             take_profit = 0.0
         result.take_profit = take_profit
         target_valid = (requested_direction == "BUY" and take_profit > entry) or (requested_direction == "SELL" and 0 < take_profit < entry)
         result.checks.append(ValidationCheck("Executable target", target_valid, f"TP {take_profit:.5f}" if target_valid else "Could not derive valid target"))
-        result.rr_ratio = abs(take_profit - entry) / risk if risk > 0 and target_valid else 0.0
-        # Only data and broker-order shape are mandatory in research candidate generation.
-        result.valid = stop_valid and target_valid
+        _, _, result.rr_ratio = calculate_rr(requested_direction, entry, stop_loss, take_profit) if target_valid else (0.0, 0.0, 0.0)
+        rr_valid = target_valid and result.rr_ratio >= required_rr
+        result.checks.append(ValidationCheck("Minimum RR", rr_valid, f"RR {result.rr_ratio:.8f}; minimum {required_rr:.8f}; {result.target_reason or 'No target source'}"))
+        # Full-precision RR is a hard pre-sizing execution prerequisite.
+        result.valid = stop_valid and target_valid and rr_valid
         return result
 
     def validate(
@@ -477,6 +524,7 @@ class SetupValidator:
 
 
 __all__ = [
+    "calculate_rr",
     "EntryMode",
     "SetupValidationResult",
     "SetupValidator",
