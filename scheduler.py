@@ -80,6 +80,7 @@ class MarketScheduler:
         self.account_reconciliation = AccountReconciliationEngine(self.executor, self.settings.trading_mode)
         self.last_account_reconciliation: dict = {}
         self.capital_state_service = CapitalStateService(self.settings, self.executor)
+        self.capital_state_service.begin_target_universe_refresh({"stage": "scheduler_created"})
         self.last_capital_state: dict = {}
         self.last_broker_metadata_audit_paths: tuple[str, str] | None = None
         self.capital_reduction = CapitalReductionEngine(self.settings, self.executor)
@@ -153,6 +154,8 @@ class MarketScheduler:
         self.capital_state_service.executor = self.executor
         capital = await self.capital_state_service.evaluate()
         self.last_capital_state = capital
+        audit = capital.get("broker_metadata") or {}
+        logger.info("[ACCOUNT VALIDATOR] Received targets: %s | Usable: %s | Invalid: %s | State: %s", audit.get("target_count", 0), audit.get("usable_count", 0), audit.get("invalid_count", 0), capital.get("state"))
         self.account_reconciliation.executor = self.executor
         self.account_reconciliation.account_mode = self.settings.trading_mode
         snapshot = await self.account_reconciliation.snapshot(history_days=0)
@@ -173,8 +176,12 @@ class MarketScheduler:
                 await db.save_settings(self.settings)
         elif (
             self.settings.is_paused and self.settings.auto_trade
-            and str((capital.get("previous") or {}).get("state") or "") == AccountCapitalState.ACCOUNT_STATE_UNKNOWN
-            and state in {AccountCapitalState.NORMAL, AccountCapitalState.LOW_CAPITAL}
+            and str((capital.get("previous") or {}).get("state") or "") in {
+                AccountCapitalState.ACCOUNT_STATE_UNKNOWN, AccountCapitalState.TARGET_UNIVERSE_INITIALIZING,
+                AccountCapitalState.TARGET_UNIVERSE_EMPTY, AccountCapitalState.TARGET_SYMBOLS_VALIDATING,
+                AccountCapitalState.TARGET_SYMBOLS_INVALID,
+            }
+            and state in {AccountCapitalState.ACCOUNT_VERIFIED, AccountCapitalState.LOW_CAPITAL}
         ):
             # This is not an account reset. It is a recovery from a fail-closed
             # metadata/connection unknown state after current MT5 facts prove an
@@ -231,6 +238,25 @@ class MarketScheduler:
                 f"Free margin: {currency} {float(account.get('free_margin') or 0.0):,.2f}",
                 "Trading remains PAUSED. Use /resume to re-verify the broker state and resume DEMO trading.",
             ])
+        elif state in {AccountCapitalState.TARGET_UNIVERSE_INITIALIZING, AccountCapitalState.TARGET_UNIVERSE_EMPTY, AccountCapitalState.TARGET_SYMBOLS_VALIDATING, AccountCapitalState.TARGET_SYMBOLS_INVALID}:
+            audit = capital.get("broker_metadata") or {}
+            pipeline = audit.get("pipeline") or {}
+            headline = {
+                AccountCapitalState.TARGET_UNIVERSE_INITIALIZING: "⏳ TARGET UNIVERSE INITIALIZING",
+                AccountCapitalState.TARGET_UNIVERSE_EMPTY: "⚠️ TARGET UNIVERSE EMPTY",
+                AccountCapitalState.TARGET_SYMBOLS_VALIDATING: "⏳ TARGET SYMBOLS VALIDATING",
+                AccountCapitalState.TARGET_SYMBOLS_INVALID: "⚠️ TARGET SYMBOLS INVALID",
+            }.get(state, "⚠️ TARGET UNIVERSE HALTED")
+            text = "\n".join([
+                headline,
+                "Trading is halted while broker target discovery/validation is incomplete.",
+                f"MT5 broker symbols discovered: {pipeline.get('broker_symbols_returned', 0)}",
+                f"Synthetic targets: {pipeline.get('synthetic_targets_detected', 0)} | Gold targets: {pipeline.get('gold_targets_detected', 0)}",
+                f"Broker-verified targets: {pipeline.get('broker_verified_targets', 0)} | Enabled targets: {pipeline.get('enabled_targets', audit.get('target_count', 0))}",
+                f"Usable: {audit.get('usable_count', 0)} | Invalid: {audit.get('invalid_count', 0)}",
+                f"Reason: {capital.get('reason')}",
+                "Action: use /brokercheck to inspect the complete symbol pipeline.",
+            ])
         elif state == AccountCapitalState.ACCOUNT_STATE_UNKNOWN:
             audit = capital.get("broker_metadata") or {}
             text = "\n".join([
@@ -266,8 +292,8 @@ class MarketScheduler:
             f"Engine: {running}",
             f"MT5: {mt5}",
             f"Account: {str(account.get('broker_account_mode') or self.settings.trading_mode).upper()}",
-            f"Target symbols: {audit.get('target_count', 0)}",
-            f"Usable: {audit.get('usable_count', 0)} | Invalid: {audit.get('invalid_count', 0)}",
+            f"Broker symbols: {(audit.get('pipeline') or {}).get('broker_symbols_returned', 0)} | Target symbols: {audit.get('target_count', 0)}",
+            f"Usable: {audit.get('usable_count', 0)} | Invalid: {audit.get('invalid_count', 0)} | Universe: {audit.get('universe_state', 'UNKNOWN')}",
             f"Trading: {trading}",
             f"Capital state: {state}",
             f"Reason: {capital.get('reason') or 'Awaiting the next broker verification'}",
@@ -338,6 +364,20 @@ class MarketScheduler:
             self.last_universe_audit_paths = None
 
         active = self.market_universe.available_symbols
+        synthetic_targets = [record.symbol for record in records if record.category == "synthetic_index"]
+        gold_targets = [record.symbol for record in records if record.category == "gold"]
+        pipeline = {
+            "broker_symbols_returned": len(records),
+            "synthetic_targets_detected": len(synthetic_targets),
+            "gold_targets_detected": len(gold_targets),
+            "broker_verified_targets": len(active),
+            "broker_verified_target_symbols": list(active),
+            "universe_refresh_error": self.market_universe.last_refresh_error or None,
+            "stage": "broker_classification_complete",
+        }
+        logger.info("[UNIVERSE] MT5 returned %s symbols", len(records))
+        logger.info("[CLASSIFIER] Synthetic targets: %s | Gold targets: %s", len(synthetic_targets), len(gold_targets))
+        logger.info("[BROKER VERIFY] Verified targets: %s | %s", len(active), active)
         # Discovery is authoritative and fail-closed. It deliberately clears a
         # prior universe even when MT5 returned records that were all rejected.
         self.settings.symbols = [record.symbol for record in self.market_universe.accepted_records]
@@ -349,6 +389,11 @@ class MarketScheduler:
         }
         self.settings.market_universe_updated_at = datetime.utcnow().isoformat()
         await db.save_settings(self.settings)
+        # Give the validator the completed broker universe directly instead of
+        # making it depend on settings persistence or subsequent reload timing.
+        pipeline.update({"stage": "enabled_targets_populated", "enabled_targets": len(self.settings.enabled_symbols), "enabled_target_symbols": list(self.settings.enabled_symbols)})
+        self.capital_state_service.set_verified_target_universe(active, pipeline)
+        logger.info("[ENABLED] Enabled targets: %s | %s", len(self.settings.enabled_symbols), self.settings.enabled_symbols)
 
         eligible_count = sum(1 for record in records if record.category in {"synthetic_index", "gold"})
         logger.info(

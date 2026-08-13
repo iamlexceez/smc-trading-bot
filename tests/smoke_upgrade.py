@@ -472,6 +472,20 @@ async def test_broker_authoritative_capital_state() -> None:
         unknown = await service.evaluate()
         assert_true(unknown["state"] == AccountCapitalState.ACCOUNT_STATE_UNKNOWN, "unavailable MT5 account was not fail-closed")
 
+        broker.available = True
+        broker.balance = broker.equity = broker.free_margin = 1_000.0
+        service.set_verified_target_universe([], {"broker_symbols_returned": 30, "synthetic_targets_detected": 0, "gold_targets_detected": 0, "broker_verified_targets": 0})
+        target_empty = await service.evaluate()
+        assert_true(target_empty["state"] == AccountCapitalState.TARGET_UNIVERSE_EMPTY and target_empty["broker_metadata"]["target_count"] == 0, "zero targets were misclassified as invalid symbol metadata")
+
+        service.begin_target_universe_refresh({"broker_symbols_returned": 30})
+        initializing = await service.evaluate()
+        assert_true(initializing["state"] == AccountCapitalState.TARGET_UNIVERSE_INITIALIZING, "validator did not distinguish an in-progress universe handoff")
+
+        service.set_verified_target_universe(["Volatility 75 Index"], {"broker_symbols_returned": 30, "synthetic_targets_detected": 1, "gold_targets_detected": 0, "broker_verified_targets": 1})
+        verified = await service.evaluate()
+        assert_true(verified["state"] == AccountCapitalState.ACCOUNT_VERIFIED and verified["broker_metadata"]["target_count"] == 1, "completed broker-universe handoff did not reach account validation")
+
 
 async def test_demo_live_partitioning() -> None:
     with tempfile.TemporaryDirectory() as directory:

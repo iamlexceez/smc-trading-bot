@@ -23,7 +23,14 @@ from storage import db
 
 
 class AccountCapitalState:
-    NORMAL = "NORMAL"
+    # ACCOUNT_VERIFIED replaces the opaque NORMAL label while NORMAL remains a
+    # compatibility alias for existing callers that compare the constant.
+    ACCOUNT_VERIFIED = "ACCOUNT_VERIFIED"
+    NORMAL = ACCOUNT_VERIFIED
+    TARGET_UNIVERSE_INITIALIZING = "TARGET_UNIVERSE_INITIALIZING"
+    TARGET_UNIVERSE_EMPTY = "TARGET_UNIVERSE_EMPTY"
+    TARGET_SYMBOLS_VALIDATING = "TARGET_SYMBOLS_VALIDATING"
+    TARGET_SYMBOLS_INVALID = "TARGET_SYMBOLS_INVALID"
     LOW_CAPITAL = "LOW_CAPITAL"
     CRITICAL_CAPITAL = "CRITICAL_CAPITAL"
     CAPITAL_EXHAUSTED = "CAPITAL_EXHAUSTED"
@@ -32,7 +39,11 @@ class AccountCapitalState:
     AWAITING_RESUME = "AWAITING_RESUME"
     ACCOUNT_STATE_UNKNOWN = "ACCOUNT_STATE_UNKNOWN"
 
-    BLOCKING = {CAPITAL_EXHAUSTED, CRITICAL_CAPITAL, TRADING_HALTED, AWAITING_RESUME, ACCOUNT_STATE_UNKNOWN}
+    BLOCKING = {
+        TARGET_UNIVERSE_INITIALIZING, TARGET_UNIVERSE_EMPTY, TARGET_SYMBOLS_VALIDATING,
+        TARGET_SYMBOLS_INVALID, CAPITAL_EXHAUSTED, CRITICAL_CAPITAL, TRADING_HALTED,
+        AWAITING_RESUME, ACCOUNT_STATE_UNKNOWN,
+    }
 
 
 @dataclass(frozen=True)
@@ -58,6 +69,37 @@ class CapitalStateService:
         self._minimum_cache_at = 0.0
         self.last_result: dict[str, Any] = {}
         self.last_metadata_audit: dict[str, Any] = {}
+        self._verified_target_symbols: Optional[tuple[str, ...]] = None
+        self._target_universe_state = "UNINITIALIZED"
+        self._target_pipeline: dict[str, Any] = {}
+
+    def begin_target_universe_refresh(self, pipeline: Optional[dict[str, Any]] = None) -> None:
+        """Mark the broker target handoff as in progress; no settings list is read."""
+        self._verified_target_symbols = None
+        self._target_universe_state = "INITIALIZING"
+        self._target_pipeline = dict(pipeline or {})
+
+    def set_verified_target_universe(self, symbols: list[str], pipeline: Optional[dict[str, Any]] = None) -> None:
+        """Atomically accept only completed broker-classified target identifiers."""
+        self._verified_target_symbols = tuple(sorted({str(symbol).strip() for symbol in symbols if str(symbol).strip()}))
+        self._target_universe_state = "READY" if self._verified_target_symbols else "EMPTY"
+        self._target_pipeline = dict(pipeline or {})
+        self._target_pipeline.update({
+            "enabled_targets": len(self._verified_target_symbols),
+            "enabled_target_symbols": list(self._verified_target_symbols),
+            "universe_state": self._target_universe_state,
+        })
+
+    def _target_symbols_for_validation(self) -> tuple[list[str], str, dict[str, Any]]:
+        """Return the scheduler's completed handoff, never a stale persisted list."""
+        if self._target_universe_state == "INITIALIZING":
+            return [], "INITIALIZING", dict(self._target_pipeline)
+        if self._verified_target_symbols is not None:
+            return list(self._verified_target_symbols), self._target_universe_state, dict(self._target_pipeline)
+        # Compatibility for isolated test services that do not own a scheduler.
+        # Production scheduler paths always call set_verified_target_universe.
+        symbols = sorted({str(symbol).strip() for symbol in self.settings.enabled_symbols if str(symbol).strip()})
+        return symbols, "SETTINGS_FALLBACK", {"enabled_targets": len(symbols), "universe_state": "SETTINGS_FALLBACK"}
 
     @staticmethod
     def _number(value: Any) -> Optional[float]:
@@ -228,7 +270,7 @@ class CapitalStateService:
         """Audit every currently enabled broker-approved target symbol read-only."""
         account = account or {}
         free_margin = self._number(account.get("free_margin"))
-        symbols = sorted({str(symbol).strip() for symbol in self.settings.enabled_symbols if str(symbol).strip()})
+        symbols, universe_state, pipeline = self._target_symbols_for_validation()
         records = []
         for symbol in symbols:
             records.append(self._validate_probe(symbol, await self._probe_symbol(symbol), free_margin))
@@ -237,6 +279,8 @@ class CapitalStateService:
         failures = Counter(record["reason"] for record in invalid if record.get("reason"))
         audit = self._as_json({
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "universe_state": universe_state,
+            "pipeline": pipeline,
             "target_symbols": symbols,
             "target_count": len(symbols),
             "usable_symbols": [record["symbol"] for record in usable],
@@ -259,9 +303,12 @@ class CapitalStateService:
         json_path = target / f"mt5_broker_metadata_{timestamp}.json"
         markdown_path = target / f"mt5_broker_metadata_{timestamp}.md"
         json_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        pipeline = audit.get("pipeline") or {}
         lines = [
             "# MT5 Broker Metadata Audit", "",
-            f"Generated: `{audit.get('generated_at', '')}`", "",
+            f"Generated: `{audit.get('generated_at', '')}` | Universe state: `{audit.get('universe_state', 'UNKNOWN')}`", "",
+            f"Broker symbols returned: `{pipeline.get('broker_symbols_returned', 0)}` | Synthetic targets: `{pipeline.get('synthetic_targets_detected', 0)}` | Gold targets: `{pipeline.get('gold_targets_detected', 0)}`",
+            f"Broker-verified targets: `{pipeline.get('broker_verified_targets', 0)}` | Enabled targets: `{pipeline.get('enabled_targets', audit.get('target_count', 0))}`",
             f"Target symbols: `{audit.get('target_count', 0)}` | Usable: `{audit.get('usable_count', 0)}` | Invalid: `{audit.get('invalid_count', 0)}`", "",
             "| Symbol | Price | Volume | Contract | Margin | Leverage | Status | Reason |",
             "|---|---|---|---|---|---|---|---|",
@@ -290,9 +337,14 @@ class CapitalStateService:
             for record in audit.get("symbols", []) if record.get("specification_valid") and self._num(record.get("margin_required")) > 0
         ]
         if not candidates:
-            reason = "No enabled broker target has valid price, volume, and broker-calculated minimum-order margin"
-            if audit.get("invalid_count"):
-                reason += f"; top failure: {audit.get('top_failure')}"
+            if audit.get("universe_state") == "INITIALIZING":
+                reason = "Broker target universe is still initializing; symbol metadata validation has not started"
+            elif int(audit.get("target_count") or 0) == 0:
+                reason = "Broker target universe is empty; account validator received zero completed broker-classified targets"
+            else:
+                reason = "Broker target symbols were received but none has valid price, volume, and broker-calculated minimum-order margin"
+                if audit.get("invalid_count"):
+                    reason += f"; top failure: {audit.get('top_failure')}"
             result = MinimumOperatingCapital(0.0, 0.0, (), reason)
         else:
             minimum = min(value for value, _ in candidates)
@@ -378,7 +430,7 @@ class CapitalStateService:
             session_id = await self._session_for_account(account, previous, reset=reset_detected)
             await db.update_demo_session_equity(session_id, balance=balance, equity=equity, db_path=self.db_path)
 
-            state, reason = self._classify(account, minimum)
+            state, reason = self._classify(account, minimum, audit)
             if reset_detected:
                 state = AccountCapitalState.AWAITING_RESUME
                 reason = "Broker-observed DEMO balance reset verified; waiting for explicit resume"
@@ -400,6 +452,7 @@ class CapitalStateService:
                 "capacity_count": self._capacity_count(free_margin, minimum.amount),
                 "snapshot_time": snapshot.get("retrieved_at"),
                 "broker_metadata": {
+                    "universe_state": audit.get("universe_state", "UNKNOWN"), "pipeline": audit.get("pipeline", {}),
                     "target_count": audit.get("target_count", 0), "usable_count": audit.get("usable_count", 0),
                     "invalid_count": audit.get("invalid_count", 0), "top_failure": audit.get("top_failure", "None"),
                     "invalid_symbols": audit.get("invalid_symbols", []),
@@ -430,7 +483,16 @@ class CapitalStateService:
             self.last_result = result
             return result
 
-    def _classify(self, account: dict, minimum: MinimumOperatingCapital) -> tuple[str, str]:
+    def _classify(self, account: dict, minimum: MinimumOperatingCapital, audit: Optional[dict] = None) -> tuple[str, str]:
+        audit = audit or {}
+        universe_state = str(audit.get("universe_state") or "UNKNOWN")
+        target_count = int(audit.get("target_count") or 0)
+        if universe_state == "INITIALIZING":
+            return AccountCapitalState.TARGET_UNIVERSE_INITIALIZING, "Broker target universe is still initializing; account validation is waiting for the completed broker discovery handoff"
+        if target_count == 0:
+            return AccountCapitalState.TARGET_UNIVERSE_EMPTY, "Broker target universe is empty; account validator received zero completed broker-classified targets"
+        if minimum.amount <= 0 or not minimum.executable_symbols:
+            return AccountCapitalState.TARGET_SYMBOLS_INVALID, minimum.reason
         equity = self._num(account.get("equity"))
         free_margin = self._num(account.get("free_margin"))
         margin_level = self._num(account.get("margin_level"))
@@ -438,8 +500,6 @@ class CapitalStateService:
         stopout_level = self._num(account.get("margin_so_so"))
         if equity <= 0:
             return AccountCapitalState.CAPITAL_EXHAUSTED, "Actual broker equity is non-positive"
-        if minimum.amount <= 0 or not minimum.executable_symbols:
-            return AccountCapitalState.ACCOUNT_STATE_UNKNOWN, minimum.reason
         if free_margin < minimum.amount:
             return AccountCapitalState.CAPITAL_EXHAUSTED, "Free margin cannot fund one broker-valid minimum-volume position"
         if stopout_level > 0 and margin_level > 0 and margin_level <= stopout_level:
@@ -449,7 +509,7 @@ class CapitalStateService:
         capacity = self._capacity_count(free_margin, minimum.amount)
         if capacity < 2:
             return AccountCapitalState.LOW_CAPITAL, "Available free margin supports only one minimum broker-valid position"
-        return AccountCapitalState.NORMAL, "Broker account can fund at least two minimum broker-valid positions"
+        return AccountCapitalState.ACCOUNT_VERIFIED, "Broker account is verified with at least one completed broker-valid target specification"
 
     async def _persist_unknown(self, previous: Optional[dict], reason: str) -> dict[str, Any]:
         changed = not previous or previous.get("state") != AccountCapitalState.ACCOUNT_STATE_UNKNOWN

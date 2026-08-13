@@ -291,8 +291,9 @@ class BotHandlers:
             logger.exception("Could not write explicit broker-check audit: %s", exc)
         currency = str(account.get("currency") or "USD")
         current = bool(capital.get("current"))
+        pipeline = audit.get("pipeline") or {}
         lines = [
-            "BROKER CHECK — READ-ONLY MT5 AUDIT",
+            "🔎 BROKER CHECK — READ-ONLY MT5 AUDIT",
             f"MT5: {'CONNECTED' if current else 'UNAVAILABLE'}",
             f"Account: {str(account.get('broker_account_mode') or self.settings.trading_mode).upper()}",
             f"Balance: {currency} {float(account.get('balance') or 0.0):,.2f}",
@@ -300,8 +301,11 @@ class BotHandlers:
             f"Free margin: {currency} {float(account.get('free_margin') or 0.0):,.2f}",
             f"Margin: {currency} {float(account.get('margin') or 0.0):,.2f} | Level: {float(account.get('margin_level') or 0.0):.1f}%",
             f"Account leverage: {account.get('leverage') if account.get('leverage') is not None else 'NOT EXPOSED'}",
-            f"Target symbols: {audit.get('target_count', 0)} | Usable: {audit.get('usable_count', 0)} | Invalid: {audit.get('invalid_count', 0)}",
-            f"Account state: {capital.get('state') or 'ACCOUNT_STATE_UNKNOWN'}",
+            f"Broker symbols returned: {pipeline.get('broker_symbols_returned', 0)}",
+            f"Synthetic targets detected: {pipeline.get('synthetic_targets_detected', 0)} | Gold detected: {pipeline.get('gold_targets_detected', 0)}",
+            f"Broker-verified targets: {pipeline.get('broker_verified_targets', 0)} | Enabled targets: {pipeline.get('enabled_targets', audit.get('target_count', 0))}",
+            f"Target symbols: {audit.get('target_count', 0)} | Passed metadata validation: {audit.get('usable_count', 0)} | Failed metadata validation: {audit.get('invalid_count', 0)}",
+            f"Universe stage: {audit.get('universe_state', 'UNKNOWN')} | Account state: {capital.get('state') or 'ACCOUNT_STATE_UNKNOWN'}",
             f"Reason: {capital.get('reason') or 'Broker data unavailable'}",
             "",
             "SYMBOL VALIDATION",
@@ -316,7 +320,14 @@ class BotHandlers:
                 f"  Required margin: {currency} {float(record.get('margin_required') or 0.0):,.2f} | {record.get('reason')}",
             ])
         if not audit.get("symbols"):
-            lines.append("No enabled broker target symbols were available for validation.")
+            if int(audit.get("target_count") or 0) == 0:
+                lines.extend([
+                    "⚠️ TARGET UNIVERSE EMPTY",
+                    "The account validator received no completed broker-classified target symbols.",
+                    "This is a broker universe/configuration/initialization pipeline condition, not a price, volume, or margin failure.",
+                ])
+            else:
+                lines.append("No enabled broker target symbols were available for validation.")
         if markdown_path:
             lines.extend(["", f"Full audit: {markdown_path}", f"JSON audit: {json_path}"])
         report = "\n".join(lines)
