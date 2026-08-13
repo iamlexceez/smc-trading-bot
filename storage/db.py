@@ -191,6 +191,70 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS demo_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                broker_login TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                start_balance REAL NOT NULL,
+                start_equity REAL NOT NULL,
+                end_balance REAL,
+                end_equity REAL,
+                max_equity REAL NOT NULL,
+                min_equity REAL NOT NULL,
+                max_drawdown_pct REAL NOT NULL DEFAULT 0,
+                exhaustion_reason TEXT,
+                reset_detected_at TEXT,
+                strategy_trades INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                losses INTEGER NOT NULL DEFAULT 0,
+                profit_factor REAL,
+                expectancy_r REAL,
+                capital_reduction_activity INTEGER NOT NULL DEFAULT 0,
+                capital_test_active INTEGER NOT NULL DEFAULT 0,
+                policy_versions_json TEXT NOT NULL DEFAULT '[]'
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS account_state (
+                account_mode TEXT PRIMARY KEY,
+                broker_login TEXT,
+                state TEXT NOT NULL,
+                state_changed_at TEXT NOT NULL,
+                last_checked_at TEXT NOT NULL,
+                last_balance REAL,
+                last_equity REAL,
+                last_free_margin REAL,
+                last_margin_level REAL,
+                minimum_operating_capital REAL,
+                active_demo_session_id INTEGER,
+                exhaustion_reason TEXT,
+                reset_previous_balance REAL,
+                reset_previous_equity REAL,
+                reset_detected_at TEXT,
+                notification_key TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS account_state_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_mode TEXT NOT NULL,
+                broker_login TEXT,
+                demo_session_id INTEGER,
+                event_type TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                balance REAL,
+                equity REAL,
+                free_margin REAL,
+                margin_level REAL,
+                minimum_operating_capital REAL,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS capital_reduction_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_mode TEXT NOT NULL,
@@ -294,17 +358,21 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await _ensure_column(db, "trades", "max_adverse_r", "REAL DEFAULT 0")
         await _ensure_column(db, "trades", "policy_version", "TEXT")
         await _ensure_column(db, "trades", "experiment_id", "INTEGER")
+        await _ensure_column(db, "trades", "demo_session_id", "INTEGER")
         await _ensure_column(db, "setup_records", "policy_version", "TEXT")
         await _ensure_column(db, "setup_records", "experiment_id", "INTEGER")
         await _ensure_column(db, "trade_baskets", "policy_version", "TEXT")
         await _ensure_column(db, "trade_baskets", "experiment_id", "INTEGER")
         await _ensure_column(db, "trade_baskets", "account_mode", "TEXT NOT NULL DEFAULT 'demo'")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode_status ON trades(account_mode, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_demo_session ON trades(demo_session_id, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_setups_mode_status ON setup_records(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_trade ON execution_events(trade_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_model_versions_mode_role ON model_versions(account_mode, role, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hypotheses_mode_status ON research_hypotheses(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_experiments_mode_status ON policy_experiments(account_mode, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_demo_sessions_login_status ON demo_sessions(broker_login, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_account_state_events_mode_time ON account_state_events(account_mode, created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_capital_reduction_mode_status ON capital_reduction_sessions(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_capital_reduction_actions_session ON capital_reduction_actions(session_id, created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_layers_ticket ON trade_layers(ticket)")
@@ -338,18 +406,19 @@ async def record_trade(
     tp_price: float, lot_size: float, score: float, rr_ratio: float,
     executor: str, raw_signal: str, account_mode: str = "demo", ticket: Optional[int] = None,
     setup_id: Optional[int] = None, initial_risk: float = 0.0,
-    policy_version: Optional[str] = None, experiment_id: Optional[int] = None, db_path: str = DB_PATH
+    policy_version: Optional[str] = None, experiment_id: Optional[int] = None,
+    demo_session_id: Optional[int] = None, db_path: str = DB_PATH
 ) -> int:
     async with aiosqlite.connect(db_path) as db:
         now = datetime.utcnow().isoformat()
         cursor = await db.execute(
             """INSERT INTO trades (timestamp, symbol, direction, entry_price, sl_price, tp_price,
                lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk,
-               raw_signal, policy_version, experiment_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               raw_signal, policy_version, experiment_id, demo_session_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (now, symbol, direction, entry_price, sl_price, tp_price,
              lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk,
-             raw_signal, policy_version, experiment_id)
+             raw_signal, policy_version, experiment_id, demo_session_id)
         )
         await db.commit()
         return cursor.lastrowid
@@ -1533,5 +1602,258 @@ async def get_strategy_trade_outcomes_excluding_capital_reduction(
                  ))
                ORDER BY t.timestamp ASC, t.id ASC""",
             (account_mode, since),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_account_state(account_mode: str = "demo", db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM account_state WHERE account_mode = ?", (account_mode,))
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["metadata"] = json.loads(result.pop("metadata_json") or "{}")
+    return result
+
+
+async def upsert_account_state(
+    *,
+    account_mode: str,
+    broker_login: Optional[str],
+    state: str,
+    balance: Optional[float],
+    equity: Optional[float],
+    free_margin: Optional[float],
+    margin_level: Optional[float],
+    minimum_operating_capital: Optional[float],
+    active_demo_session_id: Optional[int],
+    exhaustion_reason: Optional[str] = None,
+    reset_previous_balance: Optional[float] = None,
+    reset_previous_equity: Optional[float] = None,
+    reset_detected_at: Optional[str] = None,
+    notification_key: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    db_path: str = DB_PATH,
+) -> None:
+    """Persist one authoritative broker-account state row per account mode."""
+    now = datetime.utcnow().isoformat()
+    previous = await get_account_state(account_mode, db_path)
+    changed_at = now if not previous or previous.get("state") != state else previous.get("state_changed_at", now)
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """INSERT INTO account_state
+               (account_mode, broker_login, state, state_changed_at, last_checked_at,
+                last_balance, last_equity, last_free_margin, last_margin_level,
+                minimum_operating_capital, active_demo_session_id, exhaustion_reason,
+                reset_previous_balance, reset_previous_equity, reset_detected_at,
+                notification_key, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(account_mode) DO UPDATE SET
+                broker_login=excluded.broker_login, state=excluded.state,
+                state_changed_at=excluded.state_changed_at, last_checked_at=excluded.last_checked_at,
+                last_balance=excluded.last_balance, last_equity=excluded.last_equity,
+                last_free_margin=excluded.last_free_margin, last_margin_level=excluded.last_margin_level,
+                minimum_operating_capital=excluded.minimum_operating_capital,
+                active_demo_session_id=excluded.active_demo_session_id,
+                exhaustion_reason=excluded.exhaustion_reason,
+                reset_previous_balance=excluded.reset_previous_balance,
+                reset_previous_equity=excluded.reset_previous_equity,
+                reset_detected_at=excluded.reset_detected_at,
+                notification_key=excluded.notification_key, metadata_json=excluded.metadata_json""",
+            (
+                account_mode, broker_login, state, changed_at, now, balance, equity,
+                free_margin, margin_level, minimum_operating_capital,
+                active_demo_session_id, exhaustion_reason, reset_previous_balance,
+                reset_previous_equity, reset_detected_at, notification_key,
+                json.dumps(metadata or {}, sort_keys=True),
+            ),
+        )
+        await conn.commit()
+
+
+async def create_demo_session(
+    *, broker_login: str, start_balance: float, start_equity: float,
+    capital_reduction_activity: bool = False, capital_test_active: bool = False,
+    db_path: str = DB_PATH,
+) -> int:
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            """INSERT INTO demo_sessions
+               (broker_login, status, started_at, start_balance, start_equity, max_equity,
+                min_equity, capital_reduction_activity, capital_test_active)
+               VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?)""",
+            (str(broker_login), now, float(start_balance), float(start_equity),
+             float(start_equity), float(start_equity), int(capital_reduction_activity), int(capital_test_active)),
+        )
+        await conn.commit()
+        return int(cursor.lastrowid)
+
+
+async def get_demo_session(session_id: int, db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM demo_sessions WHERE id = ?", (int(session_id),))
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["policy_versions"] = json.loads(result.pop("policy_versions_json") or "[]")
+    result["capital_reduction_activity"] = bool(result.get("capital_reduction_activity"))
+    result["capital_test_active"] = bool(result.get("capital_test_active"))
+    return result
+
+
+async def get_active_demo_session(broker_login: str, db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM demo_sessions WHERE broker_login = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+            (str(broker_login),),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["policy_versions"] = json.loads(result.pop("policy_versions_json") or "[]")
+    result["capital_reduction_activity"] = bool(result.get("capital_reduction_activity"))
+    result["capital_test_active"] = bool(result.get("capital_test_active"))
+    return result
+
+
+async def update_demo_session_equity(
+    session_id: int, *, balance: float, equity: float, capital_test_active: Optional[bool] = None,
+    db_path: str = DB_PATH,
+) -> None:
+    current = await get_demo_session(session_id, db_path)
+    if not current:
+        return
+    maximum = max(float(current.get("max_equity") or equity), float(equity))
+    minimum = min(float(current.get("min_equity") or equity), float(equity))
+    drawdown = max(0.0, (maximum - minimum) / maximum * 100) if maximum else 0.0
+    fields = ["end_balance = ?", "end_equity = ?", "max_equity = ?", "min_equity = ?", "max_drawdown_pct = ?"]
+    values: list[Any] = [float(balance), float(equity), maximum, minimum, drawdown]
+    if capital_test_active is not None:
+        fields.append("capital_test_active = ?")
+        values.append(int(bool(capital_test_active)))
+    values.append(int(session_id))
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(f"UPDATE demo_sessions SET {', '.join(fields)} WHERE id = ?", values)
+        await conn.commit()
+
+
+async def close_demo_session(
+    session_id: int, *, status: str, balance: float, equity: float,
+    exhaustion_reason: Optional[str] = None, reset_detected_at: Optional[str] = None,
+    db_path: str = DB_PATH,
+) -> None:
+    await update_demo_session_equity(session_id, balance=balance, equity=equity, db_path=db_path)
+    await refresh_demo_session_metrics(session_id, db_path)
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """UPDATE demo_sessions SET status = ?, ended_at = ?, end_balance = ?, end_equity = ?,
+               exhaustion_reason = ?, reset_detected_at = ? WHERE id = ?""",
+            (status, datetime.utcnow().isoformat(), float(balance), float(equity), exhaustion_reason, reset_detected_at, int(session_id)),
+        )
+        await conn.commit()
+
+
+async def record_account_state_event(
+    *, account_mode: str, broker_login: Optional[str], demo_session_id: Optional[int],
+    event_type: str, state: str, balance: Optional[float], equity: Optional[float],
+    free_margin: Optional[float], margin_level: Optional[float], minimum_operating_capital: Optional[float],
+    details: Optional[dict] = None, db_path: str = DB_PATH,
+) -> int:
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            """INSERT INTO account_state_events
+               (account_mode, broker_login, demo_session_id, event_type, state, created_at,
+                balance, equity, free_margin, margin_level, minimum_operating_capital, details_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (account_mode, broker_login, demo_session_id, event_type, state,
+             datetime.utcnow().isoformat(), balance, equity, free_margin,
+             margin_level, minimum_operating_capital, json.dumps(details or {}, sort_keys=True)),
+        )
+        await conn.commit()
+        return int(cursor.lastrowid)
+
+
+async def get_recent_account_state_events(account_mode: str = "demo", limit: int = 20, db_path: str = DB_PATH) -> list[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM account_state_events WHERE account_mode = ? ORDER BY id DESC LIMIT ?",
+            (account_mode, max(1, int(limit))),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    for row in rows:
+        row["details"] = json.loads(row.pop("details_json") or "{}")
+    return rows
+
+
+async def refresh_demo_session_metrics(session_id: int, db_path: str = DB_PATH) -> dict:
+    """Aggregate only normal strategy trades assigned to one DEMO session."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT pnl, pnl_r, symbol, policy_version FROM trades
+               WHERE demo_session_id = ? AND status = 'closed'
+                 AND (ticket IS NULL OR ticket NOT IN (
+                    SELECT ticket FROM capital_reduction_actions
+                    WHERE ticket IS NOT NULL AND action = 'order_filled'
+                 ))
+               ORDER BY timestamp ASC, id ASC""",
+            (int(session_id),),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    pnls = [float(row.get("pnl") or 0.0) for row in rows]
+    r_values = [float(row.get("pnl_r") or 0.0) for row in rows if row.get("pnl_r") is not None]
+    wins = [value for value in pnls if value > 0]
+    losses = [value for value in pnls if value < 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    factor = gross_profit / gross_loss if gross_loss else (float("inf") if gross_profit else None)
+    policies = sorted({str(row["policy_version"]) for row in rows if row.get("policy_version")})
+    metrics = {
+        "strategy_trades": len(rows), "wins": len(wins), "losses": len(losses),
+        "profit_factor": factor, "expectancy_r": sum(r_values) / len(r_values) if r_values else None,
+        "policy_versions": policies,
+    }
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """UPDATE demo_sessions SET strategy_trades = ?, wins = ?, losses = ?,
+               profit_factor = ?, expectancy_r = ?, policy_versions_json = ? WHERE id = ?""",
+            (metrics["strategy_trades"], metrics["wins"], metrics["losses"], metrics["profit_factor"],
+             metrics["expectancy_r"], json.dumps(policies), int(session_id)),
+        )
+        await conn.commit()
+    return metrics
+
+
+async def get_demo_session_report(session_id: int, db_path: str = DB_PATH) -> Optional[dict]:
+    session = await get_demo_session(session_id, db_path)
+    if not session:
+        return None
+    await refresh_demo_session_metrics(session_id, db_path)
+    return await get_demo_session(session_id, db_path)
+
+
+async def get_demo_session_symbol_summary(session_id: int, db_path: str = DB_PATH) -> list[dict]:
+    """Return normal strategy P/L by market for one reset-separated DEMO session."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT symbol, COUNT(*) AS trades, COALESCE(SUM(pnl), 0) AS pnl,
+                      COALESCE(AVG(pnl_r), 0) AS avg_r
+               FROM trades
+               WHERE demo_session_id = ? AND status = 'closed'
+                 AND (ticket IS NULL OR ticket NOT IN (
+                    SELECT ticket FROM capital_reduction_actions
+                    WHERE ticket IS NOT NULL AND action = 'order_filled'
+                 ))
+               GROUP BY symbol ORDER BY pnl DESC, trades DESC""",
+            (int(session_id),),
         )
         return [dict(row) for row in await cursor.fetchall()]

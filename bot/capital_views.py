@@ -68,3 +68,31 @@ def capital_actions_view(session: Optional[dict], currency: str = "USD") -> str:
             f" | {details.get('reason') or ''}"
         )
     return "\n".join(lines)
+
+
+
+def demo_session_report_view(session: Optional[dict], symbols: list[dict], currency: str = "USD") -> str:
+    if not session:
+        return "DEMO SESSION REPORT\n\nNo broker-verified DEMO session has been recorded yet."
+    factor = session.get("profit_factor")
+    pf = "N/A" if factor is None else ("∞" if factor == float("inf") else f"{float(factor):.2f}")
+    expectancy = session.get("expectancy_r")
+    best = symbols[0]["symbol"] if symbols else "No completed normal strategy trades"
+    worst = symbols[-1]["symbol"] if symbols else "No completed normal strategy trades"
+    title = "🚨 DEMO SESSION ENDED" if session.get("status") == "exhausted" else "💰 DEMO SESSION REPORT"
+    return "\n".join([
+        title,
+        f"Session: #{session.get('id')} | Status: {str(session.get('status') or 'unknown').upper()}",
+        f"Started: {session.get('started_at')} | Ended: {session.get('ended_at') or 'ACTIVE'}",
+        f"Starting capital: {money(session.get('start_balance'), currency)} | Starting equity: {money(session.get('start_equity'), currency)}",
+        f"Ending capital: {money(session.get('end_balance'), currency)} | Ending equity: {money(session.get('end_equity'), currency)}",
+        f"Peak equity: {money(session.get('max_equity'), currency)} | Minimum equity: {money(session.get('min_equity'), currency)}",
+        f"Maximum drawdown: {float(session.get('max_drawdown_pct') or 0.0):.2f}%",
+        f"Normal strategy trades: {int(session.get('strategy_trades') or 0)} | Wins: {int(session.get('wins') or 0)} | Losses: {int(session.get('losses') or 0)}",
+        f"Profit factor: {pf} | Expectancy: {f'{float(expectancy):.2f}R' if expectancy is not None else 'N/A'}",
+        f"Best market: {best} | Worst market: {worst}",
+        f"Policy versions: {', '.join(session.get('policy_versions') or []) or 'No completed policy-attributed trades'}",
+        f"Capital reduction activity: {'YES' if session.get('capital_reduction_activity') else 'NO'} | Capital test: {'ACTIVE' if session.get('capital_test_active') else 'NO'}",
+        f"End reason: {session.get('exhaustion_reason') or 'Not exhausted'}",
+        "Intentional capital-reduction trades are excluded from normal strategy statistics.",
+    ])

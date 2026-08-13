@@ -406,6 +406,15 @@ class SelfOptimizer:
         policy = ExperimentalPolicy.from_dict(champion["parameters"])
         challenger_text = challenger.get("model_version", "No forward challenger") if challenger else "No forward challenger"
         next_hypothesis = hypotheses[0]["statement"] if hypotheses else "Generate additional evidence from completed DEMO trades."
+        capital_state = await db.get_account_state("demo") if account_mode == "demo" else None
+        if capital_state:
+            capital_text = (
+                f"State: `{capital_state.get('state')}` | DEMO session: `#{capital_state.get('active_demo_session_id') or 'n/a'}` | "
+                f"Current equity: `${float(capital_state.get('last_equity') or 0.0):.2f}` | "
+                f"Minimum operating capital: `${float(capital_state.get('minimum_operating_capital') or 0.0):.2f}`"
+            )
+        else:
+            capital_text = "Capital state has not yet been broker-verified."
 
         return "\n".join([
             f"📖 **MORNING LEARNING REPORT — {datetime.utcnow().date().isoformat()}**",
@@ -420,6 +429,9 @@ class SelfOptimizer:
             f"Current Champion: `{champion['version']}`. Forward challenger: `{challenger_text}`.",
             f"Champion policy: entry `{policy.entry_model}`, risk `{policy.risk_model}` at `{policy.risk_pct}%`, RR `{policy.rr_target or 'market-derived'}`, layers `{policy.max_layers}`, management `{policy.trailing_model}`.",
             f"Latest research decision: `{decision}`.",
+            "",
+            "**Capital Status**",
+            capital_text,
             "",
             "**What Changed and What Did Not**",
             "A policy only changes after chronological historical evidence and actual broker-realized forward-DEMO results. No LIVE policy has been changed automatically.",

@@ -62,6 +62,10 @@ class LiveAccountViews:
         history = summarize_history(snapshot.get("history", []))
         drawdown = max(0.0, balance - equity) / balance * 100 if balance else 0.0
         exposure = exposure_summary(snapshot)
+        capital = await db.get_account_state("demo") if self.account_mode == "demo" else None
+        capital_status = str((capital or {}).get("state") or "NOT YET VERIFIED")
+        minimum_operating = self._money((capital or {}).get("minimum_operating_capital"), currency)
+        capital_reason = (capital or {}).get("exhaustion_reason") or "Broker state currently supports normal monitoring."
         return "\n".join([
             f"ACCOUNT — {self.mode_label} — LIVE MT5 DATA",
             f"Updated: {snapshot.get('retrieved_at')}",
@@ -78,6 +82,8 @@ class LiveAccountViews:
             "",
             f"Open positions: {len(snapshot.get('positions', []))} | Pending orders: {len(snapshot.get('pending_orders', []))}",
             f"Margin exposure: {exposure['margin_exposure_pct']:.2f}% | Current drawdown vs balance: {drawdown:.2f}%",
+            f"Capital state: {capital_status} | Minimum operating capital: {minimum_operating}",
+            f"Capital action: {capital_reason}",
             f"Account sync: {'SYNCHRONIZED' if not reconciliation.get('discrepancies') else f'{len(reconciliation.get("discrepancies", []))} discrepancy(s) — use /health'}",
             "Source: fresh MT5 account snapshot; local database is used only for bot-trade annotation.",
         ])
@@ -226,11 +232,14 @@ class LiveAccountViews:
             return f"ACCOUNT HEALTH — {self.mode_label}\n\nCONNECTION LOST / DATA UNAVAILABLE\n{snapshot.get('error', 'Unknown MT5 error')}"
         account = snapshot["account"]
         discrepancies = reconciliation.get("discrepancies", [])
+        capital = await db.get_account_state("demo") if self.account_mode == "demo" else None
         return "\n".join([
             f"ACCOUNT HEALTH — {self.mode_label}",
             "Connection: CONNECTED | Data: CURRENT (fresh MT5 query)",
             f"Open positions: {len(snapshot.get('positions', []))} | Pending orders: {len(snapshot.get('pending_orders', []))}",
             f"Free margin: {self._money(account.get('free_margin'), str(account.get('currency') or 'USD'))} | Margin level: {float(account.get('margin_level') or 0.0):.1f}%",
+            f"Capital state: {(capital or {}).get('state') or 'NOT YET VERIFIED'} | Minimum operating capital: {self._money((capital or {}).get('minimum_operating_capital'), str(account.get('currency') or 'USD'))}",
+            f"Capital reason: {(capital or {}).get('exhaustion_reason') or 'No blocking capital condition recorded.'}",
             f"Account synchronization: {'SYNCHRONIZED' if not discrepancies else f'{len(discrepancies)} discrepancy(s) detected'}",
             *( [f"- #{item.get('ticket')} {item.get('symbol')}: {item.get('detail')}" for item in discrepancies[:10]] or ["- No broker/local mismatch detected."] ),
             f"Last synchronization: {snapshot.get('retrieved_at')}",

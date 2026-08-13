@@ -31,6 +31,7 @@ from analysis.optimizer import SelfOptimizer
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 from analysis.account_monitor import summarize_history, exposure_summary
 from execution.capital_reduction import CapitalReductionEngine
+from analysis.capital_state import AccountCapitalState, CapitalStateService
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
 from bot.handlers import BotHandlers  # noqa: F401 — validates Telegram control imports.
 
@@ -400,6 +401,70 @@ async def test_capital_reduction_isolation() -> None:
         assert_true(completed and completed["capital_test_active"] and completed["status"] == "completed", "capital-test transition was not persisted")
 
 
+async def test_broker_authoritative_capital_state() -> None:
+    class FakeBroker:
+        def __init__(self) -> None:
+            self.available = True
+            self.balance = 100.0
+            self.equity = 100.0
+            self.free_margin = 100.0
+            self.margin_level = 1_000.0
+
+        async def get_live_account_snapshot(self, history_days=0):
+            if not self.available:
+                return {"current": False, "error": "MT5 unavailable"}
+            return {
+                "current": True, "retrieved_at": "2026-08-13T10:00:00Z",
+                "account": {
+                    "login": 123456, "broker_account_mode": "demo", "balance": self.balance,
+                    "equity": self.equity, "free_margin": self.free_margin,
+                    "margin_level": self.margin_level, "margin_so_call": 100.0,
+                    "margin_so_so": 50.0, "leverage": 100, "currency": "USD",
+                },
+            }
+
+        async def get_symbol_info(self, symbol):
+            return {"min_lot": 0.1, "contract_size": 100.0}
+
+        async def get_symbol_price(self, symbol):
+            return 100.0, 100.0
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "capital_state.db")
+        await db.init_db(path)
+        settings = TradeSettings.defaults()
+        settings.enabled_symbols = ["Volatility 75 Index"]
+        settings.trading_mode = "demo"
+        broker = FakeBroker()
+        service = CapitalStateService(settings, broker, db_path=path)
+        normal = await service.evaluate()
+        assert_true(normal["state"] == AccountCapitalState.NORMAL and normal["demo_session_id"], "normal broker account did not create a valid DEMO session")
+        first_session = normal["demo_session_id"]
+        repeat = await service.evaluate()
+        assert_true(repeat["demo_session_id"] == first_session and not repeat["changed"], "steady account state created a duplicate DEMO session or event")
+
+        broker.margin_level = 99.0
+        critical = await service.evaluate()
+        assert_true(critical["state"] == AccountCapitalState.CRITICAL_CAPITAL and critical["state"] in AccountCapitalState.BLOCKING, "broker margin-call condition did not halt execution as capital-critical")
+
+        broker.margin_level = 1_000.0
+        broker.free_margin = 5.0
+        exhausted = await service.evaluate()
+        assert_true(exhausted["state"] == AccountCapitalState.CAPITAL_EXHAUSTED, "insufficient broker free margin was not classified as functional exhaustion")
+        persisted = await db.get_account_state("demo", path)
+        assert_true(persisted and persisted["state"] == AccountCapitalState.CAPITAL_EXHAUSTED, "exhausted state was not persisted authoritatively")
+
+        broker.balance = broker.equity = broker.free_margin = 1_000.0
+        reset = await service.evaluate()
+        assert_true(reset["state"] == AccountCapitalState.AWAITING_RESUME and reset["reset_detected"], "broker balance increase after exhaustion did not create a verified reset state")
+        resumed = await service.verify_resume()
+        assert_true(resumed["resume_verified"] and resumed["state"] == AccountCapitalState.NORMAL, "verified DEMO reset could not enter a resumable normal state")
+
+        broker.available = False
+        unknown = await service.evaluate()
+        assert_true(unknown["state"] == AccountCapitalState.ACCOUNT_STATE_UNKNOWN, "unavailable MT5 account was not fail-closed")
+
+
 async def test_demo_live_partitioning() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "modes.db")
@@ -432,6 +497,7 @@ def run() -> None:
     asyncio.run(test_experiment_engine_persistence())
     asyncio.run(test_chart_activity_notifications())
     asyncio.run(test_capital_reduction_isolation())
+    asyncio.run(test_broker_authoritative_capital_state())
     asyncio.run(test_demo_live_partitioning())
     print("PASS: upgrade smoke tests")
 

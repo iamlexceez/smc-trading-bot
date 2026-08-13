@@ -38,6 +38,7 @@ from risk.manager import RiskManager
 from executors.base import BaseExecutor, ExecutionResult
 from analysis.optimizer import SelfOptimizer
 from analysis.account_monitor import AccountReconciliationEngine
+from analysis.capital_state import AccountCapitalState, CapitalStateService
 from data.provider import DataProvider
 from data.universe import DerivMarketUniverse
 
@@ -78,6 +79,8 @@ class MarketScheduler:
         self.optimizer = SelfOptimizer(self.settings)
         self.account_reconciliation = AccountReconciliationEngine(self.executor, self.settings.trading_mode)
         self.last_account_reconciliation: dict = {}
+        self.capital_state_service = CapitalStateService(self.settings, self.executor)
+        self.last_capital_state: dict = {}
         self.capital_reduction = CapitalReductionEngine(self.settings, self.executor)
 
     async def start(self, interval_seconds: int = 300):
@@ -132,23 +135,84 @@ class MarketScheduler:
             replace_existing=True,
         )
 
-        # Force an immediate scan on startup in a background task
+        # Establish a broker-authoritative capital state before the first scan.
+        await self.reconcile_account_state()
+        # Force an immediate scan on startup only after that verification.
         asyncio.create_task(self.scan_and_execute())
 
     async def reconcile_account_state(self) -> dict:
-        """Compare MT5 current state with local bot records; never modify either."""
+        """Run the one authoritative broker capital-state evaluation plus read-only trade reconciliation."""
+        self.capital_state_service.settings = self.settings
+        self.capital_state_service.executor = self.executor
+        capital = await self.capital_state_service.evaluate()
+        self.last_capital_state = capital
         self.account_reconciliation.executor = self.executor
         self.account_reconciliation.account_mode = self.settings.trading_mode
         snapshot = await self.account_reconciliation.snapshot(history_days=0)
         result = await self.account_reconciliation.reconcile(snapshot)
         self.last_account_reconciliation = result
+
+        state = capital.get("state")
+        blocking = state in AccountCapitalState.BLOCKING or state == AccountCapitalState.CAPITAL_EXHAUSTED
+        if blocking and not self.settings.is_paused:
+            self.settings.is_paused = True
+            await db.save_settings(self.settings)
+            logger.warning("New trading halted by authoritative account state: %s (%s)", state, capital.get("reason"))
+        elif capital.get("reset_detected") and self.settings.demo_auto_resume_after_reset:
+            verified = await self.capital_state_service.verify_resume()
+            self.last_capital_state = verified
+            if verified.get("resume_verified"):
+                self.settings.is_paused = False
+                await db.save_settings(self.settings)
+
+        if capital.get("changed"):
+            await self._notify_capital_state(capital)
         if not result.get("current"):
             logger.warning("Account reconciliation unavailable: %s", result.get("error"))
         elif result.get("discrepancies"):
             logger.warning("Account reconciliation found %s discrepancy(s): %s", len(result["discrepancies"]), result["discrepancies"][:3])
         else:
             logger.info("Account reconciliation is synchronized: %s MT5 positions", result.get("broker_open_positions", 0))
-        return result
+        return {"capital": capital, "reconciliation": result}
+
+    async def _notify_capital_state(self, capital: dict) -> None:
+        """Send exactly one alert per material capital-state transition."""
+        if not self.bot_app or not self.admin_chat_id:
+            return
+        account = capital.get("account") or {}
+        currency = str(account.get("currency") or "USD")
+        state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
+        minimum = float(capital.get("minimum_operating_capital") or 0.0)
+        if state == AccountCapitalState.CAPITAL_EXHAUSTED:
+            text = "\n".join([
+                "🚨 DEMO CAPITAL EXHAUSTED",
+                "The bot can no longer reliably open a broker-valid minimum position with the actual account state.",
+                f"Balance: {currency} {float(account.get('balance') or 0.0):,.2f}",
+                f"Equity: {currency} {float(account.get('equity') or 0.0):,.2f}",
+                f"Free margin: {currency} {float(account.get('free_margin') or 0.0):,.2f}",
+                f"Margin level: {float(account.get('margin_level') or 0.0):.1f}%",
+                f"Minimum operating capital: {currency} {minimum:,.2f}",
+                f"Reason: {capital.get('reason')}",
+                "Status: TRADING HALTED. Reset the Deriv DEMO account externally, then use /health and /resume after the reset is verified.",
+            ])
+        elif state == AccountCapitalState.AWAITING_RESUME:
+            previous = capital.get("previous") or {}
+            text = "\n".join([
+                "✅ DEMO ACCOUNT RESET DETECTED",
+                f"Previous balance: {currency} {float(previous.get('last_balance') or 0.0):,.2f}",
+                f"New balance: {currency} {float(account.get('balance') or 0.0):,.2f}",
+                f"New equity: {currency} {float(account.get('equity') or 0.0):,.2f}",
+                f"Free margin: {currency} {float(account.get('free_margin') or 0.0):,.2f}",
+                "Trading remains PAUSED. Use /resume to re-verify the broker state and resume DEMO trading.",
+            ])
+        elif state == AccountCapitalState.ACCOUNT_STATE_UNKNOWN:
+            text = f"⚠️ ACCOUNT STATE UNKNOWN\nNew trading is halted until MT5 account state is verified.\nReason: {capital.get('reason')}"
+        else:
+            text = f"💰 DEMO CAPITAL STATUS: {state}\nReason: {capital.get('reason')}\nMinimum operating capital: {currency} {minimum:,.2f}"
+        try:
+            await self.bot_app.bot.send_message(chat_id=self.admin_chat_id, text=text)
+        except Exception as exc:
+            logger.error("Capital-state notification failed: %s", exc)
 
     async def run_capital_reduction(self) -> dict:
         """Advance the isolated DEMO reduction engine; it never feeds the optimizer."""
@@ -793,6 +857,7 @@ class MarketScheduler:
                     initial_risk=sizing.expected_loss,
                     policy_version=signal.policy_version,
                     experiment_id=signal.experiment_id,
+                    demo_session_id=(self.last_capital_state.get("demo_session_id") if self.settings.trading_mode == "demo" else None),
                 )
                 if signal.setup_id is not None:
                     await db.update_setup_record(signal.setup_id, status="executed", trade_id=trade_id)
@@ -905,6 +970,18 @@ class MarketScheduler:
     async def scan_and_execute(self):
         """Main loop: scan markets, check risk gates, execute trades."""
         await self._reload_settings()
+        self.capital_state_service.settings = self.settings
+        self.capital_state_service.executor = self.executor
+        capital = await self.capital_state_service.evaluate()
+        self.last_capital_state = capital
+        if capital.get("changed"):
+            await self._notify_capital_state(capital)
+        if capital.get("state") in AccountCapitalState.BLOCKING:
+            if not self.settings.is_paused:
+                self.settings.is_paused = True
+                await db.save_settings(self.settings)
+            logger.warning("Scan halted by authoritative account state: %s (%s)", capital.get("state"), capital.get("reason"))
+            return
 
         # ─── ACTIVE TRADE MANAGEMENT ──────────────────────
         # We manage positions even if auto_trade is OFF (to protect existing trades)

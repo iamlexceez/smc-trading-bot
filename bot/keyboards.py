@@ -62,7 +62,7 @@ def capital_test_menu(has_active_session: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Start Reduction", callback_data="capital_start"), InlineKeyboardButton("View Progress", callback_data="capital_status")],
         [InlineKeyboardButton("Pause", callback_data="capital_pause"), InlineKeyboardButton("Resume", callback_data="capital_resume")],
         [InlineKeyboardButton("Cancel", callback_data="capital_cancel"), InlineKeyboardButton("View Activity", callback_data="capital_activity")],
-        [InlineKeyboardButton("Enter Capital-Test Mode", callback_data="capital_enter_test")],
+        [InlineKeyboardButton("Enter Capital-Test Mode", callback_data="capital_enter_test"), InlineKeyboardButton("DEMO Session", callback_data="demo_session")],
         [InlineKeyboardButton("Account", callback_data="account"), InlineKeyboardButton("⬅️ Dashboard", callback_data="dashboard")],
     ]
     return InlineKeyboardMarkup(rows)

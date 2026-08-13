@@ -40,7 +40,7 @@ from analysis.scoring import format_signal_report
 from analysis.profiler import profiler
 from analysis.order_flow import order_flow
 from bot.account_views import LiveAccountViews
-from bot.capital_views import capital_actions_view, capital_test_view
+from bot.capital_views import capital_actions_view, capital_test_view, demo_session_report_view
 from risk.manager import RiskManager
 from executors.mt5 import MT5Executor
 
@@ -152,12 +152,17 @@ class BotHandlers:
         model_text = model["version"] if model else "baseline pending"
         forward = await db.get_active_forward_experiment(self.settings.trading_mode)
         experiment_text = forward.get("model_version", "none") if forward else "none"
+        capital = await db.get_account_state("demo") if self.settings.trading_mode == "demo" else None
+        capital_state = str((capital or {}).get("state") or "NOT YET VERIFIED")
+        minimum_operating = float((capital or {}).get("minimum_operating_capital") or 0.0)
+        capital_action = "RESET DEMO ACCOUNT" if capital_state == "CAPITAL_EXHAUSTED" else ("USE /resume AFTER VERIFIED RESET" if capital_state == "AWAITING_RESUME" else "MONITORING")
         return "\n".join([
             "🤖 **DERIV AUTONOMOUS RESEARCH SYSTEM**",
             f"Mode: `{self.settings.trading_mode.upper()}` | Autonomous execution: `{'ON' if self.settings.auto_trade and not self.settings.is_paused else 'OFF'}`",
             f"Broker universe: `{active_count}` active / `{available_count}` available Deriv Synthetic Indices or Gold",
             f"Today: `{performance['trades']}` closed trades | P/L `${performance['pnl']:.2f}` | win rate `{performance['win_rate']:.1f}%`",
             f"Champion: `{model_text}` | Forward-DEMO challenger: `{experiment_text}`",
+            f"Capital state: `{capital_state}` | Minimum operating capital: `${minimum_operating:.2f}` | Action: `{capital_action}`",
             f"Research engine: `{'enabled' if self.settings.self_optimization_enabled else 'disabled'}` — policy variables are learned from evidence, not fixed global caps.",
             "\nUse the research controls below. LIVE always requires a separate explicit confirmation.",
         ])
@@ -193,6 +198,8 @@ class BotHandlers:
             "`/capital_start` — show the deliberate-DEMO-drawdown confirmation prompt\n"
             "`/capital_pause`, `/capital_resume`, `/capital_cancel` — session controls\n"
             "`/capital_activity` — isolated intentional-reduction activity\n"
+            "`/demo_session [id]` — reset-separated DEMO session report\n"
+            "`/demo_auto_resume on|off` — optional verified-reset auto-resume\n"
             "`/backtest <symbol> <tf> <days>` — causal policy backtest\n"
             "`/activity [detailed|essential|off]` — chart-study notification mode\n"
             "`/settings` — autonomy, alerts, and explicit DEMO/LIVE controls\n"
@@ -725,6 +732,28 @@ class BotHandlers:
         await self.cmd_capital_test(update, context)
 
     @admin_only
+    async def cmd_demo_session_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show one permanent reset-separated DEMO session report."""
+        state = await db.get_account_state("demo")
+        session_id = None
+        if context.args:
+            try:
+                session_id = int(context.args[0])
+            except ValueError:
+                await self._render_plain_menu(update, "Usage: /demo_session [session_id]")
+                return
+        else:
+            session_id = (state or {}).get("active_demo_session_id")
+        if not session_id:
+            await self._render_plain_menu(update, "No broker-verified DEMO session has been recorded yet.")
+            return
+        session = await db.get_demo_session_report(int(session_id))
+        symbols = await db.get_demo_session_symbol_summary(int(session_id))
+        account = await self.executor.get_account_info()
+        currency = str((account or {}).get("currency") or "USD")
+        await self._render_plain_menu(update, demo_session_report_view(session, symbols, currency))
+
+    @admin_only
     async def cmd_capital_enter_test(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Report the automatic post-reduction transition; it never creates a broker order."""
         engine = self.capital_engine()
@@ -932,14 +961,33 @@ class BotHandlers:
 
     @admin_only
     async def cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Resume auto-trading."""
-        self.settings.is_paused = False
-        await db.save_settings(self.settings)
-        msg = "▶️ Auto-trading resumed."
+        """Resume only after a fresh viable broker account-capital verification."""
+        service = getattr(self.scheduler, "capital_state_service", None) if self.scheduler else None
+        result = await service.verify_resume() if service else {"resume_verified": False, "reason": "Scheduler/account-state service unavailable"}
+        if not result.get("resume_verified"):
+            msg = f"Trading remains HALTED. Broker account state is not viable for resumption: {result.get('reason', result.get('state', 'unknown'))}."
+        else:
+            self.settings.is_paused = False
+            await db.save_settings(self.settings)
+            msg = "▶️ DEMO broker state verified. Auto-trading resumed."
         if update.callback_query:
             await update.callback_query.edit_message_text(msg, reply_markup=keyboards.main_menu())
         else:
             await update.message.reply_text(msg, reply_markup=keyboards.main_menu())
+
+    @admin_only
+    async def cmd_demo_auto_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Configure whether a broker-verified external DEMO reset may resume automatically."""
+        if not context.args:
+            await self._render_plain_menu(update, f"DEMO reset auto-resume: {'ON' if self.settings.demo_auto_resume_after_reset else 'OFF'}\nUse /demo_auto_resume on or /demo_auto_resume off.")
+            return
+        value = context.args[0].strip().lower()
+        if value not in {"on", "off"}:
+            await self._render_plain_menu(update, "Usage: /demo_auto_resume on or /demo_auto_resume off")
+            return
+        self.settings.demo_auto_resume_after_reset = value == "on"
+        await db.save_settings(self.settings)
+        await self._render_plain_menu(update, f"DEMO reset auto-resume is now {'ON' if self.settings.demo_auto_resume_after_reset else 'OFF'}. Broker reset verification remains mandatory.")
 
     @admin_only
     async def cmd_set_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1459,6 +1507,8 @@ class BotHandlers:
             await self.cmd_capital_activity(update, context)
         elif data == "capital_enter_test":
             await self.cmd_capital_enter_test(update, context)
+        elif data == "demo_session":
+            await self.cmd_demo_session_report(update, context)
         elif data == "markets":
             await self.cmd_markets(update, context)
         elif data == "learning":
@@ -1850,6 +1900,8 @@ class BotHandlers:
         app.add_handler(CommandHandler("capital_status", self.cmd_capital_status))
         app.add_handler(CommandHandler("capital_activity", self.cmd_capital_activity))
         app.add_handler(CommandHandler("capital_enter_test", self.cmd_capital_enter_test))
+        app.add_handler(CommandHandler("demo_session", self.cmd_demo_session_report))
+        app.add_handler(CommandHandler("demo_auto_resume", self.cmd_demo_auto_resume))
         app.add_handler(CommandHandler("learning", self.cmd_learning))
         app.add_handler(CommandHandler("experiments", self.cmd_experiments))
         app.add_handler(CommandHandler("champion", self.cmd_champion))

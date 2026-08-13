@@ -142,6 +142,8 @@ async def main():
         BotCommand("capital_status", "Current capital reduction progress"),
         BotCommand("capital_activity", "Isolated capital reduction activity"),
         BotCommand("capital_enter_test", "Report completed DEMO capital-test transition"),
+        BotCommand("demo_session", "Broker-verified reset-separated DEMO session report"),
+        BotCommand("demo_auto_resume", "Set verified DEMO reset auto-resume on or off"),
         BotCommand("markets", "Broker-verified Deriv universe"),
         BotCommand("learning", "Measured learning status"),
         BotCommand("experiments", "Policy experiment lifecycle"),
