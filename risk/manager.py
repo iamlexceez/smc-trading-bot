@@ -35,10 +35,43 @@ class PositionSizingResult:
     available_margin: float
     loss_per_lot: float
     reason: str = ""
+    # Explicit instrument sizing evidence. ``policy_required_lot`` is the raw
+    # lot implied by the active policy; ``required_lot`` is the broker-step
+    # normalized executable request when one exists.
+    policy_required_lot: float = 0.0
+    required_lot: float = 0.0
+    broker_min_lot: float = 0.0
+    broker_max_lot: float = 0.0
+    broker_volume_step: float = 0.0
+    margin_per_lot: float = 0.0
+    minimum_lot_margin: float = 0.0
+    minimum_lot_loss: float = 0.0
+    sizing_code: str = ""
 
     @property
     def valid(self) -> bool:
         return self.final_volume > 0 and not self.reason
+
+    def evidence(self) -> dict:
+        """JSON-safe per-instrument lot calculation evidence for execution audits."""
+        return {
+            "policy_required_lot": self.policy_required_lot,
+            "required_lot": self.required_lot,
+            "final_volume": self.final_volume,
+            "broker_min_lot": self.broker_min_lot,
+            "broker_max_lot": self.broker_max_lot,
+            "broker_volume_step": self.broker_volume_step,
+            "margin_per_lot": self.margin_per_lot,
+            "minimum_lot_margin": self.minimum_lot_margin,
+            "minimum_lot_loss": self.minimum_lot_loss,
+            "risk_amount": self.risk_amount,
+            "expected_loss": self.expected_loss,
+            "required_margin": self.required_margin,
+            "available_margin": self.available_margin,
+            "loss_per_lot": self.loss_per_lot,
+            "sizing_code": self.sizing_code,
+            "reason": self.reason,
+        }
 
 
 @dataclass(frozen=True)
@@ -103,12 +136,26 @@ class RiskManager:
             return 0.0
         return (distance / tick_size) * tick_value
 
-    def estimate_margin_per_lot(self, entry_price: float, symbol_info: dict, leverage: float) -> float:
-        """Conservative MT5-specification margin estimate when order_calc_margin is unavailable."""
+    def margin_per_lot(self, entry_price: float, symbol_info: dict, leverage: float) -> float:
+        """Use fresh broker-native margin evidence first; estimate only as a compatibility fallback."""
+        broker_value = self._spec(symbol_info, "margin_per_lot", "broker_margin_per_lot", default=0.0)
+        if broker_value > 0:
+            return broker_value
+        minimum_volume = self._spec(symbol_info, "normalized_volume", "volume_min", "min_lot", default=0.0)
+        minimum_margin = self._spec(symbol_info, "margin_required_min_volume", "margin_required", default=0.0)
+        if minimum_volume > 0 and minimum_margin > 0:
+            return minimum_margin / minimum_volume
+        initial_margin = self._spec(symbol_info, "margin_initial", "initial_margin", default=0.0)
+        if initial_margin > 0:
+            return initial_margin
         contract_size = self._spec(symbol_info, "trade_contract_size", "contract_size", default=1.0)
         if entry_price <= 0 or leverage <= 0:
             return 0.0
         return abs(float(entry_price) * contract_size / float(leverage))
+
+    # Backward-compatible name retained for isolated older callers.
+    def estimate_margin_per_lot(self, entry_price: float, symbol_info: dict, leverage: float) -> float:
+        return self.margin_per_lot(entry_price, symbol_info, leverage)
 
     def calculate_position_sizing(
         self,
@@ -132,9 +179,12 @@ class RiskManager:
         """
         equity = self._risk_equity(account_equity)
         configured_risk_pct = self.settings.risk_per_trade if risk_pct is None else float(risk_pct)
+        broker_min_lot = self._spec(symbol_info, "volume_min", "min_lot", default=0.0)
+        broker_max_lot = self._spec(symbol_info, "volume_max", "max_lot", default=0.0)
+        broker_volume_step = self._spec(symbol_info, "volume_step", "step_lot", default=broker_min_lot)
         loss_per_lot = self.loss_per_lot_at_stop(entry_price, stop_loss, symbol_info)
         if loss_per_lot <= 0:
-            return PositionSizingResult(0, 0, 0, 0, 0, 0, free_margin, loss_per_lot, "Invalid broker stop-loss specification")
+            return PositionSizingResult(0, 0, 0, 0, 0, 0, free_margin, loss_per_lot, "Invalid broker stop-loss specification", broker_min_lot=broker_min_lot, broker_max_lot=broker_max_lot, broker_volume_step=broker_volume_step, sizing_code="INVALID_STOP_SPEC")
         if risk_model == "fixed_volume":
             ideal_volume = max(0.0, float(fixed_volume or 0.0))
             risk_amount = ideal_volume * loss_per_lot
@@ -144,34 +194,66 @@ class RiskManager:
             risk_amount = equity * max(0.0, configured_risk_pct) / 100
             ideal_volume = risk_amount / loss_per_lot if risk_amount > 0 else 0.0
         if ideal_volume <= 0:
-            return PositionSizingResult(0, 0, 0, risk_amount, 0, 0, free_margin, loss_per_lot, "Policy did not specify a positive executable size")
+            return PositionSizingResult(0, 0, 0, risk_amount, 0, 0, free_margin, loss_per_lot, "Policy did not specify a positive executable size", policy_required_lot=ideal_volume, broker_min_lot=broker_min_lot, broker_max_lot=broker_max_lot, broker_volume_step=broker_volume_step, sizing_code="POLICY_NO_POSITIVE_SIZE")
 
-        margin_per_lot = self.estimate_margin_per_lot(entry_price, symbol_info, leverage)
+        margin_per_lot = self.margin_per_lot(entry_price, symbol_info, leverage)
         available_margin = max(0.0, free_margin * (1 - max(0.0, margin_safety_buffer_pct)))
         margin_limited_volume = available_margin / margin_per_lot if margin_per_lot > 0 else ideal_volume
-        final_volume = self.floor_volume(min(ideal_volume, margin_limited_volume), symbol_info)
-        required_margin = final_volume * margin_per_lot
-        expected_loss = final_volume * loss_per_lot
+        policy_required_lot = ideal_volume
+        capped_required_lot = min(policy_required_lot, margin_limited_volume)
+        required_lot = self.floor_volume(capped_required_lot, symbol_info)
+        required_margin = required_lot * margin_per_lot
+        expected_loss = required_lot * loss_per_lot
+        minimum_lot_margin = broker_min_lot * margin_per_lot if broker_min_lot > 0 else 0.0
+        minimum_lot_loss = broker_min_lot * loss_per_lot if broker_min_lot > 0 else 0.0
 
-        if final_volume <= 0:
-            reason = "No broker-valid volume fits the risk and margin constraints"
+        sizing_code = ""
+        if broker_min_lot <= 0 or broker_volume_step <= 0:
+            sizing_code = "BROKER_VOLUME_SPEC_INVALID"
+            reason = "Broker did not expose a positive minimum volume and volume step"
+        elif margin_per_lot <= 0:
+            sizing_code = "BROKER_MARGIN_UNAVAILABLE"
+            reason = "No positive broker margin-per-lot evidence is available for this instrument"
+        elif margin_limited_volume + 1e-12 < broker_min_lot:
+            sizing_code = "MINIMUM_LOT_MARGIN_UNAFFORDABLE"
+            reason = (f"Broker minimum lot {broker_min_lot:g} requires margin {minimum_lot_margin:.2f}, "
+                      f"above available margin {available_margin:.2f}")
+        elif risk_model != "fixed_volume" and policy_required_lot + 1e-12 < broker_min_lot:
+            sizing_code = "MINIMUM_LOT_EXCEEDS_POLICY_RISK"
+            reason = (f"Policy-required lot {policy_required_lot:.8g} is below broker minimum {broker_min_lot:g}; "
+                      f"minimum lot loss {minimum_lot_loss:.2f} exceeds policy risk budget {risk_amount:.2f}")
+        elif required_lot <= 0:
+            sizing_code = "NO_STEP_NORMALIZED_LOT"
+            reason = (f"Required lot {capped_required_lot:.8g} cannot be rounded down to broker step "
+                      f"{broker_volume_step:g} at minimum {broker_min_lot:g}")
         elif required_margin > available_margin + 1e-9:
-            reason = "Final volume exceeds available margin after safety buffer"
+            sizing_code = "FINAL_LOT_MARGIN_EXCEEDS_AVAILABLE"
+            reason = "Broker-normalized required lot exceeds available margin after safety buffer"
         elif risk_model != "fixed_volume" and expected_loss > risk_amount + 1e-6:
-            reason = "Final volume exceeds the selected policy risk budget"
+            sizing_code = "FINAL_LOT_EXCEEDS_POLICY_RISK"
+            reason = "Broker-normalized required lot exceeds the selected policy risk budget"
         else:
             reason = ""
 
         return PositionSizingResult(
             ideal_volume=ideal_volume,
             margin_limited_volume=margin_limited_volume,
-            final_volume=final_volume,
+            final_volume=required_lot,
             risk_amount=risk_amount,
             expected_loss=expected_loss,
             required_margin=required_margin,
             available_margin=available_margin,
             loss_per_lot=loss_per_lot,
             reason=reason,
+            policy_required_lot=policy_required_lot,
+            required_lot=required_lot,
+            broker_min_lot=broker_min_lot,
+            broker_max_lot=broker_max_lot,
+            broker_volume_step=broker_volume_step,
+            margin_per_lot=margin_per_lot,
+            minimum_lot_margin=minimum_lot_margin,
+            minimum_lot_loss=minimum_lot_loss,
+            sizing_code=sizing_code,
         )
 
     def calculate_position_size(

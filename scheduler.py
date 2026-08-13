@@ -590,6 +590,26 @@ class MarketScheduler:
             return False
         return True
 
+    async def _execution_symbol_spec(self, symbol: str, direction: str) -> dict:
+        """Return broker-native volume, tick, contract, and minimum-lot margin evidence."""
+        spec = dict(await self.executor.get_symbol_info(symbol) or {})
+        metadata = await self.executor.get_symbol_execution_metadata(symbol, direction)
+        if not metadata:
+            return spec
+        minimum_volume = metadata.get("normalized_volume") or metadata.get("volume_min")
+        spec.update({
+            "volume_min": metadata.get("volume_min", spec.get("min_lot")),
+            "volume_max": metadata.get("volume_max", spec.get("max_lot")),
+            "volume_step": metadata.get("volume_step", spec.get("step_lot")),
+            "normalized_volume": minimum_volume,
+            "margin_required_min_volume": metadata.get("margin_required"),
+            "margin_initial": metadata.get("margin_initial"),
+            "trade_tick_size": metadata.get("tick_size", spec.get("tick_size")),
+            "trade_tick_value": metadata.get("tick_value", spec.get("tick_value")),
+            "trade_contract_size": metadata.get("trade_contract_size", spec.get("contract_size")),
+        })
+        return spec
+
     async def fetch_candles(self, symbol: str, timeframe: str, count: int = 200) -> "pd.DataFrame":
         """Fetch broker-native, closed OHLCV data and record the actual outcome."""
         self.telemetry.increment("candle_requests")
@@ -1007,7 +1027,7 @@ class MarketScheduler:
             today_count = await db.get_today_trade_count(self.settings.trading_mode)
             consecutive_losses = await db.get_consecutive_losses(account_mode=self.settings.trading_mode)
             open_positions = await self.executor.get_open_positions()
-            sym_info = await self.executor.get_symbol_info(symbol)
+            sym_info = await self._execution_symbol_spec(symbol, signal.direction)
             pip = sym_info.get("pip_size", pip_value(symbol))
             spread = sym_info.get("spread", 0) * pip
 
@@ -1052,11 +1072,16 @@ class MarketScheduler:
                         status="sizing_rejected",
                         requested_price=signal.entry_price,
                         reason=signal.rejection_reason,
-                        details={"free_margin": free_margin, "required_margin": sizing.required_margin},
+                        details={"free_margin": free_margin, "sizing": sizing.evidence()},
                     )
                 await self._chart_activity(
                     "execution_rejected", symbol,
-                    f"⛔ **SIZING REJECTED — {symbol}**\nReason: {signal.rejection_reason}\nFree margin: `${free_margin:.2f}` | Required margin: `${sizing.required_margin:.2f}`\nNo order was submitted.",
+                    f"⛔ **SIZING REJECTED — {symbol}**\n"
+                    f"Code: `{sizing.sizing_code or 'UNSPECIFIED'}`\nReason: {signal.rejection_reason}\n"
+                    f"Policy-required lot: `{sizing.policy_required_lot:.8g}` | Broker-normalized required lot: `{sizing.required_lot:.8g}`\n"
+                    f"Broker min / step: `{sizing.broker_min_lot:g}` / `{sizing.broker_volume_step:g}`\n"
+                    f"Min-lot margin: `${sizing.minimum_lot_margin:.2f}` | Min-lot loss: `${sizing.minimum_lot_loss:.2f}`\n"
+                    f"Free margin: `${sizing.available_margin:.2f}` | Required margin: `${sizing.required_margin:.2f}`\nNo order was submitted.",
                     fingerprint=f"{setup_id}:sizing:{signal.rejection_reason}",
                 )
                 return False
@@ -1138,7 +1163,10 @@ class MarketScheduler:
 
             await self._chart_activity(
                 "broker_submission", symbol,
-                f"📤 **BROKER ORDER SUBMITTED — {symbol}**\nDirection: `{signal.direction}` | Volume: `{initial_layer['lot']}`\nRisk reserved: `${sizing.expected_loss:.2f}` | Free margin: `${free_margin:.2f}`\nSL: `{signal.stop_loss:.5f}` | TP: `{signal.take_profit:.5f}`\nAwaiting broker response.",
+                f"📤 **BROKER ORDER SUBMITTED — {symbol}**\nDirection: `{signal.direction}` | Required volume: `{initial_layer['lot']}`\n"
+                f"Policy-required lot: `{sizing.policy_required_lot:.8g}` | Broker-normalized lot: `{sizing.required_lot:.8g}`\n"
+                f"Risk reserved: `${sizing.expected_loss:.2f}` | Required margin: `${sizing.required_margin:.2f}` | Free margin: `${sizing.available_margin:.2f}`\n"
+                f"SL: `{signal.stop_loss:.5f}` | TP: `{signal.take_profit:.5f}`\nAwaiting broker response.",
                 fingerprint=f"{setup_id}:submit:{initial_layer['lot']}:{signal.entry_price}", essential=True,
             )
             execution_started = perf_counter()
@@ -1161,13 +1189,7 @@ class MarketScheduler:
                     "target_source": signal.target_source,
                     "initial_layer": initial_layer,
                     "planned_layers": layers,
-                    "sizing": {
-                        "ideal_volume": sizing.ideal_volume,
-                        "margin_limited_volume": sizing.margin_limited_volume,
-                        "final_volume": sizing.final_volume,
-                        "expected_loss": sizing.expected_loss,
-                        "required_margin": sizing.required_margin,
-                    },
+                    "sizing": sizing.evidence(),
                     "policy_version": signal.policy_version,
                     "experiment_id": signal.experiment_id,
                     "experimental_policy": signal.experimental_policy,
@@ -1757,7 +1779,7 @@ class MarketScheduler:
         equity = float(account.get("equity", account.get("balance", 0)))
         free_margin = float(account.get("free_margin", 0))
         leverage = float(account.get("leverage", 1) or 1)
-        symbol_info = await self.executor.get_symbol_info(position.symbol)
+        symbol_info = await self._execution_symbol_spec(position.symbol, refreshed.direction)
 
         basket_tickets = {layer["ticket"] for layer in layers if layer.get("ticket")}
         basket_current_risk = 0.0
@@ -1786,7 +1808,12 @@ class MarketScheduler:
             leverage=leverage,
             risk_pct=risk_pct,
         )
-        if not sizing.valid or sizing.expected_loss > remaining_basket_risk + 1e-6:
+        if not sizing.valid:
+            self.telemetry.record_rejection(f"Layer sizing rejected: {sizing.reason}")
+            logger.info("[LAYER SIZING REJECTED] symbol=%s code=%s evidence=%s", position.symbol, sizing.sizing_code, sizing.evidence())
+            return False
+        if sizing.expected_loss > remaining_basket_risk + 1e-6:
+            self.telemetry.record_rejection("Layer required lot exceeds remaining basket risk")
             return False
 
         today_pnl = await db.get_today_pnl(self.settings.trading_mode)

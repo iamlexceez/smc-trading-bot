@@ -153,12 +153,20 @@ def test_risk_sizing_and_layers() -> None:
         leverage=100,
     )
     assert_true(sizing.valid, f"sizing failed: {sizing.reason}")
+    assert_true(sizing.required_lot == sizing.final_volume and sizing.required_lot > 0, "required lot was not broker-normalized for execution")
     assert_true(sizing.expected_loss <= sizing.risk_amount + 1e-6, "sizing exceeded budget")
     fixed_volume = manager.calculate_position_sizing(
         account_equity=10_000, free_margin=8_000, entry_price=100.0, stop_loss=98.0,
         symbol_info=symbol_info, leverage=100, risk_model="fixed_volume", fixed_volume=2.5,
     )
-    assert_true(fixed_volume.valid and fixed_volume.final_volume == 2.5, "fixed-volume policy was not broker-normalized correctly")
+    assert_true(fixed_volume.valid and fixed_volume.final_volume == 2.5 and fixed_volume.required_lot == 2.5, "fixed-volume policy was not broker-normalized correctly")
+    below_minimum = manager.calculate_position_sizing(
+        account_equity=100.0, free_margin=100.0, entry_price=100.0, stop_loss=98.0,
+        symbol_info={**symbol_info, "margin_required_min_volume": 1.0, "normalized_volume": 0.01},
+        leverage=100, risk_pct=0.01,
+    )
+    assert_true(not below_minimum.valid and below_minimum.sizing_code == "MINIMUM_LOT_EXCEEDS_POLICY_RISK", "minimum-lot risk no-fit was not identified")
+    assert_true(below_minimum.policy_required_lot < below_minimum.broker_min_lot and below_minimum.minimum_lot_loss > below_minimum.risk_amount, "minimum-lot evidence is incomplete")
     layers = manager.get_layering_plan(sizing.final_volume, 100.0, 98.0, symbol_info)
     assert_true(bool(layers), "layer plan is empty")
     assert_true(sum(layer["lot"] for layer in layers) <= sizing.final_volume + 1e-6, "layers exceed total volume")
