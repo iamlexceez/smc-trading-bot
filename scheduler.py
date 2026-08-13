@@ -86,6 +86,20 @@ class MarketScheduler:
         self.last_broker_metadata_audit_paths: tuple[str, str] | None = None
         self.capital_reduction = CapitalReductionEngine(self.settings, self.executor)
         self.telemetry = RuntimeTelemetry()
+        # This is populated only from the fresh capital-service broker audit.
+        # It is intentionally separate from settings because settings reloads
+        # discard broker symbol lists to prevent stale post-restart execution.
+        self._analysis_eligible_symbols: tuple[str, ...] = ()
+
+    def _set_analysis_eligible_symbols(self, audit: Optional[dict]) -> tuple[str, ...]:
+        audit = audit or {}
+        usable = tuple(sorted({str(symbol).strip() for symbol in (audit.get("usable_symbols") or []) if str(symbol).strip()}))
+        self._analysis_eligible_symbols = usable
+        logger.info("[ANALYSIS ELIGIBILITY] broker_usable=%s symbols=%s", len(usable), list(usable))
+        return usable
+
+    def _analysis_symbol_is_eligible(self, symbol: str) -> bool:
+        return str(symbol) in self._analysis_eligible_symbols
 
     async def _run_scheduled_task(self, name: str, interval: str, callback):
         """Record real scheduled-task entry/outcome and never discard exceptions."""
@@ -237,6 +251,7 @@ class MarketScheduler:
         capital = await self.capital_state_service.evaluate()
         self.last_capital_state = capital
         audit = capital.get("broker_metadata") or {}
+        self._set_analysis_eligible_symbols(audit)
         logger.info("[ACCOUNT VALIDATOR] Received targets: %s | Usable: %s | Invalid: %s | State: %s", audit.get("target_count", 0), audit.get("usable_count", 0), audit.get("invalid_count", 0), capital.get("state"))
         self.account_reconciliation.executor = self.executor
         self.account_reconciliation.account_mode = self.settings.trading_mode
@@ -701,11 +716,11 @@ class MarketScheduler:
         self.telemetry.increment("observations")
         self.optimizer.settings = self.settings
         policy, experiment_id, policy_version = await self.optimizer.active_policy(self.settings.trading_mode)
-        if symbol not in self.settings.enabled_symbols:
-            reason = "Symbol is no longer in the broker-enabled target list"
+        if not self._analysis_symbol_is_eligible(symbol):
+            reason = "Symbol is absent from the current broker-validated usable-target handoff"
             self.telemetry.increment("setups_rejected")
             self.telemetry.record_rejection(reason)
-            logger.warning("Skipping non-active broker symbol %s", symbol)
+            logger.warning("[ANALYSIS PRE-CANDLE REJECTED] symbol=%s broker_usable=%s settings_enabled=%s", symbol, len(self._analysis_eligible_symbols), len(self.settings.enabled_symbols))
             return None
 
         # Fetch data for primary timeframe
@@ -916,9 +931,9 @@ class MarketScheduler:
         return signal
 
     async def scan_markets(self) -> list[TradeSignal]:
-        """Scan all enabled symbols and return signals that pass threshold."""
+        """Scan only the current broker-validated usable handoff and return accepted signals."""
         signals = []
-        for symbol in self.settings.enabled_symbols:
+        for symbol in self._analysis_eligible_symbols:
             try:
                 signal = await self.analyze_symbol(symbol)
                 if signal and signal.passed:
@@ -1310,6 +1325,7 @@ class MarketScheduler:
         self.capital_state_service.executor = self.executor
         capital = await self.capital_state_service.evaluate()
         self.last_capital_state = capital
+        self._set_analysis_eligible_symbols(capital.get("broker_metadata") or {})
         if capital.get("changed"):
             await self._notify_capital_state(capital)
         if capital.get("state") in AccountCapitalState.BLOCKING:

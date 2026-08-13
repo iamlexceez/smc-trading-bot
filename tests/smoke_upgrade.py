@@ -63,6 +63,17 @@ def test_runtime_telemetry() -> None:
     assert_true(telemetry.snapshot()["components"]["analysis_engine"]["state"] == "FAILED", "component failure was not exposed")
 
 
+def test_scanner_eligibility_handoff() -> None:
+    engine = object.__new__(scheduler.MarketScheduler)
+    engine._analysis_eligible_symbols = ()
+    handoff = engine._set_analysis_eligible_symbols({"usable_symbols": ["Volatility 75 Index", "XAUUSDmicro"]})
+    reloaded = TradeSettings.from_dict({"enabled_symbols": "EURUSD"})
+    assert_true(not reloaded.enabled_symbols, "fixture did not reproduce intentional empty persisted-symbol migration")
+    assert_true(handoff == ("Volatility 75 Index", "XAUUSDmicro"), "broker-usable scanner handoff lost the returned identifiers")
+    assert_true(engine._analysis_symbol_is_eligible("Volatility 75 Index"), "broker-validated scanner symbol was rejected after settings reload")
+    assert_true(not engine._analysis_symbol_is_eligible("EURUSD"), "unverified legacy symbol entered scanner eligibility")
+
+
 def test_config_round_trip() -> None:
     settings = TradeSettings.defaults()
     encoded = settings.to_dict()
@@ -529,6 +540,7 @@ async def test_demo_live_partitioning() -> None:
 
 def run() -> None:
     test_runtime_telemetry()
+    test_scanner_eligibility_handoff()
     test_config_round_trip()
     test_account_monitor_aggregates()
     test_risk_sizing_and_layers()
