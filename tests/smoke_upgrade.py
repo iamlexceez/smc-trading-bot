@@ -42,6 +42,12 @@ def test_config_round_trip() -> None:
     assert_true(restored.layer_allocation == settings.layer_allocation, "layer allocation did not round-trip")
     assert_true(restored.max_setup_risk_pct <= 1.0, "setup risk cap must be at most 1%")
 
+    legacy = TradeSettings.from_dict({"risk_per_trade": 10.0, "max_daily_loss_pct": 20.0, "max_open_positions": 5, "score_threshold": 60.0})
+    assert_true(legacy.risk_per_trade == 1.0, "legacy risk was not capped")
+    assert_true(legacy.max_daily_loss_pct == 3.0, "legacy daily loss was not safely migrated")
+    assert_true(legacy.max_open_positions == 2, "legacy position cap was not safely migrated")
+    assert_true(legacy.min_setup_score == 75.0, "legacy quality threshold was not safely migrated")
+
 
 def test_risk_sizing_and_layers() -> None:
     settings = TradeSettings.defaults()

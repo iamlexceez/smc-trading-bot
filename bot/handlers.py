@@ -157,6 +157,9 @@ class BotHandlers:
             "/rr [ratio] - Set the minimum market-derived RR\n"
             "/score [pct] - Set the minimum setup-quality threshold\n"
             "/daily_limit [pct] - Set the daily profit stop\n"
+            "/loss_limit [pct] - Set the daily loss and emergency stop\n"
+            "/open_risk [pct] - Set the account-wide open-risk ceiling\n"
+            "/layers [count] - Set the maximum confirmation-only layers\n"
             "/cooldown [min] - Set the symbol cooldown\n\n"
             "**Monitoring & Analysis:**\n"
             "/journal - View the daily learning journal\n"
@@ -981,6 +984,53 @@ class BotHandlers:
             await update.message.reply_text(f"Current daily profit stop: +{self.settings.daily_profit_stop_pct}%\nDaily loss stop: -{self.settings.max_daily_loss_pct}%\nUsage: /daily_limit 10")
 
     @admin_only
+    async def cmd_loss_limit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set the normal daily loss stop while retaining a separate emergency stop."""
+        if not context.args:
+            await update.message.reply_text(
+                f"Daily loss stop: -{self.settings.max_daily_loss_pct}% | Emergency stop: -{self.settings.absolute_daily_stop_pct}%\n"
+                "Usage: `/loss_limit 3`"
+            )
+            return
+        try:
+            value = float(context.args[0])
+            value = max(0.5, min(value, 10.0))
+            self.settings.max_daily_loss_pct = value
+            self.settings.absolute_daily_stop_pct = max(value, min(10.0, value + 1.0))
+            await db.save_settings(self.settings)
+            await update.message.reply_text(f"✅ Daily loss stop set to **-{value}%**; emergency stop set to **-{self.settings.absolute_daily_stop_pct}%**.")
+        except ValueError:
+            await update.message.reply_text("Usage: `/loss_limit 3`")
+
+    @admin_only
+    async def cmd_open_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set the account-wide protected loss ceiling for all open positions."""
+        if not context.args:
+            await update.message.reply_text(f"Current total open-risk ceiling: {self.settings.max_total_open_risk_pct}%\nUsage: `/open_risk 3`")
+            return
+        try:
+            value = max(0.5, min(float(context.args[0]), 5.0))
+            self.settings.max_total_open_risk_pct = value
+            await db.save_settings(self.settings)
+            await update.message.reply_text(f"✅ Total open-risk ceiling set to **{value}%**.")
+        except ValueError:
+            await update.message.reply_text("Usage: `/open_risk 3`")
+
+    @admin_only
+    async def cmd_layers(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set the maximum number of planned confirmation-only layers per setup."""
+        if not context.args:
+            await update.message.reply_text(f"Current maximum layers/setup: {self.settings.max_layers}\nUsage: `/layers 3`")
+            return
+        try:
+            value = max(1, min(int(context.args[0]), 4))
+            self.settings.max_layers = value
+            await db.save_settings(self.settings)
+            await update.message.reply_text(f"✅ Maximum planned layers per setup set to **{value}**. Existing baskets are unchanged.")
+        except ValueError:
+            await update.message.reply_text("Usage: `/layers 3`")
+
+    @admin_only
     async def cmd_cooldown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Set symbol cooldown minutes."""
         if context.args:
@@ -1295,7 +1345,7 @@ class BotHandlers:
             await query.edit_message_text(
                 f"Daily profit stop: +{self.settings.daily_profit_stop_pct}%\n"
                 f"Daily loss stop: -{self.settings.max_daily_loss_pct}%\n"
-                f"Use command: `/daily_limit 10` to set the profit stop.",
+                f"Use `/daily_limit 10` for the profit stop or `/loss_limit 3` for the loss stop.",
                 reply_markup=keyboards.settings_menu()
             )
         elif data == "set_symbols":
@@ -1403,6 +1453,9 @@ class BotHandlers:
         app.add_handler(CommandHandler("manage", self.cmd_manage))
         app.add_handler(CommandHandler("score", self.cmd_score))
         app.add_handler(CommandHandler("daily_limit", self.cmd_daily_limit))
+        app.add_handler(CommandHandler("loss_limit", self.cmd_loss_limit))
+        app.add_handler(CommandHandler("open_risk", self.cmd_open_risk))
+        app.add_handler(CommandHandler("layers", self.cmd_layers))
         app.add_handler(CommandHandler("cooldown", self.cmd_cooldown))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))
         app.add_handler(CommandHandler("sessions", self.cmd_sessions))
