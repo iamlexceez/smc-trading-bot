@@ -222,12 +222,13 @@ class TradeSettings:
                     return [s.strip() for s in default.split(",") if s.strip()]
             return []
 
-        # Broker discovery replaces legacy persisted market lists at runtime.
-        # These values are parsed only so the scheduler can migrate safely.
-        symbols_list = parse_list(d.get("symbols"))
-        enabled_symbols_list = parse_list(d.get("enabled_symbols"), symbols_list)
-        available_symbols_list = parse_list(d.get("available_symbols"))
-        unsupported_symbols_list = parse_list(d.get("unsupported_symbols"))
+        # Persisted symbol lists may originate from a legacy forex or generic
+        # market configuration.  Never restore them: the scheduler must rebuild
+        # every active/displayed symbol from the connected Deriv MT5 account.
+        symbols_list: list[str] = []
+        enabled_symbols_list: list[str] = []
+        available_symbols_list: list[str] = []
+        unsupported_symbols_list: list[str] = []
 
         import json
         symbol_status_raw = d.get("symbol_status", "{}")
@@ -235,6 +236,9 @@ class TradeSettings:
             symbol_status = json.loads(symbol_status_raw) if isinstance(symbol_status_raw, str) else dict(symbol_status_raw or {})
         except (TypeError, ValueError, json.JSONDecodeError):
             symbol_status = {}
+        # Status metadata is broker-derived as well and must not surface a stale
+        # instrument list before startup discovery completes.
+        symbol_status = {}
         
         # Parse brokers
         brokers_raw = d.get("brokers", "[]")

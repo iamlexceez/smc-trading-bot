@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import re
 from typing import Any, Iterable
 
 
@@ -21,7 +22,6 @@ SYNTHETIC_NAME_TOKENS = (
     "jump index",
     "range break",
     "drift switch",
-    "dex",
     "trek",
     "skew step",
 )
@@ -75,9 +75,16 @@ def classify_deriv_symbol(raw: dict[str, Any]) -> MarketSymbol:
         except (TypeError, ValueError):
             broker_available = False
 
-    if "gold" in text or "xau" in text:
+    # A broker path containing “Synthetic Indices” alone is not sufficient:
+    # Deriv can expose crypto-derived or other speciality products beneath that
+    # heading.  Accept only the named Synthetic Index product families requested
+    # for this bot, plus the standard XAUUSD Gold pair (not micro or alternate
+    # metal variants).
+    symbol_key = _normalise(symbol)
+    is_standard_gold = symbol_key == "xauusd"
+    if is_standard_gold:
         category = "gold"
-    elif "synthetic" in text or any(token in text for token in SYNTHETIC_NAME_TOKENS):
+    elif any(token in text for token in SYNTHETIC_NAME_TOKENS) or re.search(r"\b(?:dex|jump)\s+\d+", text):
         category = "synthetic_index"
     else:
         category = "unsupported"

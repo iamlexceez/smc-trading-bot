@@ -165,7 +165,7 @@ async def main():
     logger.info("🚀 SMC Trading Bot is running!")
     logger.info(f"Admin IDs: {admin_ids}")
     logger.info(f"Mode: {settings.trading_mode}")
-    logger.info(f"Symbols: {settings.symbols}")
+    logger.info(f"Active Deriv Synthetic Indices / Gold symbols: {settings.enabled_symbols}")
 
     # Start polling using async lifecycle (compatible with asyncio.run)
     await app.initialize()

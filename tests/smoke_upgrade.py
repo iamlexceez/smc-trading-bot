@@ -52,6 +52,9 @@ def test_config_round_trip() -> None:
     assert_true(legacy.max_open_positions == 2, "legacy position cap was not safely migrated")
     assert_true(legacy.min_setup_score == 0.0, "learning baseline did not remove the quality-score entry gate")
 
+    migrated_markets = TradeSettings.from_dict({"symbols": "EURUSD,XAUUSDmicro", "enabled_symbols": "EURUSD", "available_symbols": "EURUSD"})
+    assert_true(not migrated_markets.symbols and not migrated_markets.enabled_symbols, "persisted legacy symbols survived restart migration")
+
 
 def test_risk_sizing_and_layers() -> None:
     settings = TradeSettings.defaults()
@@ -146,16 +149,24 @@ async def test_deriv_market_universe() -> None:
         async def list_symbols(self) -> list[dict]:
             return [
                 {"name": "Volatility 75 Index", "description": "Volatility 75 Index", "path": "Synthetic Indices\\Volatility", "trade_mode": 1, "available": True},
-                {"name": "DERIV-GOLD", "description": "Gold", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
+                {"name": "DEX 600 UP Index", "description": "DEX 600 UP Index", "path": "Synthetic Indices\\DEX", "trade_mode": 1, "available": True},
+                {"name": "Jump 10 Index", "description": "Jump 10 Index", "path": "Synthetic Indices\\Jump", "trade_mode": 1, "available": True},
+                {"name": "XAUUSD", "description": "Gold vs US Dollar", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
+                {"name": "XAUUSDmicro", "description": "Gold micro", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
                 {"name": "UnsupportedMarket", "description": "Unsupported broker market", "path": "Other\\Market", "trade_mode": 1, "available": True},
+                {"name": "EURUSD", "description": "Euro vs US Dollar", "path": "Forex\\Majors", "trade_mode": 1, "available": True},
+                {"name": "BTCETH Arbitrage Index", "description": "BTCETH Arbitrage Index", "path": "Synthetic Indices\\Specialty", "trade_mode": 1, "available": True},
                 {"name": "Crash 500 Index", "description": "Crash 500 Index", "path": "Synthetic Indices\\Crash", "trade_mode": 0, "available": False},
             ]
 
     universe = DerivMarketUniverse()
     await universe.refresh(FakeBroker())
-    assert_true(universe.available_symbols == ["DERIV-GOLD", "Volatility 75 Index"], "eligible Deriv markets were not classified correctly")
+    assert_true(universe.available_symbols == ["DEX 600 UP Index", "Jump 10 Index", "Volatility 75 Index", "XAUUSD"], "eligible Deriv markets were not classified correctly")
     assert_true(universe.status_for("Crash 500 Index") == "unavailable", "unavailable broker symbol became active")
     assert_true("UnsupportedMarket" in universe.unsupported_symbols, "unsupported broker symbol was not excluded from the Deriv universe")
+    assert_true("EURUSD" in universe.unsupported_symbols, "forex symbol was not excluded from the Deriv universe")
+    assert_true("BTCETH Arbitrage Index" in universe.unsupported_symbols, "non-approved synthetic specialty product was not excluded")
+    assert_true("XAUUSDmicro" in universe.unsupported_symbols, "Gold micro variant was not excluded")
 
 
 async def test_basket_persistence() -> None:
