@@ -170,8 +170,39 @@ class BotHandlers:
             "`/backtest <symbol> <tf> <days>` — broker-history causal backtest\n"
             "`/safety` — hard limits and circuit breakers\n"
             "`/model` — active model and governance decision\n"
+            "`/activity [detailed|essential|off]` — chart-study notification mode\n"
             "`/emergency` — pause new execution and optionally close positions\n\n"
             "Use `/settings` only for mode, entry model, and safety controls.",
+        )
+
+    @admin_only
+    async def cmd_activity(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show or change the closed-candle chart-activity alert mode."""
+        if context.args:
+            requested = context.args[0].lower()
+            if requested not in {"detailed", "essential", "off"}:
+                await update.message.reply_text("Usage: `/activity detailed`, `/activity essential`, or `/activity off`", parse_mode="Markdown")
+                return
+            self.settings.chart_activity_level = requested
+            self.settings.chart_activity_notifications = requested != "off"
+            await db.save_settings(self.settings)
+
+        mode = self.settings.chart_activity_level
+        state = "ON" if self.settings.chart_activity_notifications and mode != "off" else "OFF"
+        text = "\n".join([
+            "📡 **CHART ACTIVITY ALERTS**",
+            f"Status: `{state}` | Mode: `{mode.upper()}`",
+            f"Rejected setup alerts: `{'ON' if self.settings.chart_activity_include_rejections else 'OFF'}`",
+            f"Duplicate cooldown: `{self.settings.chart_activity_cooldown_seconds}s` per symbol and stage",
+            "",
+            "**Detailed** reports closed-candle study, structure, hard-gate rejections, validated setups, final risk review, broker submission, execution, and management actions.",
+            "**Essential** reports execution-critical broker, safety, and management events only.",
+            "Use `/activity detailed`, `/activity essential`, or `/activity off`.",
+        ])
+        await self._render_menu(
+            update,
+            text,
+            keyboards.activity_menu(mode, self.settings.chart_activity_include_rejections),
         )
 
     @admin_only
@@ -1179,6 +1210,37 @@ class BotHandlers:
                 reply_markup=keyboards.main_menu(),
                 parse_mode="Markdown",
             )
+        elif data == "activity_menu":
+            mode = self.settings.chart_activity_level
+            status = "ON" if self.settings.chart_activity_notifications and mode != "off" else "OFF"
+            await query.edit_message_text(
+                "📡 **CHART ACTIVITY ALERTS**\n\n"
+                f"Status: `{status}` | Mode: `{mode.upper()}`\n"
+                f"Rejected setup alerts: `{'ON' if self.settings.chart_activity_include_rejections else 'OFF'}`\n"
+                f"Duplicate cooldown: `{self.settings.chart_activity_cooldown_seconds}s` per symbol and stage\n\n"
+                "Detailed follows closed-candle study and every decision stage. Essential reports only execution-critical broker, safety, and management events.",
+                reply_markup=keyboards.activity_menu(mode, self.settings.chart_activity_include_rejections),
+                parse_mode="Markdown",
+            )
+        elif data in {"activity_detailed", "activity_essential", "activity_off"}:
+            mode = data.removeprefix("activity_")
+            self.settings.chart_activity_level = mode
+            self.settings.chart_activity_notifications = mode != "off"
+            await db.save_settings(self.settings)
+            await query.edit_message_text(
+                f"📡 Chart activity mode set to **{mode.upper()}**.",
+                reply_markup=keyboards.activity_menu(mode, self.settings.chart_activity_include_rejections),
+                parse_mode="Markdown",
+            )
+        elif data == "activity_rejections":
+            self.settings.chart_activity_include_rejections = not self.settings.chart_activity_include_rejections
+            await db.save_settings(self.settings)
+            mode = self.settings.chart_activity_level
+            await query.edit_message_text(
+                f"📡 Rejected-setup alerts are now **{'ON' if self.settings.chart_activity_include_rejections else 'OFF'}**.",
+                reply_markup=keyboards.activity_menu(mode, self.settings.chart_activity_include_rejections),
+                parse_mode="Markdown",
+            )
         elif data == "set_autotrade":
             await query.edit_message_text(
                 f"Auto-Trade is currently {'ON ✅' if self.settings.auto_trade else 'OFF ❌'}",
@@ -1448,6 +1510,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("settings", self.cmd_settings))
         app.add_handler(CommandHandler("safety", self.cmd_safety))
         app.add_handler(CommandHandler("model", self.cmd_model))
+        app.add_handler(CommandHandler("activity", self.cmd_activity))
         app.add_handler(CommandHandler("emergency", self.cmd_emergency))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))
         app.add_handler(CallbackQueryHandler(self.handle_callback))

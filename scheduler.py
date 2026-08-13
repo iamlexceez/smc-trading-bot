@@ -11,7 +11,7 @@ import asyncio
 import logging
 import json
 import os
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -68,6 +68,9 @@ class MarketScheduler:
         self._running = False
         self.data_provider = DataProvider(self.executor)
         self.market_universe = DerivMarketUniverse()
+        # In-memory delivery ledger: a chart-stage alert is sent once per
+        # closed candle/fingerprint and is throttled independently per symbol.
+        self._chart_activity_ledger: dict[str, tuple[str, float]] = {}
         # Initialize Self-Optimizer
         self.optimizer = SelfOptimizer(self.settings)
 
@@ -139,6 +142,11 @@ class MarketScheduler:
             self.settings.symbol_status = {}
             self.settings.market_universe_updated_at = datetime.utcnow().isoformat()
             await db.save_settings(self.settings)
+            await self._chart_activity(
+                "broker_unavailable", "SYSTEM",
+                "⚠️ **BROKER MARKET DATA UNAVAILABLE**\nDeriv MT5 exposed no eligible tradeable Synthetic Indices or Gold instruments. Scanning and execution are fail-closed until broker discovery recovers.",
+                fingerprint="no-eligible-deriv-markets", essential=True,
+            )
             return False
 
         eligible = [record for record in records if record.category in {"synthetic_index", "gold"}]
@@ -270,7 +278,19 @@ class MarketScheduler:
 
         if df.empty or len(df) < 20:
             logger.warning(f"Insufficient data for {symbol}")
+            await self._chart_activity(
+                "data_unavailable", symbol,
+                f"⚠️ **CHART STUDY PAUSED — {symbol}**\nTimeframe: `{primary_tf}`\nReason: insufficient closed broker candles for structural analysis.",
+                fingerprint=f"{primary_tf}:insufficient:{len(df)}",
+            )
             return None
+        bar_time = str(df.iloc[-1]["time"])
+        current_price = float(df.iloc[-1]["close"])
+        await self._chart_activity(
+            "study_started", symbol,
+            f"🔎 **CHART STUDY STARTED — {symbol}**\nClosed candle: `{bar_time}` ({primary_tf})\nClose: `{current_price:.5f}`\nNext: mapping structure, liquidity, displacement, and valid zones.",
+            fingerprint=f"{primary_tf}:{bar_time}",
+        )
         await self._evaluate_counterfactuals(symbol, primary_tf, df)
 
         # Run structure analysis
@@ -297,8 +317,13 @@ class MarketScheduler:
                 htf_struct = analyze_structure(htf_df, lookback=3)
                 htf_structures.append(htf_struct)
 
-        # Determine trade direction from structure
-        current_price = df.iloc[-1]["close"]
+        # Determine trade direction from the current closed-candle structure.
+        event_name = structure.last_event.event_type.value.replace("_", " ").upper()
+        await self._chart_activity(
+            "structure_mapped", symbol,
+            f"🧭 **STRUCTURE MAPPED — {symbol}**\nTrend: `{structure.trend.value.upper()}` | Zone: `{structure.current_zone.upper()}`\nLatest structural event: `{event_name}`\nHTF alignment observed: `{len(htf_structures)}/{min(2, len(self.settings.htf_timeframes))}` timeframe(s).",
+            fingerprint=f"{bar_time}:{structure.trend.value}:{structure.current_zone}:{structure.last_event.event_type.value}",
+        )
 
         # Set paper prices so PaperExecutor can execute (if still in use by backtester)
         if hasattr(self.executor, 'set_price'):
@@ -381,6 +406,13 @@ class MarketScheduler:
             )
         if not validation.valid:
             logger.debug("Invalid setup for %s: %s", symbol, validation.rejection_reason)
+            failed = next((check for check in validation.checks if not check.passed), None)
+            failed_detail = f"{failed.name}: {failed.detail}" if failed else validation.rejection_reason
+            await self._chart_activity(
+                "validation_rejected", symbol,
+                f"⛔ **SETUP REJECTED — {symbol}**\nDirection assessed: `{direction}` | Timeframe: `{primary_tf}`\nFirst blocking hard gate: {failed_detail}\nNo order will be considered from this candle.",
+                fingerprint=f"{bar_time}:{direction}:{validation.rejection_reason}",
+            )
             return None
 
         quality = score_setup_quality(
@@ -395,7 +427,18 @@ class MarketScheduler:
             if setup_id is not None:
                 await db.update_setup_record(setup_id, status="rejected", rejection_reason=quality.rejection_reason)
             logger.debug("Valid but low-quality setup for %s: %s", symbol, quality.rejection_reason)
+            await self._chart_activity(
+                "quality_deferred", symbol,
+                f"⏳ **VALID SETUP DEFERRED — {symbol}**\nAll hard gates passed, but the configured entry model requires additional quality evidence.\nReason: {quality.rejection_reason}",
+                fingerprint=f"{bar_time}:{direction}:{quality.rejection_reason}",
+            )
             return None
+
+        await self._chart_activity(
+            "setup_validated", symbol,
+            f"✅ **SETUP VALIDATED — {symbol}**\nDirection: `{direction}` | Timeframe: `{primary_tf}` | Quality rank: `{quality.score:.1f}/100`\nEntry: `{validation.entry_price:.5f}` | Structural SL: `{validation.stop_loss:.5f}` | Liquidity TP: `{validation.take_profit:.5f}`\nMarket-derived RR: `1:{validation.rr_ratio:.2f}`\nNext: final broker, portfolio, margin, and risk review.",
+            fingerprint=f"{bar_time}:{direction}:{validation.entry_price}:{validation.stop_loss}:{validation.take_profit}",
+        )
 
         # Signal transport contains only prices derived by the causal validator
         # and the transparent post-validity quality rank.
@@ -448,7 +491,11 @@ class MarketScheduler:
                 signal.rejection_reason = "Signal expired before execution"
                 if setup_id is not None:
                     await db.update_setup_record(setup_id, status="expired", rejection_reason=signal.rejection_reason)
-                await self._notify(format_signal_report(signal))
+                await self._chart_activity(
+                    "execution_rejected", symbol,
+                    f"⌛ **EXECUTION CANCELLED — {symbol}**\nReason: {signal.rejection_reason}",
+                    fingerprint=f"{setup_id}:expired", essential=True,
+                )
                 return False
             refreshed = await self.analyze_symbol(symbol, record_learning=False)
             if not refreshed or not refreshed.passed or refreshed.direction != signal.direction:
@@ -456,10 +503,19 @@ class MarketScheduler:
                 signal.rejection_reason = "Setup invalidated during final revalidation"
                 if setup_id is not None:
                     await db.update_setup_record(setup_id, status="invalidated", rejection_reason=signal.rejection_reason)
-                await self._notify(format_signal_report(signal))
+                await self._chart_activity(
+                    "execution_rejected", symbol,
+                    f"⛔ **FINAL REVALIDATION FAILED — {symbol}**\nReason: {signal.rejection_reason}\nNo market order was submitted.",
+                    fingerprint=f"{setup_id}:invalidated", essential=True,
+                )
                 return False
             signal = refreshed
             signal.setup_id = setup_id
+            await self._chart_activity(
+                "final_revalidation", symbol,
+                f"🔬 **FINAL REVALIDATION PASSED — {symbol}**\nDirection: `{signal.direction}` | Entry: `{signal.entry_price:.5f}` | RR: `1:{signal.rr_ratio:.2f}`\nNext: sizing, portfolio exposure, margin, and daily-risk review.",
+                fingerprint=f"{setup_id}:{signal.entry_price}:{signal.stop_loss}:{signal.take_profit}",
+            )
 
             account = await self.executor.get_account_info()
             equity = float(account.get("equity", account.get("balance", 0)))
@@ -481,7 +537,11 @@ class MarketScheduler:
                 if position_risk == float("inf"):
                     signal.passed = False
                     signal.rejection_reason = f"Unprotected open position: {position.symbol} #{position.ticket}"
-                    await self._notify(format_signal_report(signal))
+                    await self._chart_activity(
+                        "execution_rejected", symbol,
+                        f"⛔ **SAFETY BLOCK — {symbol}**\nReason: {signal.rejection_reason}\nA new trade will not be opened while an existing position lacks structural protection.",
+                        fingerprint=f"{setup_id}:unprotected:{position.ticket}", essential=True,
+                    )
                     return False
                 current_open_risk += position_risk
 
@@ -508,7 +568,11 @@ class MarketScheduler:
                         reason=signal.rejection_reason,
                         details={"free_margin": free_margin, "required_margin": sizing.required_margin},
                     )
-                await self._notify(format_signal_report(signal))
+                await self._chart_activity(
+                    "execution_rejected", symbol,
+                    f"⛔ **SIZING REJECTED — {symbol}**\nReason: {signal.rejection_reason}\nFree margin: `${free_margin:.2f}` | Required margin: `${sizing.required_margin:.2f}`\nNo order was submitted.",
+                    fingerprint=f"{setup_id}:sizing:{signal.rejection_reason}",
+                )
                 return False
 
             # Reserve risk for the planned basket now. Layers are not blindly
@@ -534,7 +598,11 @@ class MarketScheduler:
                         requested_price=signal.entry_price,
                         reason=signal.rejection_reason,
                     )
-                await self._notify(format_signal_report(signal))
+                await self._chart_activity(
+                    "execution_rejected", symbol,
+                    f"⛔ **BROKER VOLUME BLOCK — {symbol}**\nReason: {signal.rejection_reason}\nNo valid initial layer exists within the broker’s volume rules.",
+                    fingerprint=f"{setup_id}:volume:{signal.rejection_reason}",
+                )
                 return False
             initial_layer = layers[0]
 
@@ -569,9 +637,18 @@ class MarketScheduler:
                         requested_price=signal.entry_price,
                         reason=risk_result.reason,
                     )
-                await self._notify(format_signal_report(signal))
+                await self._chart_activity(
+                    "execution_rejected", symbol,
+                    f"⛔ **PORTFOLIO RISK BLOCK — {symbol}**\nReason: {signal.rejection_reason}\nThe structural setup remains recorded, but no order was sent.",
+                    fingerprint=f"{setup_id}:risk:{signal.rejection_reason}", essential=True,
+                )
                 return False
 
+            await self._chart_activity(
+                "broker_submission", symbol,
+                f"📤 **BROKER ORDER SUBMITTED — {symbol}**\nDirection: `{signal.direction}` | Volume: `{initial_layer['lot']}`\nRisk reserved: `${sizing.expected_loss:.2f}` | Free margin: `${free_margin:.2f}`\nSL: `{signal.stop_loss:.5f}` | TP: `{signal.take_profit:.5f}`\nAwaiting broker response.",
+                fingerprint=f"{setup_id}:submit:{initial_layer['lot']}:{signal.entry_price}", essential=True,
+            )
             execution_started = perf_counter()
             result = await self.executor.execute_trade(
                 symbol=symbol,
@@ -711,7 +788,11 @@ class MarketScheduler:
                         status="rejected",
                         reason=result.message,
                     )
-                await self._notify(f"❌ Trade execution failed for {symbol}: {result.message}")
+                await self._chart_activity(
+                    "broker_rejected", symbol,
+                    f"❌ **BROKER ORDER REJECTED — {symbol}**\nReason: {result.message}\nNo position was opened.",
+                    fingerprint=f"{setup_id}:broker:{result.message}", essential=True,
+                )
                 return False
 
         except Exception as e:
@@ -753,8 +834,11 @@ class MarketScheduler:
                 if not signal or not signal.passed:
                     continue
                 
-                # Notify potential setup found
-                await self._notify(f"🔍 **POTENTIAL SETUP FOUND: {symbol}**\nDirection: `{signal.direction}`\nScore: `{signal.score:.1f}%`\nAnalyzing risk gates...")
+                await self._chart_activity(
+                    "execution_queue", symbol,
+                    f"📋 **VALIDATED SETUP QUEUED — {symbol}**\nDirection: `{signal.direction}` | Quality rank: `{signal.score:.1f}/100`\nThe bot is beginning final revalidation and broker risk checks.",
+                    fingerprint=f"{signal.setup_id}:{signal.direction}:{signal.entry_price}",
+                )
 
                 # Fetch data for the chart if signal passed
                 primary_tf = "M1" if self.settings.aggressive_mode else "M15"
@@ -786,8 +870,44 @@ class MarketScheduler:
         journal = await self.optimizer.generate_daily_journal(self.settings.trading_mode)
         await self._notify(journal)
 
-    async def _notify(self, message: str, photo: bytes = None):
-        """Send notification to admin via Telegram and WhatsApp if configured."""
+    async def _chart_activity(
+        self,
+        stage: str,
+        symbol: str,
+        message: str,
+        *,
+        fingerprint: str,
+        essential: bool = False,
+        photo: bytes = None,
+    ) -> bool:
+        """Send one deduplicated chart-state event after a closed-candle decision.
+
+        ``detailed`` reports study and validation stages. ``essential`` reports
+        only execution-critical events. A symbol/stage event is emitted once per
+        fingerprint; a short time throttle protects Telegram from M1 bursts.
+        """
+        if not self.settings.chart_activity_notifications:
+            return False
+        level = self.settings.chart_activity_level
+        if level == "off" or (level == "essential" and not essential):
+            return False
+        if stage == "validation_rejected" and not self.settings.chart_activity_include_rejections:
+            return False
+
+        key = f"{symbol}:{stage}"
+        now = monotonic()
+        prior = self._chart_activity_ledger.get(key)
+        cooldown = max(30, int(self.settings.chart_activity_cooldown_seconds))
+        if prior and prior[0] == fingerprint:
+            return False
+        if prior and now - prior[1] < cooldown and not essential:
+            return False
+        self._chart_activity_ledger[key] = (fingerprint, now)
+        await self._notify(message, photo=photo, include_whatsapp=essential)
+        return True
+
+    async def _notify(self, message: str, photo: bytes = None, *, include_whatsapp: bool = True):
+        """Send notification to Telegram and, for material events, WhatsApp."""
         # Telegram
         if self.bot_app and self.admin_chat_id:
             try:
@@ -798,6 +918,11 @@ class MarketScheduler:
             except Exception as e:
                 logger.error(f"Failed to send Telegram notification: {e}")
         
+        # Chart-study detail stays on Telegram. WhatsApp receives material
+        # execution, safety, and management events only.
+        if not include_whatsapp:
+            return
+
         # WhatsApp (via CallMeBot relay)
         wa_phone = os.getenv("WHATSAPP_PHONE")
         wa_apikey = os.getenv("WHATSAPP_APIKEY")
@@ -824,6 +949,7 @@ class MarketScheduler:
             initial_risk = float(trade.get("initial_risk") or 0.0)
             pnl = float(outcome.get("pnl") or 0.0)
             pnl_r = pnl / initial_risk if initial_risk > 0 else None
+            pnl_r_text = f"{pnl_r:.2f}R" if pnl_r is not None else "N/A"
             await db.close_trade(
                 int(trade["id"]),
                 pnl,
@@ -831,6 +957,11 @@ class MarketScheduler:
                 pnl_r=pnl_r,
                 max_favorable_r=float(trade.get("max_favorable_r") or 0.0),
                 max_adverse_r=float(trade.get("max_adverse_r") or 0.0),
+            )
+            await self._chart_activity(
+                "broker_exit", trade["symbol"],
+                f"🏁 **BROKER EXIT CONFIRMED — {trade['symbol']}**\nTicket: `#{ticket}` | Realized P/L: `${pnl:.2f}` | Result: `{pnl_r_text}`\nExit price: `{float(outcome.get('exit_price') or 0.0):.5f}` | MFE: `{float(trade.get('max_favorable_r') or 0.0):.2f}R` | MAE: `{float(trade.get('max_adverse_r') or 0.0):.2f}R`",
+                fingerprint=f"{ticket}:{pnl}:{outcome.get('exit_price')}", essential=True,
             )
             setup_id = trade.get("setup_id")
             if setup_id:

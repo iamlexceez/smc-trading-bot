@@ -110,6 +110,14 @@ class TradeSettings:
     is_paused: bool = False
     live_trading_confirmed_at: Optional[str] = None
 
+    # Chart-activity notifications are event-driven from closed broker candles.
+    # Detailed mode includes study and rejection events; duplicates are keyed
+    # by symbol, stage, and closed bar to avoid scan-heartbeat spam.
+    chart_activity_notifications: bool = True
+    chart_activity_level: str = "detailed"  # off | essential | detailed
+    chart_activity_include_rejections: bool = True
+    chart_activity_cooldown_seconds: int = 300
+
     # Instruments are populated from the connected Deriv MT5 account only.
     # No forex ticker or guessed Gold symbol is retained as a default.
     symbols: list[str] = field(default_factory=list)
@@ -284,6 +292,10 @@ class TradeSettings:
             auto_trade=(parse_bool(d.get("auto_trade", "true"), True) if "autonomous_learning_mode" in d else True),
             is_paused=parse_bool(d.get("is_paused", "false")),
             live_trading_confirmed_at=d.get("live_trading_confirmed_at"),
+            chart_activity_notifications=parse_bool(d.get("chart_activity_notifications", "true"), True),
+            chart_activity_level=(str(d.get("chart_activity_level", "detailed")).lower() if str(d.get("chart_activity_level", "detailed")).lower() in {"off", "essential", "detailed"} else "detailed"),
+            chart_activity_include_rejections=parse_bool(d.get("chart_activity_include_rejections", "true"), True),
+            chart_activity_cooldown_seconds=max(30, int(d.get("chart_activity_cooldown_seconds", 300))),
             symbols=symbols_list,
             enabled_symbols=enabled_symbols_list,
             available_symbols=available_symbols_list,
@@ -376,6 +388,10 @@ class TradeSettings:
             auto_trade=os.getenv("AUTO_TRADE", "true").lower() == "true",
             is_paused=False,
             live_trading_confirmed_at=None,
+            chart_activity_notifications=os.getenv("CHART_ACTIVITY_NOTIFICATIONS", "true").lower() == "true",
+            chart_activity_level=os.getenv("CHART_ACTIVITY_LEVEL", "detailed").lower(),
+            chart_activity_include_rejections=os.getenv("CHART_ACTIVITY_INCLUDE_REJECTIONS", "true").lower() == "true",
+            chart_activity_cooldown_seconds=max(30, int(os.getenv("CHART_ACTIVITY_COOLDOWN_SECONDS", "300"))),
             symbols=[],
             enabled_symbols=[],
             available_symbols=[],

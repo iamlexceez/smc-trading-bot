@@ -44,6 +44,7 @@ def test_config_round_trip() -> None:
     assert_true(restored.entry_mode == settings.entry_mode, "entry mode did not round-trip")
     assert_true(restored.layer_allocation == settings.layer_allocation, "layer allocation did not round-trip")
     assert_true(restored.max_setup_risk_pct <= 1.0, "setup risk cap must be at most 1%")
+    assert_true(restored.chart_activity_level == "detailed", "detailed chart activity must be the default")
 
     legacy = TradeSettings.from_dict({"risk_per_trade": 10.0, "max_daily_loss_pct": 20.0, "max_open_positions": 5, "score_threshold": 60.0})
     assert_true(legacy.risk_per_trade == 1.0, "legacy risk was not capped")
@@ -264,6 +265,38 @@ async def test_model_governance_persistence() -> None:
     assert_true(metric["expectancy_r"] == 0.25 and metric["max_drawdown_r"] == 0.5, "risk-adjusted objective metrics are incorrect")
 
 
+async def test_chart_activity_notifications() -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send_message(self, chat_id: int, message: str) -> None:
+            self.messages.append(message)
+
+    class FakeApp:
+        def __init__(self) -> None:
+            self.bot = FakeBot()
+
+    settings = TradeSettings.defaults()
+    settings.chart_activity_notifications = True
+    settings.chart_activity_level = "detailed"
+    settings.chart_activity_cooldown_seconds = 300
+    app = FakeApp()
+    live = scheduler.MarketScheduler(settings, object(), object(), bot_app=app, admin_chat_id=1)
+
+    sent = await live._chart_activity("study_started", "TEST", "first", fingerprint="bar-1")
+    duplicate = await live._chart_activity("study_started", "TEST", "duplicate", fingerprint="bar-1")
+    throttled = await live._chart_activity("study_started", "TEST", "new but throttled", fingerprint="bar-2")
+    assert_true(sent and not duplicate and not throttled, "chart-study duplicate suppression failed")
+    assert_true(app.bot.messages == ["first"], "suppressed chart alerts reached Telegram")
+
+    settings.chart_activity_level = "essential"
+    suppressed = await live._chart_activity("structure_mapped", "TEST", "detail", fingerprint="structure-1")
+    essential = await live._chart_activity("broker_submission", "TEST", "essential", fingerprint="submit-1", essential=True)
+    assert_true(not suppressed and essential, "essential chart-activity mode did not filter detailed events")
+    assert_true(app.bot.messages[-1] == "essential", "essential event was not delivered")
+
+
 async def test_demo_live_partitioning() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "modes.db")
@@ -292,6 +325,7 @@ def run() -> None:
     asyncio.run(test_basket_persistence())
     asyncio.run(test_learning_telemetry_persistence())
     asyncio.run(test_model_governance_persistence())
+    asyncio.run(test_chart_activity_notifications())
     asyncio.run(test_demo_live_partitioning())
     print("PASS: upgrade smoke tests")
 

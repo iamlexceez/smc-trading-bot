@@ -134,6 +134,7 @@ async def main():
         BotCommand("backtest", "Causal broker-history backtest"),
         BotCommand("safety", "Hard limits and circuit breakers"),
         BotCommand("model", "Champion model and governance"),
+        BotCommand("activity", "Chart-study notification mode"),
         BotCommand("emergency", "Pause execution; optionally close positions"),
         BotCommand("help", "Operational command guide"),
     ]

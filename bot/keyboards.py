@@ -21,7 +21,7 @@ def settings_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Mode: DEMO / LIVE", callback_data="set_mode"), InlineKeyboardButton("Autonomy", callback_data="set_autotrade")],
         [InlineKeyboardButton("Safety Limits", callback_data="safety"), InlineKeyboardButton("Risk & Layers", callback_data="baskets")],
-        [InlineKeyboardButton("Refresh Markets", callback_data="markets")],
+        [InlineKeyboardButton("Chart Activity Alerts", callback_data="activity_menu"), InlineKeyboardButton("Refresh Markets", callback_data="markets")],
         [InlineKeyboardButton("⬅️ Dashboard", callback_data="dashboard")],
     ])
 
@@ -30,6 +30,17 @@ def autotrade_menu(current: bool) -> InlineKeyboardMarkup:
     status = "ON" if current else "OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"Autonomous Execution: {status}", callback_data="toggle_autotrade")],
+        [InlineKeyboardButton("⬅️ Settings", callback_data="settings")],
+    ])
+
+
+def activity_menu(current: str, include_rejections: bool) -> InlineKeyboardMarkup:
+    """Choose how much closed-candle chart activity reaches Telegram."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{'✅' if current == 'detailed' else '⬜'} Detailed", callback_data="activity_detailed")],
+        [InlineKeyboardButton(f"{'✅' if current == 'essential' else '⬜'} Essential only", callback_data="activity_essential")],
+        [InlineKeyboardButton(f"{'✅' if current == 'off' else '⬜'} Off", callback_data="activity_off")],
+        [InlineKeyboardButton(f"Rejected setups: {'ON' if include_rejections else 'OFF'}", callback_data="activity_rejections")],
         [InlineKeyboardButton("⬅️ Settings", callback_data="settings")],
     ])
 
