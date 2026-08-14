@@ -895,6 +895,24 @@ async def test_objective_markdown_fallback() -> None:
     assert_true(reply.calls[1][1].get("parse_mode") is None and "CAPITALEXHAUSTED" in reply.calls[1][0], "Objective Console did not send a plain-text fallback after Telegram rejected Markdown")
 
 
+async def test_objective_broker_universe_separation() -> None:
+    handler = object.__new__(BotHandlers)
+    handler.scheduler = SimpleNamespace(
+        last_capital_state={
+            "account": {"equity": 42.77, "free_margin": -0.48, "currency": "USD"},
+            "state": "CAPITAL_EXHAUSTED",
+        },
+        _analysis_eligible_symbols=(),
+        market_universe=SimpleNamespace(
+            accepted_records=[SimpleNamespace(symbol="Boom 500 Index"), SimpleNamespace(symbol="XAUUSDmicro")]
+        ),
+    )
+    handler.settings = SimpleNamespace(trading_mode="demo")
+    account, state, approved = await handler._objective_facts(refresh=False)
+    assert_true(state == "CAPITAL_EXHAUSTED" and account["free_margin"] < 0, "fixture did not preserve the broker capital block")
+    assert_true(approved == ("Boom 500 Index", "XAUUSDmicro"), "Objective Console incorrectly hid broker-approved symbols when margin feasibility was zero")
+
+
 async def test_objective_console_safety() -> None:
     interpreter = ObjectiveInterpreter()
     account = {"equity": 152.60, "free_margin": 152.60, "currency": "USD"}
@@ -1302,6 +1320,7 @@ def run() -> None:
     asyncio.run(test_sizing_rejection_diagnostic_persistence())
     asyncio.run(test_admin_command_error_reply())
     asyncio.run(test_objective_markdown_fallback())
+    asyncio.run(test_objective_broker_universe_separation())
     asyncio.run(test_objective_console_safety())
     asyncio.run(test_objective_phase_lifecycle())
     asyncio.run(test_legacy_objective_phase_migration())

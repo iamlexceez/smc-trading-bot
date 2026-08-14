@@ -206,8 +206,13 @@ class BotHandlers:
                 capital = self.scheduler.last_capital_state or {}
             account = dict(capital.get("account") or {})
             state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
-            usable = tuple(self.scheduler._analysis_eligible_symbols)
-            return account, state, usable
+            # Discovery is distinct from immediate margin feasibility.  The
+            # configured objective must resolve against the broker-approved
+            # Deriv universe even when negative free margin makes no symbol
+            # currently executable; the capital-state validator still blocks
+            # confirmation and all new exposure until broker readiness returns.
+            approved = tuple(record.symbol for record in self.scheduler.market_universe.accepted_records)
+            return account, state, approved
         state_row = await db.get_account_state(self.settings.trading_mode)
         state = str((state_row or {}).get("state") or "ACCOUNT_STATE_UNKNOWN")
         account = {
@@ -274,7 +279,7 @@ class BotHandlers:
             f"Phase: `{preview.phase}` | Inherited account mode: `{objective.account_mode.upper()}`",
             "", "**Fresh broker evidence**",
             f"State: `{account.get('state') or 'current reconciliation'}` | Equity: `{account.get('currency') or 'USD'} {float(account.get('equity') or 0.0):,.2f}` | Free margin: `{account.get('currency') or 'USD'} {float(account.get('free_margin') or 0.0):,.2f}`",
-            f"Broker-usable symbols: `{usable}`",
+            f"Broker-approved symbols: `{usable}`",
             "Resolved active instruments: " + (", ".join(f"{row.get('requested')} → {row.get('broker_symbol') or 'UNRESOLVED'} ({row.get('status')})" for row in preview.resolved_symbols) if preview.resolved_symbols else "Dynamic broker-verified Synthetic Indices / Gold universe"),
         ]
         if validation.errors:
