@@ -132,6 +132,88 @@ class MarketScheduler:
     def _execution_symbol_is_selected(self, symbol: str) -> bool:
         return str(symbol) in self._execution_selected_symbols
 
+    async def start_saved_objective_session(self) -> dict:
+        """Start one explicit fresh DEMO attempt from the saved objective template.
+
+        The command caller owns intent. This method only uses current broker
+        facts, preserves confirmed target/instruments, and creates immutable
+        session/phase records; it does not alter trading policy itself.
+        """
+        if self.settings.trading_mode != "demo":
+            return {"started": False, "reason": "Saved objective sessions are DEMO-only"}
+        self.capital_state_service.settings = self.settings
+        self.capital_state_service.executor = self.executor
+        capital = await self.capital_state_service.evaluate()
+        self.last_capital_state = capital
+        state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
+        if state not in {AccountCapitalState.ACCOUNT_VERIFIED, AccountCapitalState.LOW_CAPITAL}:
+            return {"started": False, "reason": f"Fresh broker account state {state} cannot start new exposure", "capital": capital}
+        active = await db.get_active_objective("demo")
+        if not active:
+            return {"started": False, "reason": "No saved confirmed objective exists", "capital": capital}
+        context = dict(active.get("context") or {})
+        operational = dict(context.get("operational") or {})
+        terminal = dict(operational.get("terminal") or {})
+        current_session_id = capital.get("demo_session_id")
+        if not terminal and operational.get("phase_plan") and not active.get("is_paused"):
+            return {"started": False, "reason": "The saved objective already has an active session", "capital": capital, "objective": active}
+        account = dict(capital.get("account") or {})
+        equity = float(account.get("equity") or 0.0)
+        balance = float(account.get("balance") or 0.0)
+        objective = dict(active.get("objective") or {})
+        target = float(objective.get("target_capital") or 0.0)
+        if equity <= 0 or target <= equity:
+            return {"started": False, "reason": "Fresh equity must be positive and below the saved objective target", "capital": capital, "objective": active}
+        if current_session_id:
+            old = await db.get_demo_session(int(current_session_id))
+            if old and old.get("status") == "active":
+                await db.close_demo_session(
+                    int(current_session_id), status="replaced_by_objective_start", balance=balance, equity=equity,
+                    exhaustion_reason="Explicit saved-objective session start", db_path=db.DB_PATH,
+                )
+        new_session_id = await db.create_demo_session(
+            broker_login=str(account.get("login") or ""), start_balance=balance, start_equity=equity,
+            objective_id=int(active["id"]), objective_version=active.get("version"), db_path=db.DB_PATH,
+        )
+        await db.bind_account_state_demo_session("demo", new_session_id, db_path=db.DB_PATH)
+        evidence = await db.get_management_learning_summary(
+            account_mode="demo", days=self.settings.market_ranking_lookback_days
+        )
+        plan = plan_objective_phases(
+            starting_equity=equity, target_equity=target,
+            minimum_operating_capital=float(capital.get("minimum_operating_capital") or 0.0),
+            historical_evidence=evidence,
+        )
+        policy, experiment_id, policy_version = await self.optimizer.active_policy("demo")
+        instruments = list(operational.get("allowed_symbols") or active.get("broker_universe") or [])
+        phases = await db.create_objective_phase_plan(
+            objective_id=int(active["id"]), demo_session_id=new_session_id, starting_equity=equity,
+            phase_targets=list(plan.phase_targets),
+            policy_snapshot={"model_version": policy_version, "experiment_id": experiment_id, "policy": policy.to_dict()},
+            instruments=instruments, db_path=db.DB_PATH,
+        )
+        phase = phases[-len(plan.phase_targets)]
+        operational.update({
+            "phase_plan": plan.to_dict(), "demo_session_id": new_session_id,
+            "starting_capital": equity, "phase_id": phase["id"],
+            "phase_number": phase.get("session_phase_number") or 1,
+            "phase_target_equity": phase["target_equity"], "phase_status": phase["status"],
+            "session_status": "ACTIVE",
+        })
+        started = await db.reactivate_objective_template_session(
+            objective_id=int(active["id"]), demo_session_id=new_session_id,
+            account_snapshot={**account, "state": state}, operational=operational, db_path=db.DB_PATH,
+        )
+        self.settings.auto_trade = True
+        self.settings.is_paused = False
+        await db.save_settings(self.settings)
+        self.risk_manager.settings = self.settings
+        self._set_execution_selected_symbols(instruments)
+        capital["demo_session_id"] = new_session_id
+        self.last_capital_state = capital
+        return {"started": bool(started), "objective": started or active, "session_id": new_session_id,
+                "phase": phase, "phase_count": len(plan.phase_targets), "capital": capital, "instruments": instruments}
+
     async def _ensure_objective_phase_plan(self, active: dict) -> dict:
         """Backfill one phase plan for a legacy confirmed growth objective.
 
@@ -140,7 +222,7 @@ class MarketScheduler:
         """
         context = dict(active.get("context") or {})
         operational = dict(context.get("operational") or {})
-        if operational.get("phase_plan") or operational.get("terminal"):
+        if operational.get("phase_plan") or operational.get("terminal") or operational.get("session_status") == "AWAITING_START":
             return active
         objective = dict(active.get("objective") or {})
         try:

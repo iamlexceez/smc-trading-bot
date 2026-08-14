@@ -1113,6 +1113,43 @@ async def test_objective_phase_lifecycle() -> None:
         assert_true(failed and failed["status"] == "failed" and failed["completion_reason"] == "CAPITAL_EXHAUSTED", "verified phase failure was not preserved")
 
 
+async def test_persistent_objective_template_sessions() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "objective_sessions.db")
+        await db.init_db(path)
+        objective = TradingObjective(raw_instruction="saved fixture", account_mode="demo", starting_capital=10.0, target_capital=100.0)
+        await db.create_objective_draft(
+            account_mode="demo", raw_instruction="saved fixture", objective=objective.to_dict(),
+            account_snapshot={"equity": 10.0, "free_margin": 10.0}, broker_universe=["Boom 100 Index"],
+            context={"operational": {"allowed_symbols": ["Boom 100 Index"], "template_saved": True}}, db_path=path,
+        )
+        template = await db.confirm_objective_draft("demo", db_path=path)
+        assert_true(template and template["objective"]["target_capital"] == 100.0, "confirmed objective template was not durable")
+        first_id = await db.create_demo_session(
+            broker_login="fixture", start_balance=10.0, start_equity=10.0,
+            objective_id=template["id"], objective_version=template["version"], db_path=path,
+        )
+        first_plan = await db.create_objective_phase_plan(
+            objective_id=template["id"], demo_session_id=first_id, starting_equity=10.0,
+            phase_targets=[25.0, 100.0], policy_snapshot={}, instruments=["Boom 100 Index"], db_path=path,
+        )
+        await db.fail_objective_phase(first_plan[0]["id"], ending_equity=4.0, reason="fixture exhausted", metrics={}, db_path=path)
+        await db.close_demo_session(first_id, status="exhausted", balance=4.0, equity=4.0, db_path=path)
+        second_id = await db.create_demo_session(
+            broker_login="fixture", start_balance=50.0, start_equity=50.0,
+            objective_id=template["id"], objective_version=template["version"], db_path=path,
+        )
+        second_plan_all = await db.create_objective_phase_plan(
+            objective_id=template["id"], demo_session_id=second_id, starting_equity=50.0,
+            phase_targets=[75.0, 100.0], policy_snapshot={}, instruments=["Boom 100 Index"], db_path=path,
+        )
+        second_first = second_plan_all[-2]
+        assert_true(second_first["session_phase_number"] == 1 and second_first["starting_equity"] == 50.0, "new saved-objective session did not use fresh equity and local phase one")
+        assert_true(second_first["target_equity"] == 75.0 and objective.target_capital == 100.0, "saved objective target changed during reset-separated session creation")
+        sessions = await db.get_objective_sessions(template["id"], db_path=path)
+        assert_true(len(sessions) == 2 and sessions[-1]["start_equity"] == 10.0 and sessions[0]["start_equity"] == 50.0, "prior session history was not immutable across a new session")
+
+
 async def test_legacy_objective_phase_migration() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "legacy_objective.db")
@@ -1353,6 +1390,7 @@ def run() -> None:
     asyncio.run(test_objective_broker_universe_separation())
     asyncio.run(test_objective_console_safety())
     asyncio.run(test_objective_phase_lifecycle())
+    asyncio.run(test_persistent_objective_template_sessions())
     asyncio.run(test_legacy_objective_phase_migration())
     test_causal_replay_safety()
     asyncio.run(test_adaptive_management_learning_evidence())

@@ -401,6 +401,9 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 FOREIGN KEY(basket_id) REFERENCES trade_baskets(id)
             )
         """)
+        await _ensure_column(db, "demo_sessions", "objective_id", "INTEGER")
+        await _ensure_column(db, "demo_sessions", "objective_version", "INTEGER")
+        await _ensure_column(db, "objective_phases", "session_phase_number", "INTEGER")
         await _ensure_column(db, "trades", "account_mode", "TEXT NOT NULL DEFAULT 'demo'")
         await _ensure_column(db, "trades", "ticket", "INTEGER")
         await _ensure_column(db, "trades", "setup_id", "INTEGER")
@@ -434,6 +437,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hypotheses_mode_status ON research_hypotheses(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_experiments_mode_status ON policy_experiments(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_demo_sessions_login_status ON demo_sessions(broker_login, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_demo_sessions_objective ON demo_sessions(objective_id, id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_account_state_events_mode_time ON account_state_events(account_mode, created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_capital_reduction_mode_status ON capital_reduction_sessions(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_capital_reduction_actions_session ON capital_reduction_actions(session_id, created_at)")
@@ -1447,15 +1451,18 @@ async def create_objective_phase_plan(
     prior = float(starting_equity)
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        for number, target in enumerate(phase_targets, start=1):
-            active = number == 1
+        cursor = await conn.execute("SELECT COALESCE(MAX(phase_number), 0) FROM objective_phases WHERE objective_id = ?", (int(objective_id),))
+        phase_number_base = int((await cursor.fetchone())[0] or 0)
+        for session_number, target in enumerate(phase_targets, start=1):
+            number = phase_number_base + session_number
+            active = session_number == 1
             await conn.execute(
                 """INSERT INTO objective_phases
-                   (objective_id, demo_session_id, phase_number, status, planned_start_equity,
+                   (objective_id, demo_session_id, phase_number, session_phase_number, status, planned_start_equity,
                     starting_equity, target_equity, started_at, policy_snapshot_json, instruments_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    int(objective_id), demo_session_id, number, "active" if active else "planned",
+                    int(objective_id), demo_session_id, number, session_number, "active" if active else "planned",
                     prior, float(starting_equity) if active else None, float(target), now if active else None,
                     json.dumps(policy_snapshot or {}, sort_keys=True), json.dumps(instruments, sort_keys=True),
                 ),
@@ -2216,6 +2223,7 @@ async def upsert_account_state(
 async def create_demo_session(
     *, broker_login: str, start_balance: float, start_equity: float,
     capital_reduction_activity: bool = False, capital_test_active: bool = False,
+    objective_id: Optional[int] = None, objective_version: Optional[int] = None,
     db_path: str = DB_PATH,
 ) -> int:
     now = datetime.utcnow().isoformat()
@@ -2223,10 +2231,11 @@ async def create_demo_session(
         cursor = await conn.execute(
             """INSERT INTO demo_sessions
                (broker_login, status, started_at, start_balance, start_equity, max_equity,
-                min_equity, capital_reduction_activity, capital_test_active)
-               VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?)""",
+                min_equity, capital_reduction_activity, capital_test_active, objective_id, objective_version)
+               VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (str(broker_login), now, float(start_balance), float(start_equity),
-             float(start_equity), float(start_equity), int(capital_reduction_activity), int(capital_test_active)),
+             float(start_equity), float(start_equity), int(capital_reduction_activity), int(capital_test_active),
+             objective_id, objective_version),
         )
         await conn.commit()
         return int(cursor.lastrowid)
@@ -2246,6 +2255,25 @@ async def get_demo_session(session_id: int, db_path: str = DB_PATH) -> Optional[
     return result
 
 
+async def get_objective_sessions(objective_id: int, limit: int = 20, db_path: str = DB_PATH) -> list[dict]:
+    """Return immutable reset-separated DEMO sessions for one saved objective."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM demo_sessions WHERE objective_id = ? ORDER BY id DESC LIMIT ?",
+            (int(objective_id), max(1, int(limit)),),
+        )
+        rows = await cursor.fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["policy_versions"] = json.loads(item.pop("policy_versions_json") or "[]")
+        item["capital_reduction_activity"] = bool(item.get("capital_reduction_activity"))
+        item["capital_test_active"] = bool(item.get("capital_test_active"))
+        result.append(item)
+    return result
+
+
 async def get_active_demo_session(broker_login: str, db_path: str = DB_PATH) -> Optional[dict]:
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
@@ -2261,6 +2289,42 @@ async def get_active_demo_session(broker_login: str, db_path: str = DB_PATH) -> 
     result["capital_reduction_activity"] = bool(result.get("capital_reduction_activity"))
     result["capital_test_active"] = bool(result.get("capital_test_active"))
     return result
+
+
+async def bind_account_state_demo_session(account_mode: str, session_id: int, db_path: str = DB_PATH) -> None:
+    """Point persisted account-state telemetry at an explicitly started session."""
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            "UPDATE account_state SET active_demo_session_id = ? WHERE account_mode = ?",
+            (int(session_id), str(account_mode)),
+        )
+        await conn.commit()
+
+
+async def reactivate_objective_template_session(
+    *, objective_id: int, demo_session_id: int, account_snapshot: dict,
+    operational: dict, db_path: str = DB_PATH,
+) -> Optional[dict]:
+    """Clear only terminal/session runtime state; never alter confirmed intent."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM trading_objectives WHERE id = ? AND status = 'active'", (int(objective_id),))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        context = json.loads(row["context_json"] or "{}")
+        op = dict(operational or {})
+        op.pop("terminal", None)
+        op["status"] = "ACTIVE"
+        op["demo_session_id"] = int(demo_session_id)
+        context["operational"] = op
+        await conn.execute(
+            "UPDATE trading_objectives SET is_paused = 0, account_snapshot_json = ?, context_json = ? WHERE id = ?",
+            (json.dumps(account_snapshot or {}, sort_keys=True), json.dumps(context, sort_keys=True), int(objective_id)),
+        )
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM trading_objectives WHERE id = ?", (int(objective_id),))
+        return await _objective_row(await cursor.fetchone())
 
 
 async def update_demo_session_equity(

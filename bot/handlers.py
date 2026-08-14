@@ -328,23 +328,21 @@ class BotHandlers:
                 # user to recreate a valid confirmed objective.
                 active = await db.get_active_objective(mode)
                 operational = dict(((active or {}).get("context") or {}).get("operational") or {})
+                if active and not operational.get("terminal") and operational.get("session_status") == "AWAITING_START":
+                    await self._reply_objective(
+                        reply,
+                        f"✅ **OBJECTIVE v{active.get('version')} SAVED**\n"
+                        "The reusable objective template is already confirmed. Use `/objective start` after fresh broker validation to begin its first DEMO session."
+                    )
+                    return
                 if active and not operational.get("terminal") and not operational.get("phase_plan") and self.scheduler:
                     recovered = await self.scheduler._ensure_objective_phase_plan(active)
                     recovered_operational = dict((recovered.get("context") or {}).get("operational") or {})
                     if recovered_operational.get("phase_plan"):
-                        if mode == "demo":
-                            recovered_objective = TradingObjective.from_dict(recovered["objective"])
-                            self.settings.auto_trade = True
-                            self.settings.is_paused = False
-                            self.settings.self_optimization_enabled = bool(recovered_objective.adaptive_learning)
-                            await db.save_settings(self.settings)
-                            self.scheduler.settings = self.settings
-                            self.scheduler.risk_manager.settings = self.settings
-                            self.scheduler._start_background_task("objective_recovery_scan", self.scheduler.activate_and_scan_now())
                         await self._reply_objective(
                             reply,
                             f"✅ **OBJECTIVE v{recovered.get('version')} RECOVERED**\n"
-                            "Its interrupted confirmation was completed idempotently. The adaptive phase plan and existing DEMO execution lifecycle are active; use `/objective` to view the current broker state."
+                            "A legacy interrupted activation was completed idempotently. Use `/objective` to inspect its current broker state."
                         )
                         return
                 await reply.reply_text("No objective draft exists. Use `/objective set <instruction>` first.", parse_mode="Markdown")
@@ -361,66 +359,55 @@ class BotHandlers:
             if not validation.valid:
                 await self._reply_objective(reply, self._format_objective_preview(preview) + "\n\n❌ Objective was not activated.")
                 return
-            # Phase boundaries measure progress. They never alter the user’s
-            # final target, instrument allowlist, or policy variables.
-            management_evidence = await db.get_management_learning_summary(account_mode=mode, days=self.settings.market_ranking_lookback_days)
-            minimum_operating_capital = float((self.scheduler.last_capital_state if self.scheduler else {}).get("minimum_operating_capital") or 0.0)
-            phase_plan = plan_objective_phases(
-                starting_equity=float(objective.starting_capital or account.get("equity") or 0.0),
-                target_equity=float(objective.target_capital or 0.0),
-                minimum_operating_capital=minimum_operating_capital,
-                historical_evidence=management_evidence,
-            )
+            # Confirmation saves the reusable user objective as a durable
+            # template. A separate explicit /objective start records fresh
+            # broker equity and begins one reset-separated DEMO attempt.
             operational = self._operational_objective_config(
-                objective, resolved_symbols=resolved, broker_usable_symbols=usable, account=account,
-                phase=phase, phase_plan=phase_plan.to_dict(),
+                objective, resolved_symbols=resolved, broker_usable_symbols=usable, account=account, phase=phase,
             )
+            operational.update({"template_saved": True, "session_status": "AWAITING_START", "phase_plan": None})
             active = await db.confirm_objective_draft(
                 mode, objective=objective.to_dict(), account_snapshot={**account, "state": state}, broker_universe=list(usable), context={**preview.to_dict(), "operational": operational},
             )
-            phase_policy = {"model_version": self.settings.active_model_version, "adaptive_learning": objective.adaptive_learning}
-            phase_rows = await db.create_objective_phase_plan(
-                objective_id=int(active["id"]),
-                demo_session_id=((self.scheduler.last_capital_state if self.scheduler else {}).get("demo_session_id")),
-                starting_equity=float(objective.starting_capital or account.get("equity") or 0.0),
-                phase_targets=list(phase_plan.phase_targets), policy_snapshot=phase_policy,
-                instruments=list(operational.get("allowed_symbols") or []),
-            )
-            active_phase = phase_rows[0]
-            operational.update({
-                "phase_id": active_phase["id"], "phase_number": active_phase["phase_number"],
-                "phase_target_equity": active_phase["target_equity"], "phase_status": active_phase["status"],
-            })
-            active = await db.update_active_objective_context(
-                int(active["id"]), {**preview.to_dict(), "operational": operational}
-            ) or active
-            # Explicit confirmation activates DEMO full auto through the existing
-            # scheduler; the parser never owns MT5 submission itself.
-            if mode == "demo":
-                self.settings.auto_trade = True
-                # A newly confirmed, broker-valid objective is the only path
-                # that may reopen new exposure after an earlier terminal cycle.
-                self.settings.is_paused = False
-                # This is the existing optimizer switch; it remains background
-                # work and is never an execution prerequisite.
-                self.settings.self_optimization_enabled = bool(objective.adaptive_learning)
-                await db.save_settings(self.settings)
-                if self.scheduler:
-                    self.scheduler.settings = self.settings
-                    self.scheduler.risk_manager.settings = self.settings
-                    if not self.settings.is_paused:
-                        self.scheduler._start_background_task("objective_activation_scan", self.scheduler.activate_and_scan_now())
-            active_text = self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active['version']} ACTIVE**")
-            readiness, readiness_detail = objective_operational_readiness(account, state, is_paused=bool(self.settings.is_paused))
-            phase_text = (
-                f"\n\n🎯 **PHASE 1 ACTIVE**\nMilestone: `${float(active_phase['starting_equity']):.2f}` → `${float(active_phase['target_equity']):.2f}`\n"
-                f"Adaptive plan: `{len(phase_rows)}` broker-aware milestones; each completed phase freezes its evidence and hands it to the next phase."
-            )
-            if readiness == "READY":
-                active_text += "\n\n🟢 **FULL AUTO DEMO READY**\nThe existing scanner is now evaluating only the resolved objective universe. Valid setups continue through existing SMC, sizing, broker, TP/SL, position-management, and MT5 execution gates. Learning runs in the background." + phase_text
-            else:
-                active_text += f"\n\n⛔ **FULL AUTO DEMO STANDBY — {readiness}**\n{readiness_detail}\nNo new objective-scoped order will be opened until the existing broker-authoritative state becomes ready." + phase_text
+            await db.set_objective_paused(mode, True)
+            self.settings.is_paused = True
+            self.settings.self_optimization_enabled = bool(objective.adaptive_learning)
+            await db.save_settings(self.settings)
+            active_text = self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active['version']} SAVED**")
+            active_text += "\n\n📌 **SAVED OBJECTIVE TEMPLATE**\nThe target, preferences, and resolved instrument scope are retained across bot restarts and completed or failed DEMO sessions.\n\nUse `/objective start` after fresh broker validation to begin a new reset-separated DEMO session."
             await self._reply_objective(reply, active_text)
+            return
+        if action == "start":
+            if not self.scheduler:
+                await reply.reply_text("Objective session start is unavailable because the scheduler is not initialized.")
+                return
+            started = await self.scheduler.start_saved_objective_session()
+            if not started.get("started"):
+                await reply.reply_text(
+                    f"Objective session was not started: {started.get('reason') or 'fresh broker validation did not pass'}.\n"
+                    "The saved objective remains unchanged; use `/objective` to view its retained configuration.",
+                    parse_mode="Markdown",
+                )
+                return
+            active = started["objective"]
+            objective = TradingObjective.from_dict(active["objective"])
+            phase = started["phase"]
+            account = dict((started.get("capital") or {}).get("account") or {})
+            instruments = ", ".join(started.get("instruments") or []) or "Dynamic broker-verified Synthetic Indices / Gold universe"
+            self.scheduler._start_background_task("objective_session_start_scan", self.scheduler.activate_and_scan_now())
+            await self._reply_objective(
+                reply,
+                "🚀 **NEW OBJECTIVE SESSION**\n"
+                f"Session: `#{started['session_id']}` | Objective v{active.get('version')}\n\n"
+                f"Saved objective: `${float(objective.starting_capital or 0.0):.2f}` → `${float(objective.target_capital or 0.0):.2f}`\n"
+                f"Current DEMO equity: `${float(account.get('equity') or 0.0):.2f}`\n"
+                f"Growth: `{objective.growth_preference.upper()}` | Protection: `{objective.capital_protection_preference.upper()}`\n"
+                f"Allowed instruments: `{instruments}`\n\n"
+                f"🎯 **PHASE {phase.get('session_phase_number') or 1} ACTIVE**\n"
+                f"Milestone: `${float(phase.get('starting_equity') or 0.0):.2f}` → `${float(phase.get('target_equity') or 0.0):.2f}`\n"
+                f"Adaptive plan: `{started.get('phase_count')}` milestones\n\n"
+                "🟢 **ACTIVE — FULL AUTO DEMO**\nThe existing broker-validated scanner and independent position manager are active.",
+            )
             return
         if action == "resume":
             active = await db.get_active_objective(mode)
@@ -440,15 +427,22 @@ class BotHandlers:
             await reply.reply_text("Objective draft cancelled." if cancelled else "No objective draft was waiting for confirmation.")
             return
         if action == "history":
-            rows = await db.list_objective_history(mode)
-            if not rows:
-                await reply.reply_text("No confirmed objective history exists yet.")
+            active = await db.get_active_objective(mode)
+            if not active:
+                await reply.reply_text("No saved confirmed objective exists yet.")
                 return
-            lines = ["🎯 **OBJECTIVE HISTORY**", ""]
+            rows = await db.get_objective_sessions(int(active["id"]))
+            if not rows:
+                await reply.reply_text("No reset-separated sessions have been started for this saved objective. Use `/objective start` after broker validation.", parse_mode="Markdown")
+                return
+            lines = [f"🎯 **OBJECTIVE SESSION HISTORY — v{active.get('version')}**", ""]
             for row in rows[:10]:
-                objective = row.get("objective") or {}
-                lines.append(f"v{row.get('version') or '?'} — `{str(row.get('status') or '').upper()}` | `{row.get('account_mode', '').upper()}` | phase `{(row.get('context') or {}).get('phase', 'n/a')}`\n_{str(row.get('raw_instruction') or '')[:180]}_")
-            await reply.reply_text("\n\n".join(lines), parse_mode="Markdown")
+                lines.append(
+                    f"Session #{row.get('id')} — `{str(row.get('status') or '').upper()}`\n"
+                    f"`${float(row.get('start_equity') or 0.0):.2f}` → `${float(row.get('end_equity') or row.get('start_equity') or 0.0):.2f}` | "
+                    f"trades `{row.get('strategy_trades', 0)}` | drawdown `{float(row.get('max_drawdown_pct') or 0.0):.1f}%`"
+                )
+            await self._reply_objective(reply, "\n\n".join(lines))
             return
         if action == "pause":
             changed = await db.set_objective_paused(mode, True)
@@ -487,7 +481,7 @@ class BotHandlers:
                 f"🏁 **OBJECTIVE SESSION TERMINAL — {str(terminal.get('outcome') or 'recorded').upper()}**\n"
                 f"Session: `#{terminal.get('demo_session_id', 'N/A')}` | Terminal equity: `${float(terminal.get('equity') or 0.0):.2f}`\n"
                 f"Reason: {terminal.get('reason') or 'Broker-confirmed terminal outcome'}\n"
-                "A one-time evidence review has been recorded. New exposure stays paused, while existing positions continue receiving broker-confirmed protection. Confirm a new objective to begin another DEMO research cycle."
+                "A one-time evidence review has been recorded. New exposure stays paused, while existing positions continue receiving broker-confirmed protection. After a broker-verified DEMO reset, use `/objective start` to reuse this saved objective for another session."
             )
         elif readiness == "READY":
             readiness_text = "🟢 **FULL AUTO DEMO READY**\nScanner and automatic execution use this objective's operational universe, subject to the existing final execution gates."
@@ -532,7 +526,9 @@ class BotHandlers:
             "`/demo_session [id]` — reset-separated DEMO session report\n"
             "`/demo_auto_resume on|off` — optional verified-reset auto-resume\n"
             "`/backtest <symbol> <tf> <days>` — causal policy backtest with TP/SL replay evidence\n"
-            "`/objective [set|confirm|cancel|history|explain|pause]` — confirmed user-intent console; never direct execution\n"
+            "`/objective [set|confirm|start|cancel|history|explain|pause]` — saved objective template and explicit DEMO session controls\n"
+            "`/session` — current saved-objective DEMO session\n"
+            "`/learned` — plain-language evidence summary across saved objective sessions\n"
             "`/activity [detailed|essential|off]` — chart-study notification mode\n"
             "`/settings` — autonomy, alerts, and explicit DEMO/LIVE controls\n"
             "`/emergency` — pause new execution and optionally close positions\n\n"
@@ -846,6 +842,72 @@ class BotHandlers:
             f"Collect at least `{self.settings.optimization_min_sample_size}` completed DEMO R-recorded outcomes, then compare independently specified policies through train, validation, out-of-sample, and forward-DEMO evidence. Broker and software integrity remain mandatory; risk, RR, features, layering, and management are experimental.",
         ]
         await self._render_menu(update, "\n".join(text))
+
+    @admin_only
+    async def cmd_learned(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Explain stored DEMO evidence in plain language without inventing conclusions."""
+        mode = self.settings.trading_mode
+        active = await db.get_active_objective(mode)
+        if not active:
+            await self._render_plain_menu(update, "🧠 WHAT I'VE LEARNED SO FAR\n\nUNKNOWN — no saved objective or session evidence exists yet.")
+            return
+        operational = dict((active.get("context") or {}).get("operational") or {})
+        session_id = operational.get("demo_session_id")
+        sessions = await db.get_objective_sessions(int(active["id"]))
+        current = await db.get_demo_session_report(int(session_id)) if session_id else None
+        symbol_rows = await db.get_demo_session_symbol_summary(int(session_id)) if session_id else []
+        lines = ["🧠 WHAT I'VE LEARNED SO FAR", ""]
+        if current and int(current.get("strategy_trades") or 0) > 0:
+            lines.append(f"CURRENT SESSION — observed `{current.get('strategy_trades', 0)}` completed strategy trades; `{current.get('wins', 0)}` wins and `{current.get('losses', 0)}` losses.")
+            lines.append(f"Session expectancy: `{current.get('expectancy_r') if current.get('expectancy_r') is not None else 'UNKNOWN'}` R; drawdown: `{float(current.get('max_drawdown_pct') or 0.0):.1f}%`.")
+        else:
+            lines.append("CURRENT SESSION — UNKNOWN. There are not yet enough closed broker-confirmed trades to describe performance.")
+        if symbol_rows:
+            top = symbol_rows[0]
+            sample = int(top.get("trades") or 0)
+            stage = "VALIDATED" if sample >= self.settings.optimization_min_sample_size else "OBSERVED"
+            lines.append(f"{stage}: `{top.get('symbol')}` currently has the strongest session evidence: `{sample}` completed trades and `${float(top.get('pnl') or 0.0):.2f}` realized P/L.")
+            if len(symbol_rows) > 1:
+                weak = symbol_rows[-1]
+                lines.append(f"OBSERVED: `{weak.get('symbol')}` has the weakest current-session realized result: `${float(weak.get('pnl') or 0.0):.2f}` across `{int(weak.get('trades') or 0)}` trades.")
+        else:
+            lines.append("UNKNOWN: no instrument has enough closed session outcomes yet to be favored or avoided.")
+        completed = [row for row in sessions if row.get("status") != "active"]
+        lines.extend(["", "CURRENT PLAN"])
+        lines.append("Doing: pursuing the saved objective through the current broker-validated instrument scope and the active experimental policy.")
+        lines.append("Favoring: instruments and management responses with the strongest currently stored evidence; insufficient samples remain experimental.")
+        lines.append("Avoiding: new exposure during broker margin pressure, repeated negative-evidence setups, and loss-driven size escalation.")
+        lines.append("Testing: the active policy’s entry, sizing, layering, TP/SL, and capital-protection response variables through forward DEMO evidence.")
+        lines.append("Uncertain: whether current results persist across additional phases and reset-separated DEMO sessions.")
+        lines.append(f"Historical context: `{len(sessions)}` saved session(s), `{len(completed)}` completed/failed session(s).")
+        await self._render_plain_menu(update, "\n".join(lines))
+
+    @admin_only
+    async def cmd_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show one readable status report for the current saved-objective session."""
+        active = await db.get_active_objective(self.settings.trading_mode)
+        operational = dict(((active or {}).get("context") or {}).get("operational") or {})
+        session_id = operational.get("demo_session_id")
+        if not active or not session_id:
+            await self._render_plain_menu(update, "No active saved-objective session. Use `/objective start` after confirming a saved objective.")
+            return
+        session = await db.get_demo_session_report(int(session_id))
+        phase = await db.get_active_objective_phase(int(active["id"]))
+        if not session:
+            await self._render_plain_menu(update, "Current objective session evidence is not available yet.")
+            return
+        objective = TradingObjective.from_dict(active["objective"])
+        text = "\n".join([
+            "📊 CURRENT OBJECTIVE SESSION",
+            f"Session: #{session.get('id')} | Status: {str(session.get('status') or '').upper()}",
+            f"Starting equity: ${float(session.get('start_equity') or 0.0):.2f} | Current equity: ${float(session.get('end_equity') or session.get('start_equity') or 0.0):.2f}",
+            f"Saved target: ${float(objective.target_capital or 0.0):.2f}",
+            f"Current phase: {phase.get('session_phase_number') if phase else 'N/A'} | Target: ${float((phase or {}).get('target_equity') or 0.0):.2f}",
+            f"Trades: {session.get('strategy_trades', 0)} | Wins/losses: {session.get('wins', 0)}/{session.get('losses', 0)} | Drawdown: {float(session.get('max_drawdown_pct') or 0.0):.1f}%",
+            f"Policy versions: {', '.join(session.get('policy_versions') or []) or 'baseline / pending closed evidence'}",
+            "Learning status: broker-confirmed completed outcomes feed the existing governed optimizer.",
+        ])
+        await self._render_plain_menu(update, text)
 
     @admin_only
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2480,6 +2542,8 @@ class BotHandlers:
         app.add_handler(CommandHandler("demo_session", self.cmd_demo_session_report))
         app.add_handler(CommandHandler("demo_auto_resume", self.cmd_demo_auto_resume))
         app.add_handler(CommandHandler("learning", self.cmd_learning))
+        app.add_handler(CommandHandler("learned", self.cmd_learned))
+        app.add_handler(CommandHandler("session", self.cmd_session))
         app.add_handler(CommandHandler("experiments", self.cmd_experiments))
         app.add_handler(CommandHandler("champion", self.cmd_champion))
         app.add_handler(CommandHandler("challengers", self.cmd_challengers))
