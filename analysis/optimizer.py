@@ -429,6 +429,16 @@ class SelfOptimizer:
         ) or "No versioned policies yet"
         management_pf = management.get("profit_factor")
         management_pf_text = "N/A" if not math.isfinite(float(management_pf or 0.0)) else f"{float(management_pf):.2f}"
+        active_objective = await db.get_active_objective(account_mode)
+        if active_objective:
+            objective_context = active_objective.get("context") or {}
+            objective_text = (
+                f"Objective v{active_objective.get('version')} | phase `{objective_context.get('phase', 'UNAVAILABLE')}` | "
+                f"context `{'PAUSED' if active_objective.get('is_paused') else 'ACTIVE'}`. "
+                "It supplies user-intent reporting context only; policy promotion still requires research evidence."
+            )
+        else:
+            objective_text = "No confirmed objective is active; research remains governed only by broker facts and experimental evidence."
         capital_state = await db.get_account_state("demo") if account_mode == "demo" else None
         if capital_state:
             capital_text = (
@@ -462,6 +472,9 @@ class SelfOptimizer:
             f"Completed broker-confirmed/replay observations: `{management['sample_size']}` | expectancy `{management['expectancy_r']:.2f}R` | profit factor `{management_pf_text}`.",
             f"MAE `{management['average_mae_r']:.2f}R` | MFE `{management['average_mfe_r']:.2f}R` | SL changes `{management['sl_modifications']}` | TP changes `{management['tp_modifications']}` | partial exits `{management['partial_exits']}`.",
             "These statistics inform future causal management research; they do not independently change a live TP/SL policy.",
+            "",
+            "**Confirmed Objective Context**",
+            objective_text,
             "",
             "**No-Revenge Governance**",
             "Losses are recorded as evidence but cannot trigger immediate risk escalation, extra trades, extra layers, or an intraday policy replacement. Policy governance runs no more than once per UTC day.",

@@ -30,6 +30,7 @@ from data.provider import DataProvider
 from analysis.optimizer import SelfOptimizer
 from analysis.research_governance import ResearchGovernance
 from analysis.adaptive_management import observation_from_broker_trade, observations_from_backtest, summarize_management
+from analysis.objectives import ObjectiveInterpreter, ObjectiveValidator, TradingObjective, phase_for_equity
 from backtest.engine import BacktestEngine, BacktestResult, BacktestTrade
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 from analysis.account_monitor import summarize_history, exposure_summary
@@ -628,6 +629,57 @@ async def test_sizing_rejection_diagnostic_persistence() -> None:
         assert_true(latest["details"]["sizing_inputs"]["risk_pct"] == 1.0, "latest sizing rejection lost sizing inputs")
 
 
+async def test_objective_console_safety() -> None:
+    interpreter = ObjectiveInterpreter()
+    account = {"equity": 152.60, "free_margin": 152.60, "currency": "USD"}
+    usable = ("Volatility 75 Index", "XAUUSDmicro")
+    objective = interpreter.parse(
+        "Start with $50 and aim for $10,000 aggressively while protecting capital aggressively. "
+        "Trade Synthetic Indices and Gold with RR 0 and adaptive learning.",
+        account_mode="demo",
+    )
+    assert_true(objective.account_mode == "demo", "objective parser changed DEMO mode when the instruction omitted the word demo")
+    assert_true(objective.minimum_rr == 0.0, "objective parser did not preserve an explicit zero-RR request")
+    validation = ObjectiveValidator.validate(objective, account_snapshot=account, account_state="ACCOUNT_VERIFIED", broker_usable_symbols=usable)
+    assert_true(validation.valid and not validation.errors, "valid DEMO objective was incorrectly blocked")
+    assert_true(any("not a guaranteed" in warning for warning in validation.warnings), "large growth target was not labelled as non-guaranteed")
+    assert_true(phase_for_equity(50.0, 152.60) == "GROWTH", "objective phase calculation is incorrect")
+
+    below_target = interpreter.parse("Start with $100 and aim for $50", account_mode="demo")
+    below_validation = ObjectiveValidator.validate(below_target, account_snapshot=account, account_state="ACCOUNT_VERIFIED", broker_usable_symbols=usable)
+    assert_true(not below_validation.valid and below_validation.errors, "target below starting capital remained confirmable")
+
+    unsupported = interpreter.parse("Start with $50 and aim for $100 with XAUEUR", account_mode="demo")
+    unsupported_validation = ObjectiveValidator.validate(unsupported, account_snapshot=account, account_state="ACCOUNT_VERIFIED", broker_usable_symbols=usable)
+    assert_true(not unsupported_validation.valid and any("XAUEUR" in error for error in unsupported_validation.errors), "unsupported broker symbol was not blocked")
+    assert_true(not hasattr(interpreter, "executor") and not hasattr(interpreter, "mt5"), "objective parser was given an execution boundary")
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "objectives.db")
+        await db.init_db(path)
+        first = await db.create_objective_draft(
+            account_mode="demo", raw_instruction=objective.raw_instruction, objective=objective.to_dict(),
+            account_snapshot=account, broker_universe=list(usable), context={"phase": "GROWTH", "validation": validation.to_dict()}, db_path=path,
+        )
+        assert_true(first["status"] == "draft", "objective draft was unexpectedly activated")
+        active_one = await db.confirm_objective_draft(
+            "demo", objective=objective.to_dict(), account_snapshot=account, broker_universe=list(usable),
+            context={"phase": "GROWTH", "validation": validation.to_dict()}, db_path=path,
+        )
+        assert_true(active_one["status"] == "active" and active_one["version"] == 1, "first confirmed objective was not versioned active")
+        await db.create_objective_draft(
+            account_mode="demo", raw_instruction="Start with $60 and aim for $120", objective=objective.to_dict(),
+            account_snapshot=account, broker_universe=list(usable), context={"phase": "GROWTH", "validation": validation.to_dict()}, db_path=path,
+        )
+        active_two = await db.confirm_objective_draft("demo", db_path=path)
+        assert_true(active_two["version"] == 2, "new confirmed objective did not receive the next immutable version")
+        history = await db.list_objective_history("demo", db_path=path)
+        assert_true({row["status"] for row in history} == {"active", "superseded"}, "objective history overwrote a prior active version")
+        assert_true(await db.set_objective_paused("demo", True, db_path=path), "active objective context did not accept a pause request")
+        paused = await db.get_active_objective("demo", db_path=path)
+        assert_true(paused and paused["is_paused"], "objective pause state was not persisted")
+
+
 def test_causal_replay_safety() -> None:
     def make_engine(policy: ExperimentalPolicy | None = None) -> BacktestEngine:
         return BacktestEngine(settings=TradeSettings.defaults(), policy=policy or ExperimentalPolicy(
@@ -816,6 +868,7 @@ def run() -> None:
     asyncio.run(test_capital_reduction_isolation())
     asyncio.run(test_broker_authoritative_capital_state())
     asyncio.run(test_sizing_rejection_diagnostic_persistence())
+    asyncio.run(test_objective_console_safety())
     test_causal_replay_safety()
     asyncio.run(test_adaptive_management_learning_evidence())
     test_research_governance_rankings()

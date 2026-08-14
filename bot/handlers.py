@@ -39,6 +39,7 @@ from storage import db
 from analysis.scoring import format_signal_report
 from analysis.profiler import profiler
 from analysis.order_flow import order_flow
+from analysis.objectives import ObjectiveInterpreter, ObjectivePreview, ObjectiveValidation, ObjectiveValidator, TradingObjective, phase_for_equity
 from bot.account_views import LiveAccountViews
 from bot.capital_views import capital_actions_view, capital_test_view, demo_session_report_view
 from risk.manager import RiskManager
@@ -167,6 +168,141 @@ class BotHandlers:
             "\nUse the research controls below. LIVE always requires a separate explicit confirmation.",
         ])
 
+    async def _objective_facts(self, *, refresh: bool) -> tuple[dict, str, tuple[str, ...]]:
+        """Return broker/account facts for objective review; never executes a trade."""
+        if self.scheduler:
+            if refresh:
+                await self.scheduler.refresh_market_universe()
+                reconciliation = await self.scheduler.reconcile_account_state()
+                capital = reconciliation.get("capital") or {}
+            else:
+                capital = self.scheduler.last_capital_state or {}
+            account = dict(capital.get("account") or {})
+            state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
+            usable = tuple(self.scheduler._analysis_eligible_symbols)
+            return account, state, usable
+        state_row = await db.get_account_state(self.settings.trading_mode)
+        state = str((state_row or {}).get("state") or "ACCOUNT_STATE_UNKNOWN")
+        account = {
+            "balance": (state_row or {}).get("last_balance"),
+            "equity": (state_row or {}).get("last_equity"),
+            "free_margin": (state_row or {}).get("last_free_margin"),
+            "currency": "USD",
+        }
+        return account, state, ()
+
+    @staticmethod
+    def _format_objective_preview(preview: ObjectivePreview, *, heading: str = "🎯 **OBJECTIVE DRAFT**") -> str:
+        objective = preview.objective
+        validation = preview.validation
+        account = preview.account_snapshot
+        multiple = f"{objective.target_multiple:.2f}×" if objective.target_multiple is not None else "Not specified"
+        rr = "Not specified" if objective.minimum_rr is None else str(objective.minimum_rr)
+        usable = ", ".join(preview.broker_usable_symbols[:10]) or "None"
+        lines = [
+            heading, "",
+            f"Starting capital: `${objective.starting_capital:,.2f}`" if objective.starting_capital is not None else "Starting capital: Not specified",
+            f"Target capital: `${objective.target_capital:,.2f}`" if objective.target_capital is not None else "Target capital: Not specified",
+            f"Target multiple: `{multiple}`",
+            f"Growth preference: `{objective.growth_preference.upper()}` | Capital protection: `{objective.capital_protection_preference.upper()}`",
+            f"Minimum RR context: `{rr}` | Layering preference: `{objective.layering_preference.upper()}`",
+            f"Adaptive sizing: `{'ON' if objective.adaptive_sizing else 'OFF'}` | Adaptive TP/SL: `{'ON' if objective.adaptive_management else 'OFF'}` | Learning: `{'ON' if objective.adaptive_learning else 'OFF'}`",
+            f"Phase: `{preview.phase}` | Inherited account mode: `{objective.account_mode.upper()}`",
+            "", "**Fresh broker evidence**",
+            f"State: `{account.get('state') or 'current reconciliation'}` | Equity: `{account.get('currency') or 'USD'} {float(account.get('equity') or 0.0):,.2f}` | Free margin: `{account.get('currency') or 'USD'} {float(account.get('free_margin') or 0.0):,.2f}`",
+            f"Broker-usable symbols: `{usable}`",
+        ]
+        if validation.errors:
+            lines.extend(["", "**Errors — confirmation blocked**", *[f"❌ {item}" for item in validation.errors]])
+        if validation.warnings:
+            lines.extend(["", "**Warnings**", *[f"⚠️ {item}" for item in validation.warnings]])
+        if validation.info:
+            lines.extend(["", "**Information**", *[f"• {item}" for item in validation.info]])
+        lines.extend(["", "_This is an objective, not a guaranteed return. Existing broker and execution controls remain authoritative._"])
+        return "\n".join(lines)
+
+    @admin_only
+    async def cmd_objective(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Manage a confirmed, versioned user objective without direct trading authority."""
+        await self.reload_settings()
+        args = list(context.args or [])
+        action = args[0].lower() if args else "show"
+        mode = self.settings.trading_mode
+        reply = update.callback_query.message if update.callback_query else update.message
+        if action == "set":
+            instruction = " ".join(args[1:]).strip()
+            if not instruction:
+                await reply.reply_text("Usage: `/objective set <natural-language objective>`", parse_mode="Markdown")
+                return
+            account, state, usable = await self._objective_facts(refresh=True)
+            objective = ObjectiveInterpreter().parse(instruction, account_mode=mode)
+            validation = ObjectiveValidator.validate(objective, account_snapshot=account, account_state=state, broker_usable_symbols=usable)
+            preview = ObjectivePreview(objective, validation, {**account, "state": state}, usable, phase_for_equity(objective.starting_capital, account.get("equity")))
+            await db.create_objective_draft(
+                account_mode=mode, raw_instruction=instruction, objective=objective.to_dict(), account_snapshot={**account, "state": state},
+                broker_universe=list(usable), context=preview.to_dict(),
+            )
+            await reply.reply_text(self._format_objective_preview(preview) + "\n\nUse `/objective confirm` to apply this valid draft or `/objective cancel` to discard it.", parse_mode="Markdown")
+            return
+        if action == "confirm":
+            draft = await db.get_objective_draft(mode)
+            if not draft:
+                await reply.reply_text("No objective draft exists. Use `/objective set <instruction>` first.", parse_mode="Markdown")
+                return
+            account, state, usable = await self._objective_facts(refresh=True)
+            objective = TradingObjective.from_dict(draft["objective"])
+            # The configured account mode is authoritative; an instruction can never switch it.
+            objective = TradingObjective.from_dict({**objective.to_dict(), "account_mode": mode})
+            validation = ObjectiveValidator.validate(objective, account_snapshot=account, account_state=state, broker_usable_symbols=usable)
+            preview = ObjectivePreview(objective, validation, {**account, "state": state}, usable, phase_for_equity(objective.starting_capital, account.get("equity")))
+            if not validation.valid:
+                await reply.reply_text(self._format_objective_preview(preview) + "\n\n❌ Objective was not activated.", parse_mode="Markdown")
+                return
+            active = await db.confirm_objective_draft(
+                mode, objective=objective.to_dict(), account_snapshot={**account, "state": state}, broker_universe=list(usable), context=preview.to_dict(),
+            )
+            await reply.reply_text(self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active['version']} ACTIVE**") + "\n\nThe objective is now recorded as research context. It cannot directly submit or modify an MT5 trade.", parse_mode="Markdown")
+            return
+        if action == "cancel":
+            cancelled = await db.cancel_objective_draft(mode)
+            await reply.reply_text("Objective draft cancelled." if cancelled else "No objective draft was waiting for confirmation.")
+            return
+        if action == "history":
+            rows = await db.list_objective_history(mode)
+            if not rows:
+                await reply.reply_text("No confirmed objective history exists yet.")
+                return
+            lines = ["🎯 **OBJECTIVE HISTORY**", ""]
+            for row in rows[:10]:
+                objective = row.get("objective") or {}
+                lines.append(f"v{row.get('version') or '?'} — `{str(row.get('status') or '').upper()}` | `{row.get('account_mode', '').upper()}` | phase `{(row.get('context') or {}).get('phase', 'n/a')}`\n_{str(row.get('raw_instruction') or '')[:180]}_")
+            await reply.reply_text("\n\n".join(lines), parse_mode="Markdown")
+            return
+        if action == "pause":
+            changed = await db.set_objective_paused(mode, True)
+            await reply.reply_text("Objective-driven research context paused. The scanner, broker safety checks, and current position management remain unchanged." if changed else "No active objective exists to pause.")
+            return
+        active = await db.get_active_objective(mode)
+        if action == "explain" and active:
+            context_data = active.get("context") or {}
+            await reply.reply_text(
+                f"🎯 **OBJECTIVE EXPLANATION — v{active.get('version')}**\n\nPhase: `{context_data.get('phase', 'UNAVAILABLE')}` | paused: `{'YES' if active.get('is_paused') else 'NO'}`\n"
+                "The objective supplies user intent and reporting context only. The existing experimental-policy engine still selects, validates, and evaluates policies from historical, validation, out-of-sample, and forward-DEMO evidence. It does not set a lot, SL, TP, margin amount, or submit an order.",
+                parse_mode="Markdown",
+            )
+            return
+        if not active:
+            await reply.reply_text("No active objective. Use `/objective set <instruction>` to create a draft.", parse_mode="Markdown")
+            return
+        objective = TradingObjective.from_dict(active["objective"])
+        validation_data = (active.get("context") or {}).get("validation") or {}
+        validation = ObjectiveValidation(
+            bool(validation_data.get("valid", True)), tuple(validation_data.get("errors") or ()),
+            tuple(validation_data.get("warnings") or ()), tuple(validation_data.get("info") or ()),
+        )
+        preview = ObjectivePreview(objective, validation, active.get("account_snapshot") or {}, tuple(active.get("broker_universe") or ()), str((active.get("context") or {}).get("phase") or "UNAVAILABLE"))
+        await reply.reply_text(self._format_objective_preview(preview, heading=f"🎯 **ACTIVE OBJECTIVE v{active.get('version')}**") + ("\n\n⏸ Objective-driven research context is paused." if active.get("is_paused") else ""), parse_mode="Markdown")
+
     @admin_only
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show the monitoring dashboard."""
@@ -204,6 +340,7 @@ class BotHandlers:
             "`/demo_session [id]` — reset-separated DEMO session report\n"
             "`/demo_auto_resume on|off` — optional verified-reset auto-resume\n"
             "`/backtest <symbol> <tf> <days>` — causal policy backtest with TP/SL replay evidence\n"
+            "`/objective [set|confirm|cancel|history|explain|pause]` — confirmed user-intent console; never direct execution\n"
             "`/activity [detailed|essential|off]` — chart-study notification mode\n"
             "`/settings` — autonomy, alerts, and explicit DEMO/LIVE controls\n"
             "`/emergency` — pause new execution and optionally close positions\n\n"
@@ -2159,5 +2296,6 @@ class BotHandlers:
         app.add_handler(CommandHandler("activity", self.cmd_activity))
         app.add_handler(CommandHandler("emergency", self.cmd_emergency))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))
+        app.add_handler(CommandHandler("objective", self.cmd_objective))
         app.add_handler(CallbackQueryHandler(self.handle_callback))
         self.app = app

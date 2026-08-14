@@ -191,6 +191,24 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS trading_objectives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_mode TEXT NOT NULL,
+                version INTEGER,
+                status TEXT NOT NULL,
+                raw_instruction TEXT NOT NULL,
+                objective_json TEXT NOT NULL,
+                account_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                broker_universe_json TEXT NOT NULL DEFAULT '[]',
+                context_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                superseded_at TEXT,
+                cancelled_at TEXT,
+                is_paused INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS demo_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 broker_login TEXT NOT NULL,
@@ -370,6 +388,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_setups_mode_status ON setup_records(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_trade ON execution_events(trade_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_model_versions_mode_role ON model_versions(account_mode, role, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_objectives_mode_status ON trading_objectives(account_mode, status, id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hypotheses_mode_status ON research_hypotheses(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_experiments_mode_status ON policy_experiments(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_demo_sessions_login_status ON demo_sessions(broker_login, status)")
@@ -1181,6 +1200,141 @@ async def get_management_learning_summary(
         observation_from_broker_trade(row, row.get("management_actions") or []) for row in rows
     ]
     return summarize_management(observations)
+
+
+async def create_objective_draft(
+    *, account_mode: str, raw_instruction: str, objective: dict, account_snapshot: dict,
+    broker_universe: list[str], context: dict, db_path: str = DB_PATH,
+) -> dict:
+    """Persist one non-active objective draft; it has no execution authority."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(
+            "UPDATE trading_objectives SET status = 'cancelled', cancelled_at = ? WHERE account_mode = ? AND status = 'draft'",
+            (now, account_mode),
+        )
+        cursor = await conn.execute(
+            """INSERT INTO trading_objectives
+               (account_mode, status, raw_instruction, objective_json, account_snapshot_json,
+                broker_universe_json, context_json, created_at)
+               VALUES (?, 'draft', ?, ?, ?, ?, ?, ?)""",
+            (
+                account_mode, raw_instruction, json.dumps(objective, sort_keys=True),
+                json.dumps(account_snapshot, sort_keys=True), json.dumps(broker_universe, sort_keys=True),
+                json.dumps(context, sort_keys=True), now,
+            ),
+        )
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM trading_objectives WHERE id = ?", (cursor.lastrowid,))
+        return await _objective_row(await cursor.fetchone())
+
+
+async def _objective_row(row) -> Optional[dict]:
+    if row is None:
+        return None
+    result = dict(row)
+    for key, fallback in (("objective_json", {}), ("account_snapshot_json", {}), ("broker_universe_json", []), ("context_json", {})):
+        try:
+            result[key[:-5]] = json.loads(result.pop(key) or json.dumps(fallback))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result[key[:-5]] = fallback
+    result["is_paused"] = bool(result.get("is_paused"))
+    return result
+
+
+async def get_objective_draft(account_mode: str = "demo", db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM trading_objectives WHERE account_mode = ? AND status = 'draft' ORDER BY id DESC LIMIT 1",
+            (account_mode,),
+        )
+        return await _objective_row(await cursor.fetchone())
+
+
+async def get_active_objective(account_mode: str = "demo", db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM trading_objectives WHERE account_mode = ? AND status = 'active' ORDER BY version DESC, id DESC LIMIT 1",
+            (account_mode,),
+        )
+        return await _objective_row(await cursor.fetchone())
+
+
+async def confirm_objective_draft(
+    account_mode: str = "demo", *, objective: Optional[dict] = None,
+    account_snapshot: Optional[dict] = None, broker_universe: Optional[list[str]] = None,
+    context: Optional[dict] = None, db_path: str = DB_PATH,
+) -> Optional[dict]:
+    """Activate the latest stored draft and preserve any prior objective as history."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM trading_objectives WHERE account_mode = ? AND status = 'draft' ORDER BY id DESC LIMIT 1",
+            (account_mode,),
+        )
+        draft = await cursor.fetchone()
+        if draft is None:
+            return None
+        cursor = await conn.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM trading_objectives WHERE account_mode = ?", (account_mode,)
+        )
+        version = int((await cursor.fetchone())[0] or 0) + 1
+        await conn.execute(
+            "UPDATE trading_objectives SET status = 'superseded', superseded_at = ? WHERE account_mode = ? AND status = 'active'",
+            (now, account_mode),
+        )
+        await conn.execute(
+            """UPDATE trading_objectives
+               SET status = 'active', version = ?, confirmed_at = ?, is_paused = 0,
+                   objective_json = ?, account_snapshot_json = ?, broker_universe_json = ?, context_json = ?
+               WHERE id = ?""",
+            (
+                version, now,
+                json.dumps(objective if objective is not None else json.loads(draft["objective_json"] or "{}"), sort_keys=True),
+                json.dumps(account_snapshot if account_snapshot is not None else json.loads(draft["account_snapshot_json"] or "{}"), sort_keys=True),
+                json.dumps(broker_universe if broker_universe is not None else json.loads(draft["broker_universe_json"] or "[]"), sort_keys=True),
+                json.dumps(context if context is not None else json.loads(draft["context_json"] or "{}"), sort_keys=True),
+                int(draft["id"]),
+            ),
+        )
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM trading_objectives WHERE id = ?", (int(draft["id"]),))
+        return await _objective_row(await cursor.fetchone())
+
+
+async def cancel_objective_draft(account_mode: str = "demo", db_path: str = DB_PATH) -> bool:
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            "UPDATE trading_objectives SET status = 'cancelled', cancelled_at = ? WHERE account_mode = ? AND status = 'draft'",
+            (now, account_mode),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+async def set_objective_paused(account_mode: str = "demo", paused: bool = True, db_path: str = DB_PATH) -> bool:
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            "UPDATE trading_objectives SET is_paused = ? WHERE account_mode = ? AND status = 'active'",
+            (1 if paused else 0, account_mode),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+async def list_objective_history(account_mode: str = "demo", limit: int = 10, db_path: str = DB_PATH) -> list[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM trading_objectives WHERE account_mode = ? AND status != 'draft' ORDER BY id DESC LIMIT ?",
+            (account_mode, max(1, int(limit))),
+        )
+        return [row for item in await cursor.fetchall() if (row := await _objective_row(item)) is not None]
 
 
 async def get_performance_summary(account_mode: str, days: Optional[int] = None, db_path: str = DB_PATH) -> dict:
