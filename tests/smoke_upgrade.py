@@ -869,7 +869,10 @@ async def test_admin_command_error_reply() -> None:
         raise RuntimeError("fixture failure")
 
     update = UpdateFixture()
-    with patch("bot.handlers.is_admin", return_value=True):
+    # The failure is intentional test data. Suppress its production logger
+    # output so VPS smoke validation remains readable while still asserting the
+    # user-facing recovery message.
+    with patch("bot.handlers.is_admin", return_value=True), patch("bot.handlers.logger.exception"):
         await _broken_command(object(), update, SimpleNamespace())
     assert_true(update.message.messages and "COMMAND ERROR" in update.message.messages[0] and "RuntimeError" in update.message.messages[0], "admin command exceptions still failed silently in Telegram")
 
