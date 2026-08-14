@@ -873,6 +873,26 @@ async def test_objective_console_safety() -> None:
         assert_true(await db.set_objective_paused("demo", True, db_path=path), "active objective context did not accept a pause request")
         paused = await db.get_active_objective("demo", db_path=path)
         assert_true(paused and paused["is_paused"], "objective pause state was not persisted")
+        session_id = await db.create_demo_session(broker_login="fixture", start_balance=50.0, start_equity=50.0, db_path=path)
+        terminal = await db.mark_active_objective_terminal(
+            account_mode="demo", outcome="target_reached", terminal_state="OBJECTIVE_TARGET_REACHED",
+            demo_session_id=session_id, terminal_equity=100.0, reason="fixture target reached", db_path=path,
+        )
+        assert_true(terminal and terminal["is_paused"], "terminal objective did not remain paused")
+        assert_true((terminal.get("context") or {}).get("operational", {}).get("terminal", {}).get("outcome") == "target_reached", "terminal objective outcome was not persisted")
+        assert_true(not await db.set_objective_paused("demo", False, db_path=path), "terminal objective could be resumed without a new confirmation")
+        claimed = await db.claim_objective_session_review(
+            demo_session_id=session_id, objective_id=terminal["id"], outcome="target_reached",
+            terminal_state="OBJECTIVE_TARGET_REACHED", summary={"strategy_trades": 2}, db_path=path,
+        )
+        assert_true(claimed, "first terminal session review was not claimed")
+        assert_true(not await db.claim_objective_session_review(
+            demo_session_id=session_id, objective_id=terminal["id"], outcome="target_reached",
+            terminal_state="OBJECTIVE_TARGET_REACHED", db_path=path,
+        ), "terminal session review was not idempotent")
+        await db.complete_objective_session_review(session_id, summary={"strategy_trades": 2}, optimization={"decision": "recorded"}, db_path=path)
+        review = await db.get_objective_session_review(session_id, db_path=path)
+        assert_true(review and review["optimization"].get("decision") == "recorded", "terminal session review did not retain its evidence result")
 
     # The scheduler must honor a confirmed explicit objective instead of the
     # normal evidence-governed top-ten cohort. This fixture has no MT5/executor.

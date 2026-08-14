@@ -104,6 +104,9 @@ class MarketScheduler:
         # One full scan can be lengthy across a broker-verified universe. All
         # triggers share this guard, preventing duplicate analysis or execution.
         self._scan_lock = asyncio.Lock()
+        # Management can be triggered by scans, a scheduled protection pass, or
+        # a manual review. One guard prevents competing MT5 modifications.
+        self._position_management_lock = asyncio.Lock()
 
     def _set_analysis_eligible_symbols(self, audit: Optional[dict]) -> tuple[str, ...]:
         audit = audit or {}
@@ -240,6 +243,9 @@ class MarketScheduler:
     async def _capital_reduction_job(self):
         return await self._run_scheduled_task("capital_reduction", "15 seconds", self.run_capital_reduction)
 
+    async def _position_management_job(self):
+        return await self._run_scheduled_task("position_management", "15 seconds", self.manage_open_positions)
+
     async def _heartbeat_job(self):
         return await self._run_scheduled_task("activity_heartbeat", "10 minutes", self.send_activity_heartbeat)
 
@@ -313,6 +319,12 @@ class MarketScheduler:
             replace_existing=True,
         )
         self.scheduler.add_job(
+            self._position_management_job,
+            IntervalTrigger(seconds=15),
+            id="position_management",
+            replace_existing=True,
+        )
+        self.scheduler.add_job(
             self._heartbeat_job,
             IntervalTrigger(minutes=10),
             id="activity_heartbeat",
@@ -363,6 +375,7 @@ class MarketScheduler:
         self.capital_state_service.executor = self.executor
         capital = await self.capital_state_service.evaluate()
         self.last_capital_state = capital
+        await self._finalize_objective_session_if_terminal(capital)
         audit = capital.get("broker_metadata") or {}
         self._set_analysis_eligible_symbols(audit)
         logger.info("[ACCOUNT VALIDATOR] Received targets: %s | Usable: %s | Invalid: %s | State: %s", audit.get("target_count", 0), audit.get("usable_count", 0), audit.get("invalid_count", 0), capital.get("state"))
@@ -1691,23 +1704,24 @@ class MarketScheduler:
         self.capital_state_service.executor = self.executor
         capital = await self.capital_state_service.evaluate()
         self.last_capital_state = capital
+        await self._finalize_objective_session_if_terminal(capital)
         self._set_analysis_eligible_symbols(capital.get("broker_metadata") or {})
         if capital.get("changed"):
             await self._notify_capital_state(capital)
+        # ─── ACTIVE TRADE MANAGEMENT ──────────────────────
+        # Protection never depends on new-exposure readiness, auto-trade, or a
+        # paused/terminal objective. It continues from fresh broker positions.
+        try:
+            await self.manage_open_positions()
+        except Exception as e:
+            logger.error(f"Error managing positions: {e}")
+
         if capital.get("state") in AccountCapitalState.BLOCKING:
             if not self.settings.is_paused:
                 self.settings.is_paused = True
                 await db.save_settings(self.settings)
             logger.warning("Scan halted by authoritative account state: %s (%s)", capital.get("state"), capital.get("reason"))
             return
-
-        # ─── ACTIVE TRADE MANAGEMENT ──────────────────────
-        # We manage positions even if auto_trade is OFF (to protect existing trades)
-        if not self.settings.is_paused:
-            try:
-                await self.manage_open_positions()
-            except Exception as e:
-                logger.error(f"Error managing positions: {e}")
 
         capital_session = await db.get_active_capital_reduction_session("demo")
         if capital_session:
@@ -1771,6 +1785,83 @@ class MarketScheduler:
             except Exception as e:
                 self.telemetry.record_error(f"symbol {symbol}: {type(e).__name__}: {e}")
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
+
+    async def _finalize_objective_session_if_terminal(self, capital: dict) -> Optional[dict]:
+        """Run exactly one evidence review after broker-confirmed DEMO success or failure.
+
+        A terminal session pauses only new objective-scoped exposure. Open trades
+        remain under the independent protection manager. Any policy change still
+        has to pass the existing chronological and forward-DEMO governance path.
+        """
+        if self.settings.trading_mode != "demo":
+            return None
+        session_id = capital.get("demo_session_id")
+        account = dict(capital.get("account") or {})
+        active = await db.get_active_objective("demo")
+        if not active or not session_id or account.get("equity") is None:
+            return None
+        operational = dict((active.get("context") or {}).get("operational") or {})
+        if operational.get("terminal"):
+            return None
+        try:
+            equity = float(account.get("equity"))
+            target = operational.get("target_capital")
+            target = float(target) if target is not None else None
+        except (TypeError, ValueError):
+            return None
+
+        state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
+        if target is not None and target > 0 and equity >= target:
+            outcome = "target_reached"
+            terminal_state = "OBJECTIVE_TARGET_REACHED"
+            reason = f"Fresh broker equity {equity:.2f} reached confirmed objective target {target:.2f}"
+            await db.close_demo_session(
+                int(session_id), status="objective_target_reached",
+                balance=float(account.get("balance") or equity), equity=equity,
+                exhaustion_reason=reason,
+            )
+        elif state == AccountCapitalState.CAPITAL_EXHAUSTED:
+            outcome = "objective_failed"
+            terminal_state = AccountCapitalState.CAPITAL_EXHAUSTED
+            reason = str(capital.get("reason") or "Broker-authoritative capital exhaustion")
+        else:
+            return None
+
+        terminal = await db.mark_active_objective_terminal(
+            account_mode="demo", outcome=outcome, terminal_state=terminal_state,
+            demo_session_id=int(session_id), terminal_equity=equity, reason=reason,
+        )
+        if terminal is None:
+            return None
+        self.settings.is_paused = True
+        await db.save_settings(self.settings)
+
+        session = await db.get_demo_session_report(int(session_id)) or {}
+        symbol_summary = await db.get_demo_session_symbol_summary(int(session_id))
+        management = await db.get_management_learning_summary(account_mode="demo", days=self.settings.market_ranking_lookback_days)
+        summary = {
+            "session": session, "symbol_summary": symbol_summary,
+            "management": management, "reason": reason,
+        }
+        claimed = await db.claim_objective_session_review(
+            demo_session_id=int(session_id), objective_id=terminal.get("id"), outcome=outcome,
+            terminal_state=terminal_state, summary=summary,
+        )
+        if not claimed:
+            return {"outcome": outcome, "review": "already_recorded", "demo_session_id": int(session_id)}
+
+        optimization = await self.run_self_optimization()
+        await db.complete_objective_session_review(int(session_id), summary=summary, optimization=optimization)
+        await self._notify(
+            "🧠 **OBJECTIVE SESSION REVIEW COMPLETED**\n"
+            f"Outcome: `{outcome.upper()}` | Session: `#{session_id}`\n"
+            f"Terminal equity: `${equity:.2f}` | Closed strategy trades: `{session.get('strategy_trades', 0)}`\n"
+            f"Expectancy: `{session.get('expectancy_r') if session.get('expectancy_r') is not None else 'N/A'}` R | "
+            f"Management observations: `{management.get('sample_size', 0)}`\n"
+            f"Research decision: `{optimization.get('decision', 'recorded')}`\n"
+            "The objective is terminal and new exposure is paused. Existing positions remain under broker-confirmed protection; a new objective must be confirmed for another research cycle."
+        )
+        return {"outcome": outcome, "review": "completed", "demo_session_id": int(session_id), "optimization": optimization}
 
     async def run_self_optimization(self):
         """Run one daily, evidence-based champion/challenger governance cycle.
@@ -1936,14 +2027,19 @@ class MarketScheduler:
 
     async def manage_open_positions(self):
         """Instrument real position-management checks and broker outcomes."""
-        self.telemetry.component_started("position_manager")
-        try:
-            result = await self._manage_open_positions()
-        except Exception as exc:
-            self.telemetry.component_failed("position_manager", exc)
-            raise
-        self.telemetry.component_succeeded("position_manager", waiting=bool(result == 0))
-        return result
+        if self._position_management_lock.locked():
+            self.telemetry.increment("position_management_skipped_overlap")
+            logger.debug("Position-management pass skipped because another broker-safe pass is active")
+            return 0
+        async with self._position_management_lock:
+            self.telemetry.component_started("position_manager")
+            try:
+                result = await self._manage_open_positions()
+            except Exception as exc:
+                self.telemetry.component_failed("position_manager", exc)
+                raise
+            self.telemetry.component_succeeded("position_manager", waiting=bool(result == 0))
+            return result
 
     async def _manage_open_positions(self):
         """Manage each open trade from fresh closed-candle structure and basket state."""

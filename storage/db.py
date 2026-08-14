@@ -235,6 +235,20 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS objective_session_reviews (
+                demo_session_id INTEGER PRIMARY KEY,
+                objective_id INTEGER,
+                outcome TEXT NOT NULL,
+                terminal_state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                optimization_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(demo_session_id) REFERENCES demo_sessions(id),
+                FOREIGN KEY(objective_id) REFERENCES trading_objectives(id)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS account_state (
                 account_mode TEXT PRIMARY KEY,
                 broker_login TEXT,
@@ -1318,13 +1332,58 @@ async def cancel_objective_draft(account_mode: str = "demo", db_path: str = DB_P
 
 
 async def set_objective_paused(account_mode: str = "demo", paused: bool = True, db_path: str = DB_PATH) -> bool:
+    active = await get_active_objective(account_mode, db_path)
+    if not active:
+        return False
+    operational = dict((active.get("context") or {}).get("operational") or {})
+    # A terminal objective must be superseded by a newly confirmed objective;
+    # /resume may not silently restart it after success or failure.
+    if not paused and operational.get("terminal"):
+        return False
     async with aiosqlite.connect(db_path) as conn:
         cursor = await conn.execute(
-            "UPDATE trading_objectives SET is_paused = ? WHERE account_mode = ? AND status = 'active'",
-            (1 if paused else 0, account_mode),
+            "UPDATE trading_objectives SET is_paused = ? WHERE id = ? AND status = 'active'",
+            (1 if paused else 0, int(active["id"])),
         )
         await conn.commit()
         return cursor.rowcount > 0
+
+
+async def mark_active_objective_terminal(
+    *, account_mode: str, outcome: str, terminal_state: str, demo_session_id: int,
+    terminal_equity: float, reason: str, db_path: str = DB_PATH,
+) -> Optional[dict]:
+    """Pause the active objective at a broker-confirmed terminal outcome.
+
+    The terminal marker keeps the completed objective visible in the console but
+    prevents /objective resume from restarting it. A new explicit objective must
+    be drafted and confirmed for a new objective session.
+    """
+    active = await get_active_objective(account_mode, db_path)
+    if not active:
+        return None
+    context = dict(active.get("context") or {})
+    operational = dict(context.get("operational") or {})
+    terminal = dict(operational.get("terminal") or {})
+    if terminal.get("demo_session_id") == int(demo_session_id):
+        return active
+    terminal = {
+        "outcome": str(outcome), "state": str(terminal_state),
+        "demo_session_id": int(demo_session_id), "equity": float(terminal_equity),
+        "reason": str(reason), "recorded_at": datetime.utcnow().isoformat(),
+    }
+    operational["terminal"] = terminal
+    operational["status"] = "TERMINAL"
+    context["operational"] = operational
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(
+            "UPDATE trading_objectives SET is_paused = 1, context_json = ? WHERE id = ? AND status = 'active'",
+            (json.dumps(context, sort_keys=True), int(active["id"])),
+        )
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM trading_objectives WHERE id = ?", (int(active["id"]),))
+        return await _objective_row(await cursor.fetchone())
 
 
 async def list_objective_history(account_mode: str = "demo", limit: int = 10, db_path: str = DB_PATH) -> list[dict]:
@@ -2009,6 +2068,53 @@ async def close_demo_session(
             (status, datetime.utcnow().isoformat(), float(balance), float(equity), exhaustion_reason, reset_detected_at, int(session_id)),
         )
         await conn.commit()
+
+
+async def claim_objective_session_review(
+    *, demo_session_id: int, objective_id: Optional[int], outcome: str, terminal_state: str,
+    summary: Optional[dict] = None, db_path: str = DB_PATH,
+) -> bool:
+    """Claim the one permitted post-session review for a terminal DEMO session."""
+    async with aiosqlite.connect(db_path) as conn:
+        cursor = await conn.execute(
+            """INSERT OR IGNORE INTO objective_session_reviews
+               (demo_session_id, objective_id, outcome, terminal_state, created_at, summary_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (int(demo_session_id), objective_id, str(outcome), str(terminal_state),
+             datetime.utcnow().isoformat(), json.dumps(summary or {}, sort_keys=True)),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+async def complete_objective_session_review(
+    demo_session_id: int, *, summary: Optional[dict] = None, optimization: Optional[dict] = None,
+    db_path: str = DB_PATH,
+) -> None:
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """UPDATE objective_session_reviews
+               SET completed_at = ?, summary_json = ?, optimization_json = ?
+               WHERE demo_session_id = ?""",
+            (datetime.utcnow().isoformat(), json.dumps(summary or {}, sort_keys=True),
+             json.dumps(optimization or {}, sort_keys=True), int(demo_session_id)),
+        )
+        await conn.commit()
+
+
+async def get_objective_session_review(demo_session_id: int, db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM objective_session_reviews WHERE demo_session_id = ?", (int(demo_session_id),)
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["summary"] = json.loads(result.pop("summary_json") or "{}")
+    result["optimization"] = json.loads(result.pop("optimization_json") or "{}")
+    return result
 
 
 async def record_account_state_event(

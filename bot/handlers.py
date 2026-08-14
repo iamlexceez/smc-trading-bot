@@ -302,6 +302,9 @@ class BotHandlers:
             # scheduler; the parser never owns MT5 submission itself.
             if mode == "demo":
                 self.settings.auto_trade = True
+                # A newly confirmed, broker-valid objective is the only path
+                # that may reopen new exposure after an earlier terminal cycle.
+                self.settings.is_paused = False
                 # This is the existing optimizer switch; it remains background
                 # work and is never an execution prerequisite.
                 self.settings.self_optimization_enabled = bool(objective.adaptive_learning)
@@ -320,6 +323,13 @@ class BotHandlers:
             await reply.reply_text(active_text, parse_mode="Markdown")
             return
         if action == "resume":
+            active = await db.get_active_objective(mode)
+            terminal = dict(((active or {}).get("context") or {}).get("operational") or {}).get("terminal")
+            if terminal:
+                await reply.reply_text(
+                    "This objective is terminal and cannot be resumed. Its completed DEMO-session review is retained; create and confirm a new objective for the next research cycle."
+                )
+                return
             changed = await db.set_objective_paused(mode, False)
             if changed and self.scheduler and self.settings.auto_trade and not self.settings.is_paused:
                 self.scheduler._start_background_task("objective_resume_scan", self.scheduler.activate_and_scan_now())
@@ -368,8 +378,16 @@ class BotHandlers:
         operational = (active.get("context") or {}).get("operational") or {}
         display_phase = phase_for_equity(operational.get("starting_capital") or objective.starting_capital, display_account.get("equity"))
         preview = ObjectivePreview(objective, validation, display_account, current_usable or tuple(active.get("broker_universe") or ()), display_phase, tuple((active.get("context") or {}).get("resolved_symbols") or ()))
+        terminal = dict(operational.get("terminal") or {})
         readiness, readiness_detail = objective_operational_readiness(display_account, current_state, is_paused=bool(active.get("is_paused") or self.settings.is_paused))
-        if readiness == "READY":
+        if terminal:
+            readiness_text = (
+                f"🏁 **OBJECTIVE SESSION TERMINAL — {str(terminal.get('outcome') or 'recorded').upper()}**\n"
+                f"Session: `#{terminal.get('demo_session_id', 'N/A')}` | Terminal equity: `${float(terminal.get('equity') or 0.0):.2f}`\n"
+                f"Reason: {terminal.get('reason') or 'Broker-confirmed terminal outcome'}\n"
+                "A one-time evidence review has been recorded. New exposure stays paused, while existing positions continue receiving broker-confirmed protection. Confirm a new objective to begin another DEMO research cycle."
+            )
+        elif readiness == "READY":
             readiness_text = "🟢 **FULL AUTO DEMO READY**\nScanner and automatic execution use this objective's operational universe, subject to the existing final execution gates."
         else:
             readiness_text = f"⛔ **FULL AUTO DEMO STANDBY — {readiness}**\n{readiness_detail}\nNo new objective-scoped order will be opened."
