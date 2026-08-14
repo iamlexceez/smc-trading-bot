@@ -450,7 +450,9 @@ class BotHandlers:
         preview = ObjectivePreview(objective, validation, display_account, current_usable or tuple(active.get("broker_universe") or ()), display_phase, tuple((active.get("context") or {}).get("resolved_symbols") or ()))
         terminal = dict(operational.get("terminal") or {})
         readiness, readiness_detail = objective_operational_readiness(display_account, current_state, is_paused=bool(active.get("is_paused") or self.settings.is_paused))
+        heading = f"✅ **OBJECTIVE v{active.get('version')} ACTIVE**"
         if terminal:
+            heading = f"🏁 **OBJECTIVE v{active.get('version')} TERMINAL**"
             readiness_text = (
                 f"🏁 **OBJECTIVE SESSION TERMINAL — {str(terminal.get('outcome') or 'recorded').upper()}**\n"
                 f"Session: `#{terminal.get('demo_session_id', 'N/A')}` | Terminal equity: `${float(terminal.get('equity') or 0.0):.2f}`\n"
@@ -461,7 +463,7 @@ class BotHandlers:
             readiness_text = "🟢 **FULL AUTO DEMO READY**\nScanner and automatic execution use this objective's operational universe, subject to the existing final execution gates."
         else:
             readiness_text = f"⛔ **FULL AUTO DEMO STANDBY — {readiness}**\n{readiness_detail}\nNo new objective-scoped order will be opened."
-        await self._reply_objective(reply, self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active.get('version')} ACTIVE**") + "\n\n" + readiness_text)
+        await self._reply_objective(reply, self._format_objective_preview(preview, heading=heading) + "\n\n" + readiness_text)
 
     @admin_only
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
