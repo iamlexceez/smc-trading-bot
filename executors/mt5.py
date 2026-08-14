@@ -420,6 +420,26 @@ class MT5Executor(BaseExecutor):
         return result
 
     @staticmethod
+    def _order_check_succeeded(check, done_retcode: int | None = None) -> bool:
+        """Recognize MT5's successful order-check variants without accepting errors.
+
+        Some broker terminals return the normal execution ``DONE`` retcode while
+        others return ``0`` with the explicit successful comment ``Done`` for a
+        non-submitting preflight check. A zero code with any other comment is not
+        treated as success.
+        """
+        if check is None:
+            return False
+        try:
+            code = int(getattr(check, "retcode", -1))
+        except (TypeError, ValueError):
+            return False
+        if done_retcode is not None and code == int(done_retcode):
+            return True
+        comment = str(getattr(check, "comment", "") or "").strip().lower()
+        return code == 0 and comment in {"done", "success", "ok"}
+
+    @staticmethod
     def _round_to_tick(value: float, tick_size: float, digits: int, *, upward: bool) -> float:
         """Round away from the current market price onto a broker price increment."""
         value_d = Decimal(str(value))
@@ -734,7 +754,7 @@ class MT5Executor(BaseExecutor):
         check = mt5.order_check(request)
         if check is None:
             return ExecutionResult(success=False, message=f"Pre-submit MT5 order_check returned None: {mt5.last_error()}", entry_price=float(price or 0.0), sl=sl, tp=tp, lot_size=float(lot_size))
-        if check.retcode != mt5.TRADE_RETCODE_DONE:
+        if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
             return ExecutionResult(success=False, message=f"Pre-submit MT5 order_check failed: retcode={check.retcode}, comment={check.comment}", entry_price=float(price or 0.0), sl=sl, tp=tp, lot_size=float(lot_size))
 
         result = mt5.order_send(request)
@@ -756,7 +776,7 @@ class MT5Executor(BaseExecutor):
                 if retry.get("valid"):
                     request.update({"price": float(retry["entry_price"]), "sl": float(retry["sl"]), "tp": float(retry["tp"])})
                     retry_check = mt5.order_check(request)
-                    if retry_check is not None and retry_check.retcode == mt5.TRADE_RETCODE_DONE:
+                    if self._order_check_succeeded(retry_check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
                         result = mt5.order_send(request)
                         sl, tp, price = float(retry["sl"]), float(retry["tp"]), float(retry["entry_price"])
 
@@ -933,7 +953,7 @@ class MT5Executor(BaseExecutor):
         }
 
         check = mt5.order_check(request)
-        if check is None or check.retcode != mt5.TRADE_RETCODE_DONE:
+        if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
             logger.error("modify_position pre-submit MT5 order_check failed for #%s: %s", ticket, mt5.last_error() if check is None else check.comment)
             return False
         result = mt5.order_send(request)

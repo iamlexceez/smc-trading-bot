@@ -70,6 +70,9 @@ def test_broker_stop_normalization() -> None:
         point=0.01, tick_size=0.01, digits=2, stops_level=10, freeze_level=0,
     )
     assert_true(not invalid["valid"] and "positive" in invalid["reason"], "missing SL/TP did not fail before order submission")
+    assert_true(MT5Executor._order_check_succeeded(SimpleNamespace(retcode=0, comment="Done"), 10009), "MT5 order_check retcode 0/comment Done was not treated as successful preflight")
+    assert_true(MT5Executor._order_check_succeeded(SimpleNamespace(retcode=10009, comment=""), 10009), "standard MT5 DONE order-check response was not accepted")
+    assert_true(not MT5Executor._order_check_succeeded(SimpleNamespace(retcode=0, comment="Invalid stops"), 10009), "non-success zero order-check response was incorrectly accepted")
 
 
 def test_runtime_telemetry() -> None:
