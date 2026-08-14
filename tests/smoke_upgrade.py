@@ -944,7 +944,8 @@ async def test_same_day_governance_deferral() -> None:
     engine = object.__new__(scheduler.MarketScheduler)
     engine.settings = TradeSettings.defaults()
     engine.settings.trading_mode = "demo"
-    engine.settings.last_optimization_date = __import__("datetime").date.today().isoformat()
+    datetime_module = __import__("datetime")
+    engine.settings.last_optimization_date = datetime_module.datetime.now(datetime_module.UTC).date().isoformat()
     engine.telemetry = RuntimeTelemetry()
     result = await engine.run_self_optimization()
     assert_true(result["decision"] == "deferred_daily_governance", "same-day governance was not deferred")
