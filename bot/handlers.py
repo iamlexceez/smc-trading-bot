@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     CommandHandler, CallbackQueryHandler, MessageHandler,
     ContextTypes, filters, Application,
@@ -237,6 +238,24 @@ class BotHandlers:
         }
 
     @staticmethod
+    def _objective_plain_text(text: str) -> str:
+        """Remove Markdown control characters for a Telegram-safe fallback."""
+        return str(text).replace("**", "").replace("`", "").replace("_", "")
+
+    @classmethod
+    async def _reply_objective(cls, reply, text: str) -> None:
+        """Reply with Objective Console Markdown, falling back to plain text.
+
+        Broker status and persisted terminal reasons are dynamic. A malformed
+        Markdown entity must never make the command appear non-responsive.
+        """
+        try:
+            await reply.reply_text(text, parse_mode="Markdown")
+        except BadRequest:
+            logger.warning("Objective Console Markdown rejected by Telegram; sending plain-text fallback")
+            await reply.reply_text(cls._objective_plain_text(text))
+
+    @staticmethod
     def _format_objective_preview(preview: ObjectivePreview, *, heading: str = "🎯 **OBJECTIVE DRAFT**") -> str:
         objective = preview.objective
         validation = preview.validation
@@ -293,7 +312,7 @@ class BotHandlers:
                 account_mode=mode, raw_instruction=instruction, objective=objective.to_dict(), account_snapshot={**account, "state": state},
                 broker_universe=list(usable), context={**preview.to_dict(), "operational": operational},
             )
-            await reply.reply_text(self._format_objective_preview(preview) + "\n\nUse `/objective confirm` to apply this valid draft or `/objective cancel` to discard it.", parse_mode="Markdown")
+            await self._reply_objective(reply, self._format_objective_preview(preview) + "\n\nUse `/objective confirm` to apply this valid draft or `/objective cancel` to discard it.")
             return
         if action == "confirm":
             draft = await db.get_objective_draft(mode)
@@ -310,7 +329,7 @@ class BotHandlers:
             preview = ObjectivePreview(objective, validation, {**account, "state": state}, usable, phase, resolution)
             operational = self._operational_objective_config(objective, resolved_symbols=resolved, broker_usable_symbols=usable, account=account, phase=phase)
             if not validation.valid:
-                await reply.reply_text(self._format_objective_preview(preview) + "\n\n❌ Objective was not activated.", parse_mode="Markdown")
+                await self._reply_objective(reply, self._format_objective_preview(preview) + "\n\n❌ Objective was not activated.")
                 return
             # Phase boundaries measure progress. They never alter the user’s
             # final target, instrument allowlist, or policy variables.
@@ -371,7 +390,7 @@ class BotHandlers:
                 active_text += "\n\n🟢 **FULL AUTO DEMO READY**\nThe existing scanner is now evaluating only the resolved objective universe. Valid setups continue through existing SMC, sizing, broker, TP/SL, position-management, and MT5 execution gates. Learning runs in the background." + phase_text
             else:
                 active_text += f"\n\n⛔ **FULL AUTO DEMO STANDBY — {readiness}**\n{readiness_detail}\nNo new objective-scoped order will be opened until the existing broker-authoritative state becomes ready." + phase_text
-            await reply.reply_text(active_text, parse_mode="Markdown")
+            await self._reply_objective(reply, active_text)
             return
         if action == "resume":
             active = await db.get_active_objective(mode)
@@ -442,7 +461,7 @@ class BotHandlers:
             readiness_text = "🟢 **FULL AUTO DEMO READY**\nScanner and automatic execution use this objective's operational universe, subject to the existing final execution gates."
         else:
             readiness_text = f"⛔ **FULL AUTO DEMO STANDBY — {readiness}**\n{readiness_detail}\nNo new objective-scoped order will be opened."
-        await reply.reply_text(self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active.get('version')} ACTIVE**") + "\n\n" + readiness_text, parse_mode="Markdown")
+        await self._reply_objective(reply, self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active.get('version')} ACTIVE**") + "\n\n" + readiness_text)
 
     @admin_only
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

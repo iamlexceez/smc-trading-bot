@@ -46,6 +46,7 @@ from analysis.runtime_telemetry import RuntimeTelemetry
 from strategy.setup_validator import calculate_rr, rr_filter_passes
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
 from bot.handlers import BotHandlers, admin_only  # noqa: F401 — validates Telegram control imports.
+from telegram.error import BadRequest
 
 
 def assert_true(condition: bool, message: str) -> None:
@@ -877,6 +878,23 @@ async def test_admin_command_error_reply() -> None:
     assert_true(update.message.messages and "COMMAND ERROR" in update.message.messages[0] and "RuntimeError" in update.message.messages[0], "admin command exceptions still failed silently in Telegram")
 
 
+async def test_objective_markdown_fallback() -> None:
+    class Reply:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def reply_text(self, text: str, **kwargs) -> None:
+            self.calls.append((text, kwargs))
+            if len(self.calls) == 1:
+                raise BadRequest("Can't parse entities")
+
+    reply = Reply()
+    with patch("bot.handlers.logger.warning"):
+        await BotHandlers._reply_objective(reply, "**OBJECTIVE**\nState: CAPITAL_EXHAUSTED")
+    assert_true(len(reply.calls) == 2 and reply.calls[0][1].get("parse_mode") == "Markdown", "Objective Console did not attempt formatted rendering first")
+    assert_true(reply.calls[1][1].get("parse_mode") is None and "CAPITALEXHAUSTED" in reply.calls[1][0], "Objective Console did not send a plain-text fallback after Telegram rejected Markdown")
+
+
 async def test_objective_console_safety() -> None:
     interpreter = ObjectiveInterpreter()
     account = {"equity": 152.60, "free_margin": 152.60, "currency": "USD"}
@@ -1278,6 +1296,7 @@ def run() -> None:
     asyncio.run(test_broker_authoritative_capital_state())
     asyncio.run(test_sizing_rejection_diagnostic_persistence())
     asyncio.run(test_admin_command_error_reply())
+    asyncio.run(test_objective_markdown_fallback())
     asyncio.run(test_objective_console_safety())
     asyncio.run(test_objective_phase_lifecycle())
     asyncio.run(test_legacy_objective_phase_migration())
