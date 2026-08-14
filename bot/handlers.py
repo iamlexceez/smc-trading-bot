@@ -624,6 +624,10 @@ class BotHandlers:
             f"Learning engine: {status('learning_engine')}",
             f"Account reconciliation: {status('account_reconciliation')}",
             f"Capital management: {status('capital_management')}",
+            "", "LATEST SCANNER GATE",
+            f"State: `{scan_gate.get('state') or 'UNKNOWN'}` | Updated: `{scan_gate.get('updated_at') or 'never'}`",
+            f"Reason: {scan_gate.get('reason') or 'No completed scan disposition is available.'}",
+            f"Analysis symbols: `{int(scan_gate.get('analysis_symbols') or 0)}` | Broker-usable: `{scan_gate.get('broker_usable_symbols', 'UNKNOWN')}` | Objective/universe state: `{scan_gate.get('market_selection_state', 'UNKNOWN')}`",
             "", "SCHEDULED TASKS",
         ]
         for task in tasks:
@@ -631,6 +635,7 @@ class BotHandlers:
             if task.get("last_error"):
                 lines.append(f"  error: {task['last_error']}")
         ranking = list(getattr(self.scheduler, "last_opportunity_ranking", []) or [])
+        scan_gate = dict(getattr(self.scheduler, "last_scan_gate", {}) or {})
         top_opportunity = ranking[0] if ranking else {}
         top_details = dict(top_opportunity.get("details") or {})
         lines.extend([

@@ -87,6 +87,12 @@ class MarketScheduler:
         self.research_governance = ResearchGovernance(self.settings)
         self.last_research_governance: dict = {}
         self.last_opportunity_ranking: list[dict] = []
+        # Read-only latest scan disposition for Telegram diagnostics. It never
+        # changes policy, broker validation, or execution behaviour.
+        self.last_scan_gate: dict = {
+            "state": "NOT_SCANNED", "reason": "No scan has completed in this process.",
+            "updated_at": None, "analysis_symbols": 0,
+        }
         self.account_reconciliation = AccountReconciliationEngine(self.executor, self.settings.trading_mode)
         self.last_account_reconciliation: dict = {}
         self.capital_state_service = CapitalStateService(self.settings, self.executor)
@@ -116,6 +122,14 @@ class MarketScheduler:
         # one guard preserves exactly-once broker-confirmed transitions.
         self._objective_phase_lock = asyncio.Lock()
         self._last_protection_signature: tuple[str, int] | None = None
+
+    def _set_scan_gate(self, state: str, reason: str, **details) -> None:
+        """Retain the latest scan disposition for read-only diagnostics."""
+        self.last_scan_gate = {
+            "state": str(state), "reason": str(reason),
+            "updated_at": datetime.utcnow().isoformat(), **details,
+        }
+        logger.info("[SCAN GATE] state=%s reason=%s details=%s", state, reason, details)
 
     def _set_analysis_eligible_symbols(self, audit: Optional[dict]) -> tuple[str, ...]:
         audit = audit or {}
@@ -2034,6 +2048,7 @@ class MarketScheduler:
         self.capital_state_service.executor = self.executor
         capital = await self.capital_state_service.evaluate()
         self.last_capital_state = capital
+        self._set_scan_gate("ACCOUNT_EVALUATED", "Fresh broker account and universe evaluation completed.", account_state=str(capital.get("state") or "UNKNOWN"))
         await self._advance_objective_phase_if_due(capital)
         await self._finalize_objective_session_if_terminal(capital)
         self._set_analysis_eligible_symbols(capital.get("broker_metadata") or {})
@@ -2051,29 +2066,45 @@ class MarketScheduler:
             if not self.settings.is_paused:
                 self.settings.is_paused = True
                 await db.save_settings(self.settings)
-            logger.warning("Scan halted by authoritative account state: %s (%s)", capital.get("state"), capital.get("reason"))
+            reason = str(capital.get("reason") or "Authoritative broker account state blocks new exposure.")
+            self._set_scan_gate("ACCOUNT_BLOCKED", reason, account_state=str(capital.get("state") or "UNKNOWN"), analysis_symbols=0)
+            logger.warning("Scan halted by authoritative account state: %s (%s)", capital.get("state"), reason)
             return
 
         capital_session = await db.get_active_capital_reduction_session("demo")
         if capital_session:
-            logger.info("Capital reduction session #%s is %s — normal strategy scanning is suspended", capital_session["id"], capital_session["status"])
+            reason = f"Capital reduction session #{capital_session['id']} is {capital_session['status']}; normal strategy scanning is suspended."
+            self._set_scan_gate("CAPITAL_REDUCTION_ACTIVE", reason, analysis_symbols=0)
+            logger.info(reason)
             return
 
         if not self.settings.auto_trade or self.settings.is_paused:
-            logger.debug("Auto-trade disabled or paused — skipping scan")
+            reason = "Auto-trade is disabled." if not self.settings.auto_trade else "Bot-wide pause is active."
+            self._set_scan_gate("AUTOMATION_PAUSED", reason, auto_trade=bool(self.settings.auto_trade), is_paused=bool(self.settings.is_paused), analysis_symbols=0)
+            logger.debug("%s Skipping scan.", reason)
             return
             
         audit = capital.get("broker_metadata") or {}
         broker_usable_symbols = list(audit.get("usable_symbols") or [])
         if not broker_usable_symbols:
-            logger.warning("No broker-validated usable Deriv targets are active; skipping scan")
+            reason = "No broker-validated usable Synthetic Index or approved Gold target is active."
+            self._set_scan_gate("BROKER_UNIVERSE_EMPTY", reason, analysis_symbols=0)
+            logger.warning("%s Skipping scan.", reason)
             return
         research = await self.refresh_research_governance(broker_usable_symbols)
         scan_symbols = list(research["market_selection"].get("analysis_symbols") or research["market_selection"]["selected_symbols"])
         if not scan_symbols:
-            logger.warning("No broker-valid objective analysis symbols are available; skipping scan")
+            state = str(research["market_selection"].get("state") or "objective_universe_empty")
+            reason = f"Objective/broker universe produced no analysis symbols (state={state})."
+            self._set_scan_gate("OBJECTIVE_UNIVERSE_EMPTY", reason, market_selection_state=state, analysis_symbols=0)
+            logger.warning("%s Skipping scan.", reason)
             return
 
+        self._set_scan_gate(
+            "ANALYZING", "Scanning broker-validated objective symbols.", analysis_symbols=len(scan_symbols),
+            broker_usable_symbols=len(broker_usable_symbols),
+            market_selection_state=str(research["market_selection"].get("state") or "UNKNOWN"),
+        )
         logger.info(
             "[SCANNER TARGETS] universe=%s broker_usable=%s analysis=%s state=%s",
             audit.get("target_count", 0), audit.get("usable_count", 0), len(scan_symbols),
@@ -2114,7 +2145,9 @@ class MarketScheduler:
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
         if not candidates:
-            logger.info("[OPPORTUNITY RANKING] no thesis-qualified candidates across %s analyzed symbols", len(scan_symbols))
+            reason = f"All {len(scan_symbols)} objective-allowed broker-valid symbols were analyzed; no thesis-qualified candidate passed the current validation and policy path."
+            self._set_scan_gate("NO_THESIS_QUALIFIED_CANDIDATE", reason, analysis_symbols=len(scan_symbols))
+            logger.info("[OPPORTUNITY RANKING] %s", reason)
             return
         positions = await self.executor.get_open_positions() if self.executor else []
         open_symbols = [str(getattr(position, "symbol", "")) for position in positions]
@@ -2152,6 +2185,10 @@ class MarketScheduler:
         ]
         best = ranked[0]
         selected = by_symbol[best.symbol]
+        self._set_scan_gate(
+            "FINAL_EXECUTION_GATE", "Strongest current thesis is undergoing final broker, sizing, and portfolio validation.",
+            analysis_symbols=len(scan_symbols), candidates=len(candidates), selected_symbol=selected.symbol,
+        )
         logger.info("[OPPORTUNITY RANKING] candidates=%s selected=%s score=%.2f regime=%s", len(ranked), best.symbol, best.score, best.context.get("regime"))
         await self._chart_activity(
             "best_opportunity", selected.symbol,

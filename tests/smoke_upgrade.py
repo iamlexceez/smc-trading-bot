@@ -150,6 +150,16 @@ async def test_strategy_evidence_persistence() -> None:
         assert_true(lookup["confidence"] == "UNKNOWN" and lookup["average_mae_r"] == -0.3 and lookup["average_mfe_r"] == 1.6, "strategy evidence lost MAE/MFE or documented confidence")
 
 
+def test_scanner_gate_telemetry() -> None:
+    probe = object.__new__(scheduler.MarketScheduler)
+    probe.last_scan_gate = {}
+    scheduler.MarketScheduler._set_scan_gate(
+        probe, "BROKER_UNIVERSE_EMPTY", "No broker-valid symbols.", analysis_symbols=0,
+    )
+    assert_true(probe.last_scan_gate["state"] == "BROKER_UNIVERSE_EMPTY", "scanner gate did not retain the exact read-only gate state")
+    assert_true(probe.last_scan_gate["analysis_symbols"] == 0 and probe.last_scan_gate["updated_at"], "scanner gate did not retain diagnostic details and timestamp")
+
+
 def test_runtime_telemetry() -> None:
     telemetry = RuntimeTelemetry()
     telemetry.component_started("market_scanner")
@@ -1490,6 +1500,7 @@ async def test_strategy_transition_evidence_persistence() -> None:
 
 def run() -> None:
     test_broker_stop_normalization()
+    test_scanner_gate_telemetry()
     test_runtime_telemetry()
     test_opportunity_context_and_ranking()
     test_strategy_registry_and_selection()
