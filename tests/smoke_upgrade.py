@@ -34,7 +34,7 @@ from data.provider import DataProvider
 from analysis.optimizer import SelfOptimizer
 from analysis.research_governance import ResearchGovernance
 from analysis.adaptive_management import observation_from_broker_trade, observations_from_backtest, summarize_management
-from analysis.objectives import ObjectiveInterpreter, ObjectiveValidator, TradingObjective, phase_for_equity, resolve_requested_symbols
+from analysis.objectives import ObjectiveInterpreter, ObjectiveValidator, TradingObjective, phase_for_equity, objective_operational_readiness, resolve_requested_symbols
 from backtest.engine import BacktestEngine, BacktestResult, BacktestTrade
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 from analysis.account_monitor import summarize_history, exposure_summary
@@ -819,6 +819,12 @@ async def test_objective_console_safety() -> None:
     assert_true(validation.valid and not validation.errors, "valid DEMO objective was incorrectly blocked")
     assert_true(any("not a guaranteed" in warning for warning in validation.warnings), "large growth target was not labelled as non-guaranteed")
     assert_true(phase_for_equity(50.0, 152.60) == "GROWTH", "objective phase calculation is incorrect")
+    assert_true(objective_operational_readiness(account, "ACCOUNT_VERIFIED")[0] == "READY", "positive broker capital was not objective-ready")
+    exhausted_account = {"equity": 23.67, "free_margin": -10.34, "currency": "USD"}
+    exhausted_validation = ObjectiveValidator.validate(objective, account_snapshot=exhausted_account, account_state="CAPITAL_EXHAUSTED", broker_usable_symbols=usable)
+    assert_true(not exhausted_validation.valid and any("CAPITAL_EXHAUSTED" in error for error in exhausted_validation.errors), "capital-exhausted account still confirmed an objective")
+    assert_true(objective_operational_readiness(exhausted_account, "CAPITAL_EXHAUSTED")[0] == "BLOCKED_CAPITAL", "capital exhaustion was presented as scanner-ready")
+    assert_true(objective_operational_readiness({"equity": 50.0, "free_margin": -0.01}, "ACCOUNT_VERIFIED")[0] == "BLOCKED_MARGIN", "negative broker free margin was presented as scanner-ready")
 
     below_target = interpreter.parse("Start with $100 and aim for $50", account_mode="demo")
     below_validation = ObjectiveValidator.validate(below_target, account_snapshot=account, account_state="ACCOUNT_VERIFIED", broker_usable_symbols=usable)

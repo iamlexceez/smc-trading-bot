@@ -187,6 +187,27 @@ class ObjectiveInterpreter:
         )
 
 
+def objective_operational_readiness(account_snapshot: Optional[dict[str, Any]], account_state: str, *, is_paused: bool = False) -> tuple[str, str]:
+    """Classify whether an objective may truthfully be presented as ready for new exposure.
+
+    This is descriptive and confirmation-facing only. The scheduler and broker
+    retain their independent authoritative execution gates.
+    """
+    if is_paused:
+        return "PAUSED", "The objective is paused; new objective-scoped scanning is suspended."
+    state = str(account_state or "ACCOUNT_STATE_UNKNOWN")
+    if state in {"CAPITAL_EXHAUSTED", "AWAITING_RESUME"}:
+        return "BLOCKED_CAPITAL", f"Broker capital state is {state}; reset and broker-verified resume are required before new exposure."
+    account = dict(account_snapshot or {})
+    margin = account.get("free_margin")
+    try:
+        if margin is None or float(margin) <= 0:
+            return "BLOCKED_MARGIN", "Fresh broker free margin is non-positive; no new objective-scoped order can be opened."
+    except (TypeError, ValueError):
+        return "BLOCKED_MARGIN", "Fresh broker free margin is unavailable; no new objective-scoped order can be opened."
+    return "READY", "Fresh broker account state permits the existing scanner to evaluate new exposure, subject to all execution gates."
+
+
 def phase_for_equity(starting_capital: Optional[float], current_equity: Optional[float]) -> str:
     """Return a descriptive phase label only; it is not a sizing algorithm."""
     if starting_capital is None or starting_capital <= 0 or current_equity is None:
@@ -240,8 +261,11 @@ class ObjectiveValidator:
             errors.append("Broker-approved target universe is unavailable; objective confirmation is blocked.")
         if not account or account.get("equity") is None or account.get("free_margin") is None:
             errors.append("Fresh broker account state is unavailable; objective confirmation is blocked.")
-        if state in {"ACCOUNT_STATE_UNKNOWN", "TARGET_UNIVERSE_INITIALIZING", "TARGET_UNIVERSE_EMPTY", "TARGET_SYMBOLS_VALIDATING", "TARGET_SYMBOLS_INVALID"}:
+        if state in {"ACCOUNT_STATE_UNKNOWN", "TARGET_UNIVERSE_INITIALIZING", "TARGET_UNIVERSE_EMPTY", "TARGET_SYMBOLS_VALIDATING", "TARGET_SYMBOLS_INVALID", "CAPITAL_EXHAUSTED", "AWAITING_RESUME"}:
             errors.append(f"Current broker account state is {state}; objective confirmation is blocked.")
+        readiness, readiness_detail = objective_operational_readiness(account, state)
+        if readiness in {"BLOCKED_CAPITAL", "BLOCKED_MARGIN"} and readiness_detail not in errors:
+            errors.append(readiness_detail)
         resolution = tuple(resolved_symbols or ())
         unresolved = [str(row.get("requested") or "") for row in resolution if str(row.get("status") or "") != "BROKER_VERIFIED"]
         if unresolved:
@@ -261,5 +285,5 @@ class ObjectiveValidator:
 
 __all__ = [
     "ObjectiveInterpreter", "ObjectivePreview", "ObjectiveValidation", "ObjectiveValidator",
-    "TradingObjective", "phase_for_equity", "resolve_requested_symbols",
+    "TradingObjective", "phase_for_equity", "objective_operational_readiness", "resolve_requested_symbols",
 ]

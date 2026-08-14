@@ -39,7 +39,7 @@ from storage import db
 from analysis.scoring import format_signal_report
 from analysis.profiler import profiler
 from analysis.order_flow import order_flow
-from analysis.objectives import ObjectiveInterpreter, ObjectivePreview, ObjectiveValidation, ObjectiveValidator, TradingObjective, phase_for_equity, resolve_requested_symbols
+from analysis.objectives import ObjectiveInterpreter, ObjectivePreview, ObjectiveValidation, ObjectiveValidator, TradingObjective, phase_for_equity, objective_operational_readiness, resolve_requested_symbols
 from bot.account_views import LiveAccountViews
 from bot.capital_views import capital_actions_view, capital_test_view, demo_session_report_view
 from risk.manager import RiskManager
@@ -247,6 +247,8 @@ class BotHandlers:
             lines.extend(["", "**Warnings**", *[f"⚠️ {item}" for item in validation.warnings]])
         if validation.info:
             lines.extend(["", "**Information**", *[f"• {item}" for item in validation.info]])
+        if not objective.requested_symbols:
+            lines.extend(["", "⚠️ **Dynamic instrument scope** — no explicit instruments were named. The objective may use the current broker-verified Synthetic Indices / Gold universe. Create a new objective with `Trade only <instrument list>` to lock a strict allowlist."])
         lines.extend(["", "_This is an objective, not a guaranteed return. Existing broker and execution controls remain authoritative._"])
         return "\n".join(lines)
 
@@ -310,7 +312,11 @@ class BotHandlers:
                     if not self.settings.is_paused:
                         self.scheduler._start_background_task("objective_activation_scan", self.scheduler.activate_and_scan_now())
             active_text = self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active['version']} ACTIVE**")
-            active_text += "\n\n🟢 **FULL AUTO DEMO ACTIVE**\nThe existing scanner is now evaluating only the resolved objective universe. Valid setups continue through existing SMC, sizing, broker, TP/SL, position-management, and MT5 execution gates. Learning runs in the background."
+            readiness, readiness_detail = objective_operational_readiness(account, state, is_paused=bool(self.settings.is_paused))
+            if readiness == "READY":
+                active_text += "\n\n🟢 **FULL AUTO DEMO READY**\nThe existing scanner is now evaluating only the resolved objective universe. Valid setups continue through existing SMC, sizing, broker, TP/SL, position-management, and MT5 execution gates. Learning runs in the background."
+            else:
+                active_text += f"\n\n⛔ **FULL AUTO DEMO STANDBY — {readiness}**\n{readiness_detail}\nNo new objective-scoped order will be opened until the existing broker-authoritative state becomes ready."
             await reply.reply_text(active_text, parse_mode="Markdown")
             return
         if action == "resume":
@@ -362,7 +368,12 @@ class BotHandlers:
         operational = (active.get("context") or {}).get("operational") or {}
         display_phase = phase_for_equity(operational.get("starting_capital") or objective.starting_capital, display_account.get("equity"))
         preview = ObjectivePreview(objective, validation, display_account, current_usable or tuple(active.get("broker_universe") or ()), display_phase, tuple((active.get("context") or {}).get("resolved_symbols") or ()))
-        await reply.reply_text(self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active.get('version')} ACTIVE**") + ("\n\n⏸ Operational objective is paused." if active.get("is_paused") else "\n\n🟢 Scanner and automatic execution use this objective's operational universe."), parse_mode="Markdown")
+        readiness, readiness_detail = objective_operational_readiness(display_account, current_state, is_paused=bool(active.get("is_paused") or self.settings.is_paused))
+        if readiness == "READY":
+            readiness_text = "🟢 **FULL AUTO DEMO READY**\nScanner and automatic execution use this objective's operational universe, subject to the existing final execution gates."
+        else:
+            readiness_text = f"⛔ **FULL AUTO DEMO STANDBY — {readiness}**\n{readiness_detail}\nNo new objective-scoped order will be opened."
+        await reply.reply_text(self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active.get('version')} ACTIVE**") + "\n\n" + readiness_text, parse_mode="Markdown")
 
     @admin_only
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
