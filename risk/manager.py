@@ -410,6 +410,8 @@ class RiskManager:
         consecutive_losses: int = 0,
         policy: Optional[dict] = None,
         adaptive_minimum_risk: bool = False,
+        broker_verified_symbol: Optional[bool] = None,
+        broker_eligibility_detail: str = "",
     ) -> RiskCheckResult:
         """Run integrity checks plus the *selected* policy—never hidden global caps.
 
@@ -424,7 +426,9 @@ class RiskManager:
         # Software/infrastructure integrity checks.
         checks.append(("Auto-trade enabled", self.settings.auto_trade and not self.settings.is_paused, f"auto_trade={self.settings.auto_trade}, paused={self.settings.is_paused}"))
         checks.append(("Executable market data", setup_valid, "Valid closed-candle price, stop, and target" if setup_valid else "Invalid candidate geometry"))
-        checks.append(("Broker-verified enabled symbol", symbol in self.settings.enabled_symbols, f"{symbol} enabled"))
+        broker_symbol_ok = bool(broker_verified_symbol) if broker_verified_symbol is not None else symbol in self.settings.enabled_symbols
+        broker_source = broker_eligibility_detail or ("fresh broker-authoritative usable-symbol handoff" if broker_verified_symbol is not None else "legacy settings fallback")
+        checks.append(("Broker-verified enabled symbol", broker_symbol_ok, f"{symbol}; source={broker_source}"))
         safe_free_margin = max(0.0, free_margin * (1 - max(0.0, safety_margin_buffer_pct)))
         checks.append(("Free margin", required_margin <= safe_free_margin + 1e-6, f"required=${required_margin:.2f}; available=${safe_free_margin:.2f}"))
 

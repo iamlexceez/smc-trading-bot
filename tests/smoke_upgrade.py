@@ -109,6 +109,8 @@ def test_scanner_eligibility_handoff() -> None:
     assert_true(handoff == ("Volatility 75 Index", "XAUUSDmicro"), "broker-usable scanner handoff lost the returned identifiers")
     assert_true(engine._analysis_symbol_is_eligible("Volatility 75 Index"), "broker-validated scanner symbol was rejected after settings reload")
     assert_true(not engine._analysis_symbol_is_eligible("EURUSD"), "unverified legacy symbol entered scanner eligibility")
+    engine._set_analysis_eligible_symbols({"usable_symbols": ["Volatility 15 (1s) Index"]})
+    assert_true(engine._analysis_symbol_is_eligible("Volatility 15 (1s) Index"), "fresh broker-verified Volatility 15 (1s) Index handoff was lost")
 
 
 def test_config_round_trip() -> None:
@@ -205,6 +207,21 @@ def test_risk_sizing_and_layers() -> None:
         adaptive_minimum_risk=True,
     ))
     assert_true(adaptive_check.passed, "adaptive minimum-risk sizing did not preserve broker and margin validation")
+    settings.enabled_symbols = []  # Reproduce intentional persisted-list clearing after a settings reload.
+    broker_handoff_check = asyncio.run(manager.check_all(
+        symbol="Volatility 15 (1s) Index", direction="BUY", score=0.0, rr_ratio=3.0, spread_pips=0.0,
+        account_equity=152.60, free_margin=152.60, required_margin=0.0,
+        today_pnl=0.0, today_trade_count=0, open_position_count=0,
+        broker_verified_symbol=True, broker_eligibility_detail="fresh usable-symbol handoff; symbol=present",
+    ))
+    assert_true(broker_handoff_check.passed, "fresh broker handoff did not override stale cleared settings symbols")
+    broker_absent_check = asyncio.run(manager.check_all(
+        symbol="Volatility 15 (1s) Index", direction="BUY", score=0.0, rr_ratio=3.0, spread_pips=0.0,
+        account_equity=152.60, free_margin=152.60, required_margin=0.0,
+        today_pnl=0.0, today_trade_count=0, open_position_count=0,
+        broker_verified_symbol=False, broker_eligibility_detail="fresh usable-symbol handoff; symbol=absent",
+    ))
+    assert_true(not broker_absent_check.passed and "Broker-verified enabled symbol" in broker_absent_check.reason, "unverified broker handoff was not fail-closed")
     layers = manager.get_layering_plan(sizing.final_volume, 100.0, 98.0, symbol_info)
     assert_true(bool(layers), "layer plan is empty")
     assert_true(sum(layer["lot"] for layer in layers) <= sizing.final_volume + 1e-6, "layers exceed total volume")

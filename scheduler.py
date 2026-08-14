@@ -1266,6 +1266,11 @@ class MarketScheduler:
                 consecutive_losses=consecutive_losses,
                 policy=signal.experimental_policy,
                 adaptive_minimum_risk=sizing.risk_adapted_to_broker_minimum,
+                broker_verified_symbol=self._analysis_symbol_is_eligible(symbol),
+                broker_eligibility_detail=(
+                    f"fresh usable-symbol handoff; count={len(self._analysis_eligible_symbols)}; "
+                    f"symbol={'present' if self._analysis_symbol_is_eligible(symbol) else 'absent'}"
+                ),
             )
             if not risk_result.passed:
                 logger.info(f"Signal rejected for {symbol}: {risk_result.reason}")
@@ -1281,10 +1286,27 @@ class MarketScheduler:
                         status="risk_rejected",
                         requested_price=signal.entry_price,
                         reason=risk_result.reason,
+                        details={
+                            "broker_eligibility": {
+                                "symbol": symbol,
+                                "verified_usable": self._analysis_symbol_is_eligible(symbol),
+                                "usable_count": len(self._analysis_eligible_symbols),
+                                "source": "fresh broker-authoritative usable-symbol handoff",
+                            },
+                            "checks": [
+                                {"name": name, "passed": passed, "detail": detail}
+                                for name, passed, detail in risk_result.checks
+                            ],
+                        },
                     )
+                failed_checks = [name for name, passed, _detail in risk_result.checks if not passed]
+                broker_only = failed_checks == ["Broker-verified enabled symbol"]
+                title = "BROKER ELIGIBILITY BLOCK" if broker_only else "PORTFOLIO / EXECUTION BLOCK"
+                eligibility_detail = next((detail for name, _passed, detail in risk_result.checks if name == "Broker-verified enabled symbol"), "")
+                extra = f"\nBroker evidence: `{eligibility_detail}`" if broker_only else ""
                 await self._chart_activity(
                     "execution_rejected", symbol,
-                    f"⛔ **PORTFOLIO RISK BLOCK — {symbol}**\nReason: {signal.rejection_reason}\nThe structural setup remains recorded, but no order was sent.",
+                    f"⛔ **{title} — {symbol}**\nReason: {signal.rejection_reason}{extra}\nThe structural setup remains recorded, but no order was sent.",
                     fingerprint=f"{setup_id}:risk:{signal.rejection_reason}", essential=True,
                 )
                 return False
