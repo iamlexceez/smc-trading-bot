@@ -144,6 +144,11 @@ class MarketScheduler:
         self.capital_state_service.settings = self.settings
         self.capital_state_service.executor = self.executor
         capital = await self.capital_state_service.evaluate()
+        # `/objective start` is itself the deliberate user action following a
+        # reset. Reuse the existing fresh-broker resume verifier rather than
+        # requiring a second command before the new session can be created.
+        if capital.get("state") == AccountCapitalState.AWAITING_RESUME:
+            capital = await self.capital_state_service.verify_resume()
         self.last_capital_state = capital
         state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
         if state not in {AccountCapitalState.ACCOUNT_VERIFIED, AccountCapitalState.LOW_CAPITAL}:
