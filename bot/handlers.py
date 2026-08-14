@@ -317,6 +317,31 @@ class BotHandlers:
         if action == "confirm":
             draft = await db.get_objective_draft(mode)
             if not draft:
+                # Confirmation writes the objective before persisting its phase
+                # plan. If an older process failed in that narrow window, make
+                # this command an idempotent recovery instead of forcing the
+                # user to recreate a valid confirmed objective.
+                active = await db.get_active_objective(mode)
+                operational = dict(((active or {}).get("context") or {}).get("operational") or {})
+                if active and not operational.get("terminal") and not operational.get("phase_plan") and self.scheduler:
+                    recovered = await self.scheduler._ensure_objective_phase_plan(active)
+                    recovered_operational = dict((recovered.get("context") or {}).get("operational") or {})
+                    if recovered_operational.get("phase_plan"):
+                        if mode == "demo":
+                            recovered_objective = TradingObjective.from_dict(recovered["objective"])
+                            self.settings.auto_trade = True
+                            self.settings.is_paused = False
+                            self.settings.self_optimization_enabled = bool(recovered_objective.adaptive_learning)
+                            await db.save_settings(self.settings)
+                            self.scheduler.settings = self.settings
+                            self.scheduler.risk_manager.settings = self.settings
+                            self.scheduler._start_background_task("objective_recovery_scan", self.scheduler.activate_and_scan_now())
+                        await self._reply_objective(
+                            reply,
+                            f"✅ **OBJECTIVE v{recovered.get('version')} RECOVERED**\n"
+                            "Its interrupted confirmation was completed idempotently. The adaptive phase plan and existing DEMO execution lifecycle are active; use `/objective` to view the current broker state."
+                        )
+                        return
                 await reply.reply_text("No objective draft exists. Use `/objective set <instruction>` first.", parse_mode="Markdown")
                 return
             account, state, usable = await self._objective_facts(refresh=True)
