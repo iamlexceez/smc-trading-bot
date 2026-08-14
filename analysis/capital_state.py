@@ -33,6 +33,11 @@ class AccountCapitalState:
     TARGET_SYMBOLS_INVALID = "TARGET_SYMBOLS_INVALID"
     LOW_CAPITAL = "LOW_CAPITAL"
     CRITICAL_CAPITAL = "CRITICAL_CAPITAL"
+    # Margin pressure blocks new exposure but never disables management of
+    # broker-open positions. It is intentionally distinct from terminal DEMO
+    # exhaustion, which is assessed only after the account is flat.
+    MARGIN_PRESSURE = "MARGIN_PRESSURE"
+    PROTECTION_MODE = MARGIN_PRESSURE
     CAPITAL_EXHAUSTED = "CAPITAL_EXHAUSTED"
     TRADING_HALTED = "TRADING_HALTED"
     DEMO_RESET_DETECTED = "DEMO_RESET_DETECTED"
@@ -41,7 +46,7 @@ class AccountCapitalState:
 
     BLOCKING = {
         TARGET_UNIVERSE_INITIALIZING, TARGET_UNIVERSE_EMPTY, TARGET_SYMBOLS_VALIDATING,
-        TARGET_SYMBOLS_INVALID, CAPITAL_EXHAUSTED, CRITICAL_CAPITAL, TRADING_HALTED,
+        TARGET_SYMBOLS_INVALID, CAPITAL_EXHAUSTED, CRITICAL_CAPITAL, MARGIN_PRESSURE, TRADING_HALTED,
         AWAITING_RESUME, ACCOUNT_STATE_UNKNOWN,
     }
 
@@ -400,6 +405,7 @@ class CapitalStateService:
                 return result
 
             account = snapshot.get("account") or {}
+            open_positions = list(snapshot.get("positions") or [])
             if str(account.get("broker_account_mode") or "unknown").lower() != "demo":
                 result = await self._persist_unknown(previous, f"Broker account mode is {account.get('broker_account_mode', 'unknown')}, not DEMO")
                 self.last_result = result
@@ -430,7 +436,7 @@ class CapitalStateService:
             session_id = await self._session_for_account(account, previous, reset=reset_detected)
             await db.update_demo_session_equity(session_id, balance=balance, equity=equity, db_path=self.db_path)
 
-            state, reason = self._classify(account, minimum, audit)
+            state, reason = self._classify(account, minimum, audit, open_position_count=len(open_positions))
             if reset_detected:
                 state = AccountCapitalState.AWAITING_RESUME
                 reason = "Broker-observed DEMO balance reset verified; waiting for explicit resume"
@@ -476,14 +482,15 @@ class CapitalStateService:
             )
             result = {
                 "current": True, "state": state, "reason": reason, "changed": changed, "reset_detected": reset_detected,
-                "account": account, "demo_session_id": session_id, "minimum_operating_capital": minimum.amount,
+                "account": account, "open_positions": open_positions, "open_position_count": len(open_positions),
+                "demo_session_id": session_id, "minimum_operating_capital": minimum.amount,
                 "minimum_reason": minimum.reason, "executable_symbols": list(minimum.executable_symbols),
                 "capacity_count": self._capacity_count(free_margin, minimum.amount), "broker_metadata": audit, "previous": previous,
             }
             self.last_result = result
             return result
 
-    def _classify(self, account: dict, minimum: MinimumOperatingCapital, audit: Optional[dict] = None) -> tuple[str, str]:
+    def _classify(self, account: dict, minimum: MinimumOperatingCapital, audit: Optional[dict] = None, *, open_position_count: int = 0) -> tuple[str, str]:
         audit = audit or {}
         universe_state = str(audit.get("universe_state") or "UNKNOWN")
         target_count = int(audit.get("target_count") or 0)
@@ -493,17 +500,25 @@ class CapitalStateService:
             return AccountCapitalState.TARGET_UNIVERSE_EMPTY, "Broker target universe is empty; account validator received zero completed broker-classified targets"
         if minimum.amount <= 0 or not minimum.executable_symbols:
             return AccountCapitalState.TARGET_SYMBOLS_INVALID, minimum.reason
+        balance = self._num(account.get("balance"))
         equity = self._num(account.get("equity"))
         free_margin = self._num(account.get("free_margin"))
         margin_level = self._num(account.get("margin_level"))
         call_level = self._num(account.get("margin_so_call"))
         stopout_level = self._num(account.get("margin_so_so"))
-        if equity <= 0:
-            return AccountCapitalState.CAPITAL_EXHAUSTED, "Actual broker equity is non-positive"
+        # A terminal account is determined only from a fresh flat-account
+        # reconciliation. While positions exist, equity/margin describe a
+        # protection regime—not terminal failure—because management must remain
+        # active until the broker confirms all positions are closed.
+        terminal_balance = 5.0
+        if open_position_count <= 0 and balance <= terminal_balance:
+            return AccountCapitalState.CAPITAL_EXHAUSTED, f"Fresh flat-account balance {balance:.2f} is at or below DEMO terminal threshold {terminal_balance:.2f}"
+        if open_position_count > 0 and (free_margin < minimum.amount or equity <= 0 or (stopout_level > 0 and margin_level > 0 and margin_level <= stopout_level)):
+            return AccountCapitalState.MARGIN_PRESSURE, "Fresh broker margin/equity pressure with open positions; new exposure blocked while position protection remains active"
         if free_margin < minimum.amount:
-            return AccountCapitalState.CAPITAL_EXHAUSTED, "Free margin cannot fund one broker-valid minimum-volume position"
+            return AccountCapitalState.MARGIN_PRESSURE, "Free margin cannot fund one broker-valid minimum-volume position; new exposure is blocked"
         if stopout_level > 0 and margin_level > 0 and margin_level <= stopout_level:
-            return AccountCapitalState.CAPITAL_EXHAUSTED, "Broker margin level is at or below broker-reported stop-out"
+            return AccountCapitalState.MARGIN_PRESSURE, "Broker margin level is at or below broker-reported stop-out; new exposure is blocked"
         if call_level > 0 and margin_level > 0 and margin_level <= call_level:
             return AccountCapitalState.CRITICAL_CAPITAL, "Broker margin level is at or below broker-reported margin-call threshold"
         capacity = self._capacity_count(free_margin, minimum.amount)

@@ -42,6 +42,7 @@ from analysis.account_monitor import summarize_history, exposure_summary
 from execution.capital_reduction import CapitalReductionEngine
 from execution import capital_reduction as capital_reduction_module
 from analysis.capital_state import AccountCapitalState, CapitalStateService
+from analysis.capital_protection import calculate_capital_protection
 from analysis.runtime_telemetry import RuntimeTelemetry
 from strategy.setup_validator import calculate_rr, rr_filter_passes
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
@@ -270,6 +271,22 @@ def test_no_widening_management() -> None:
     manager = TradeManager()
     assert_true(not manager._is_improvement("BUY", 101.0, 100.5, 0.0), "BUY stop widening was accepted")
     assert_true(not manager._is_improvement("SELL", 99.0, 99.5, 0.0), "SELL stop widening was accepted")
+
+
+def test_adaptive_capital_protection() -> None:
+    low_pressure = calculate_capital_protection(
+        account={"balance": 100.0, "equity": 105.0, "free_margin": 90.0, "margin": 10.0},
+        positions=[{"volume": 0.1, "profit": 5.0}],
+        phase={"starting_equity": 100.0, "target_equity": 200.0},
+        management_evidence={},
+    )
+    high_pressure = calculate_capital_protection(
+        account={"balance": 100.0, "equity": 45.0, "free_margin": -1.0, "margin": 46.0},
+        positions=[{"volume": 0.9, "profit": -12.0}, {"volume": 0.1, "profit": -2.0}],
+        phase={"starting_equity": 100.0, "target_equity": 200.0},
+        management_evidence={"average_mae_r": 2.0},
+    )
+    assert_true(high_pressure.score > low_pressure.score and high_pressure.level in {"ELEVATED", "HIGH"}, "protection score did not increase under falling equity and margin pressure")
 
 
 def test_causal_confirmation_invariants() -> None:
@@ -754,6 +771,7 @@ async def test_broker_authoritative_capital_state() -> None:
             self.equity = 100.0
             self.free_margin = 100.0
             self.margin_level = 1_000.0
+            self.positions = []
 
         async def get_live_account_snapshot(self, history_days=0):
             if not self.available:
@@ -763,9 +781,10 @@ async def test_broker_authoritative_capital_state() -> None:
                 "account": {
                     "login": 123456, "broker_account_mode": "demo", "balance": self.balance,
                     "equity": self.equity, "free_margin": self.free_margin,
-                    "margin_level": self.margin_level, "margin_so_call": 100.0,
+                    "margin": max(0.0, self.equity - self.free_margin), "margin_level": self.margin_level, "margin_so_call": 100.0,
                     "margin_so_so": 50.0, "leverage": 100, "currency": "USD",
                 },
+                "positions": list(self.positions),
             }
 
         async def get_symbol_execution_metadata(self, symbol, direction="BUY"):
@@ -803,9 +822,19 @@ async def test_broker_authoritative_capital_state() -> None:
         exhausted = await service.evaluate()
         exhausted_symbol = ((exhausted.get("broker_metadata") or {}).get("symbols") or [{}])[0]
         assert_true(exhausted_symbol.get("specification_valid") and not exhausted_symbol.get("usable"), "valid symbol specification was lost when only current free margin became insufficient")
-        assert_true(exhausted["state"] == AccountCapitalState.CAPITAL_EXHAUSTED, "insufficient broker free margin was not classified as functional exhaustion")
+        assert_true(exhausted["state"] == AccountCapitalState.MARGIN_PRESSURE, "insufficient broker free margin did not enter non-terminal margin pressure")
         persisted = await db.get_account_state("demo", path)
-        assert_true(persisted and persisted["state"] == AccountCapitalState.CAPITAL_EXHAUSTED, "exhausted state was not persisted authoritatively")
+        assert_true(persisted and persisted["state"] == AccountCapitalState.MARGIN_PRESSURE, "margin-pressure state was not persisted authoritatively")
+
+        broker.balance = broker.equity = 1.0
+        broker.free_margin = -0.5
+        broker.positions = [{"ticket": 1, "volume": 0.1, "profit": -0.5}]
+        pressured_with_position = await service.evaluate()
+        assert_true(pressured_with_position["state"] == AccountCapitalState.MARGIN_PRESSURE and pressured_with_position["open_position_count"] == 1, "open positions did not defer terminal exhaustion under margin pressure")
+
+        broker.positions = []
+        exhausted_flat = await service.evaluate()
+        assert_true(exhausted_flat["state"] == AccountCapitalState.CAPITAL_EXHAUSTED, "flat broker account below the terminal balance threshold was not exhausted")
 
         broker.balance = broker.equity = broker.free_margin = 1_000.0
         reset = await service.evaluate()
@@ -1306,6 +1335,7 @@ def run() -> None:
     test_account_monitor_aggregates()
     test_risk_sizing_and_layers()
     test_no_widening_management()
+    test_adaptive_capital_protection()
     test_causal_confirmation_invariants()
     asyncio.run(test_broker_only_data_provider())
     asyncio.run(test_deriv_market_universe())

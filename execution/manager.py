@@ -90,6 +90,10 @@ class TradeManager:
         self.target_extension_trigger_r = self.policy.get("target_extension_trigger_r")
         self.target_model = self.policy.get("target_model", "liquidity")
         self.exit_on_opposing_structure = bool(self.policy.get("exit_on_opposing_structure", True))
+        # This is a learnable policy response coefficient. It maps fresh capital
+        # vulnerability into the timing of already policy-approved protective
+        # actions; it never manufactures a stop/target or weakens integrity.
+        self.protection_response = max(0.0, min(1.0, float(self.policy.get("protection_response", 0.5))))
         # Compatibility settings do not create a rule unless no explicit policy
         # object was supplied by a caller from a legacy path.
         self.allow_partial_tp = bool(allow_partial_tp) if allow_partial_tp is not None else self.partial_exit_model != "none"
@@ -163,6 +167,7 @@ class TradeManager:
         partial_exit_done: bool = False,
         structural_target: Optional[float] = None,
         costs_buffer: float = 0.0,
+        protection_context: Optional[dict] = None,
     ) -> TradeManagementAction:
         """Return at most one integrity-safe action selected by active policy."""
         snapshot = self.snapshot(
@@ -174,30 +179,37 @@ class TradeManager:
         event = structure.last_event.event_type
         structural_confirmation = _same_direction_event(direction, event)
         current_r = snapshot.current_r
+        protection_score = max(0.0, min(1.0, float((protection_context or {}).get("score") or 0.0)))
+        protection_adjustment = protection_score * self.protection_response
+        protection_suffix = f" under capital protection {protection_score:.2f}" if protection_adjustment > 0 else ""
 
         if self.exit_on_opposing_structure and _opposing_event(direction, event):
             return TradeManagementAction("close_full", ManagementState.EXIT_WARNING, reason=f"Policy exits on opposing {event.value}")
 
-        if self.trailing_model == "structural" and self.runner_rr is not None and current_r >= float(self.runner_rr) and structural_confirmation:
+        trailing_trigger = float(self.runner_rr) * (1.0 - 0.35 * protection_adjustment) if self.runner_rr is not None else None
+        if self.trailing_model == "structural" and trailing_trigger is not None and current_r >= trailing_trigger and structural_confirmation:
             structural_sl = self._structural_trail(direction=direction, current_sl=current_sl, structure=structure, atr_value=atr_value)
             if structural_sl is not None:
-                return TradeManagementAction("move_sl", ManagementState.RUNNER, new_sl=structural_sl, reason=f"Policy structural trail after {current_r:.2f}R")
+                return TradeManagementAction("move_sl", ManagementState.RUNNER, new_sl=structural_sl, reason=f"Policy structural trail after {current_r:.2f}R{protection_suffix}")
 
-        if self.profit_lock_rr is not None and self.profit_lock_r is not None and current_r >= float(self.profit_lock_rr) and structural_confirmation:
+        profit_lock_trigger = float(self.profit_lock_rr) * (1.0 - 0.35 * protection_adjustment) if self.profit_lock_rr is not None else None
+        if profit_lock_trigger is not None and self.profit_lock_r is not None and current_r >= profit_lock_trigger and structural_confirmation:
             protected = entry_price + snapshot.initial_risk * float(self.profit_lock_r) if direction == "BUY" else entry_price - snapshot.initial_risk * float(self.profit_lock_r)
             if self._is_improvement(direction, current_sl, protected, self.min_sl_update_distance):
-                return TradeManagementAction("move_sl", ManagementState.PROFIT_PROTECTED, new_sl=protected, reason=f"Policy profit lock at {self.profit_lock_r}R")
+                return TradeManagementAction("move_sl", ManagementState.PROFIT_PROTECTED, new_sl=protected, reason=f"Policy profit lock at {self.profit_lock_r}R{protection_suffix}")
 
-        if self.breakeven_model != "none" and self.breakeven_at_rr is not None and current_r >= float(self.breakeven_at_rr):
+        breakeven_trigger = float(self.breakeven_at_rr) * (1.0 - 0.35 * protection_adjustment) if self.breakeven_at_rr is not None else None
+        if self.breakeven_model != "none" and breakeven_trigger is not None and current_r >= breakeven_trigger:
             if self.breakeven_model != "structural" or structural_confirmation:
                 break_even = entry_price + costs_buffer if direction == "BUY" else entry_price - costs_buffer
                 if self._is_improvement(direction, current_sl, break_even, self.min_sl_update_distance):
-                    return TradeManagementAction("move_sl", ManagementState.BE_ELIGIBLE, new_sl=break_even, reason=f"Policy breakeven at {current_r:.2f}R")
+                    return TradeManagementAction("move_sl", ManagementState.BE_ELIGIBLE, new_sl=break_even, reason=f"Policy breakeven at {current_r:.2f}R{protection_suffix}")
 
-        if self.allow_partial_tp and not partial_exit_done and self.partial_exit_r is not None and current_r >= float(self.partial_exit_r):
+        partial_trigger = float(self.partial_exit_r) * (1.0 - 0.25 * protection_adjustment) if self.partial_exit_r is not None else None
+        if self.allow_partial_tp and not partial_exit_done and partial_trigger is not None and current_r >= partial_trigger:
             percent = float(self.partial_exit_pct or 0.0)
             if 0 < percent < 1:
-                return TradeManagementAction("close_partial", ManagementState.RUNNER, close_percent=percent, reason=f"Policy partial exit at {current_r:.2f}R")
+                return TradeManagementAction("close_partial", ManagementState.RUNNER, close_percent=percent, reason=f"Policy partial exit at {current_r:.2f}R{protection_suffix}")
 
         if self.allow_tp_extension and self.target_model in {"liquidity", "structure", "dynamic", "adaptive"} and structural_target is not None and self.target_extension_trigger_r is not None and current_r >= float(self.target_extension_trigger_r):
             farther = structural_target > current_tp if direction == "BUY" else structural_target < current_tp

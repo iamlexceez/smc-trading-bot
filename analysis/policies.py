@@ -45,6 +45,10 @@ class ExperimentalPolicy:
     partial_exit_r: Optional[float] = None
     partial_exit_pct: Optional[float] = None
     target_extension_trigger_r: Optional[float] = None
+    # Learnable sensitivity to the fresh capital-protection score. It changes
+    # timing of policy-approved protection only; it cannot widen a stop or
+    # bypass broker/order integrity.
+    protection_response: float = 0.5
     exit_on_opposing_structure: bool = True
     max_layers: int = 0
     layer_style: str = "none"
@@ -215,9 +219,9 @@ class PolicyGenerator:
         )
         management_models = (
             {"breakeven_model": "none", "trailing_model": "none", "partial_exit_model": "none"},
-            {"breakeven_model": "rr", "breakeven_trigger_r": 0.5, "trailing_model": "none", "partial_exit_model": "none"},
-            {"breakeven_model": "rr", "breakeven_trigger_r": 1.0, "trailing_model": "structural", "trailing_trigger_r": 1.5, "partial_exit_model": "none"},
-            {"breakeven_model": "structural", "breakeven_trigger_r": 1.0, "trailing_model": "structural", "trailing_trigger_r": 2.0, "partial_exit_model": "rr", "partial_exit_r": 2.0, "partial_exit_pct": 0.20},
+            {"breakeven_model": "rr", "breakeven_trigger_r": 0.5, "trailing_model": "none", "partial_exit_model": "none", "protection_response": 0.25},
+            {"breakeven_model": "rr", "breakeven_trigger_r": 1.0, "trailing_model": "structural", "trailing_trigger_r": 1.5, "partial_exit_model": "none", "protection_response": 0.50},
+            {"breakeven_model": "structural", "breakeven_trigger_r": 1.0, "trailing_model": "structural", "trailing_trigger_r": 2.0, "partial_exit_model": "rr", "partial_exit_r": 2.0, "partial_exit_pct": 0.20, "protection_response": 0.75},
         )
         policies: list[ExperimentalPolicy] = []
         seen: set[str] = set()

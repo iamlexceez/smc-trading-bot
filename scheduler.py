@@ -40,6 +40,7 @@ from analysis.optimizer import SelfOptimizer
 from analysis.research_governance import ResearchGovernance
 from analysis.account_monitor import AccountReconciliationEngine
 from analysis.capital_state import AccountCapitalState, CapitalStateService
+from analysis.capital_protection import calculate_capital_protection
 from analysis.runtime_telemetry import RuntimeTelemetry
 from analysis.objectives import phase_for_equity
 from analysis.objective_phases import plan_objective_phases
@@ -111,6 +112,7 @@ class MarketScheduler:
         # Phase lifecycle can be observed by both a scan and reconciliation;
         # one guard preserves exactly-once broker-confirmed transitions.
         self._objective_phase_lock = asyncio.Lock()
+        self._last_protection_signature: tuple[str, int] | None = None
 
     def _set_analysis_eligible_symbols(self, audit: Optional[dict]) -> tuple[str, ...]:
         audit = audit or {}
@@ -485,6 +487,18 @@ class MarketScheduler:
             self.settings.is_paused = False
             await db.save_settings(self.settings)
             logger.info("Autonomous DEMO scanning resumed after broker metadata verification")
+        elif (
+            self.settings.is_paused and self.settings.auto_trade
+            and str((capital.get("previous") or {}).get("state") or "") in {
+                AccountCapitalState.MARGIN_PRESSURE, AccountCapitalState.CRITICAL_CAPITAL,
+            }
+            and state in {AccountCapitalState.ACCOUNT_VERIFIED, AccountCapitalState.LOW_CAPITAL}
+        ):
+            # Margin pressure is not terminal. Fresh broker margin recovery may
+            # reopen new-exposure eligibility after position protection has run.
+            self.settings.is_paused = False
+            await db.save_settings(self.settings)
+            logger.info("Autonomous DEMO scanning resumed after broker-confirmed margin recovery")
 
         if capital.get("changed"):
             audit = capital.get("broker_metadata")
@@ -512,7 +526,19 @@ class MarketScheduler:
         currency = str(account.get("currency") or "USD")
         state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
         minimum = float(capital.get("minimum_operating_capital") or 0.0)
-        if state == AccountCapitalState.CAPITAL_EXHAUSTED:
+        if state == AccountCapitalState.MARGIN_PRESSURE:
+            text = "\n".join([
+                "⚠️ MARGIN PRESSURE",
+                f"Equity: {currency} {float(account.get('equity') or 0.0):,.2f}",
+                f"Balance: {currency} {float(account.get('balance') or 0.0):,.2f}",
+                f"Free margin: {currency} {float(account.get('free_margin') or 0.0):,.2f}",
+                f"Open positions: {int(capital.get('open_position_count') or 0)}",
+                "New trades: BLOCKED",
+                "Position management: ACTIVE",
+                "Protection priority: BROKER-ADAPTIVE",
+                f"Reason: {capital.get('reason')}",
+            ])
+        elif state == AccountCapitalState.CAPITAL_EXHAUSTED:
             text = "\n".join([
                 "🚨 DEMO CAPITAL EXHAUSTED",
                 "The bot can no longer reliably open a broker-valid minimum position with the actual account state.",
@@ -2210,6 +2236,33 @@ class MarketScheduler:
             self.telemetry.component_succeeded("position_manager", waiting=bool(result == 0))
             return result
 
+    async def _management_protection_context(self, positions) -> dict:
+        """Build a fresh, continuous context for the existing policy manager."""
+        capital = dict(self.last_capital_state or {})
+        account = dict(capital.get("account") or {})
+        active = await db.get_active_objective(self.settings.trading_mode)
+        phase = {}
+        if active:
+            phase = await db.get_active_objective_phase(int(active["id"])) or {}
+        evidence = await db.get_management_learning_summary(
+            account_mode=self.settings.trading_mode, days=self.settings.market_ranking_lookback_days
+        )
+        context = calculate_capital_protection(
+            account=account,
+            positions=[{"volume": item.volume, "profit": item.profit} for item in positions],
+            phase=phase,
+            management_evidence=evidence,
+        ).to_dict()
+        signature = (str(context["level"]), int(context["score"] * 100))
+        if signature != self._last_protection_signature:
+            self._last_protection_signature = signature
+            await self._notify(
+                "🛡 **CAPITAL PROTECTION ADJUSTED**\n"
+                f"Equity position: `{context['equity_position'] * 100:.1f}%` | Protection level: `{context['level']}` (`{context['score'] * 100:.1f}%`)\n"
+                f"Open positions: `{context['open_position_count']}` | Reason: {context['reason']}"
+            )
+        return context
+
     async def _manage_open_positions(self):
         """Manage each open trade from fresh closed-candle structure and basket state."""
         positions = await self.executor.get_open_positions()
@@ -2220,6 +2273,7 @@ class MarketScheduler:
             if not positions:
                 return 0
             logger.info("Managing %s open position(s) using their recorded experimental policies", len(positions))
+            protection_context = await self._management_protection_context(positions)
 
             for position in positions:
                 basket = await db.get_basket_for_ticket(position.ticket, self.settings.trading_mode)
@@ -2284,6 +2338,7 @@ class MarketScheduler:
                     partial_exit_done=partial_done,
                     structural_target=structural_target,
                     costs_buffer=atr_val * 0.02,
+                    protection_context=protection_context,
                 )
                 if action.action == "none":
                     continue
@@ -2373,6 +2428,10 @@ class MarketScheduler:
         valid setup is present, the structural event is new, risk remains inside
         the original setup budget, and free margin supports the reduced volume.
         """
+        capital_state = str((self.last_capital_state or {}).get("state") or "")
+        if capital_state in AccountCapitalState.BLOCKING:
+            logger.info("Layering blocked by current broker account state: %s", capital_state)
+            return False
         if not self.settings.auto_trade or self.settings.is_paused:
             return False
         # Existing positions continue to receive protective management, but a

@@ -198,6 +198,8 @@ def objective_operational_readiness(account_snapshot: Optional[dict[str, Any]], 
     state = str(account_state or "ACCOUNT_STATE_UNKNOWN")
     if state in {"CAPITAL_EXHAUSTED", "AWAITING_RESUME"}:
         return "BLOCKED_CAPITAL", f"Broker capital state is {state}; reset and broker-verified resume are required before new exposure."
+    if state in {"MARGIN_PRESSURE", "CRITICAL_CAPITAL"}:
+        return "PROTECTION_MODE", "Fresh broker margin pressure blocks new exposure while existing positions remain under independent broker-confirmed protection."
     account = dict(account_snapshot or {})
     margin = account.get("free_margin")
     try:
@@ -266,6 +268,8 @@ class ObjectiveValidator:
         readiness, readiness_detail = objective_operational_readiness(account, state)
         if readiness in {"BLOCKED_CAPITAL", "BLOCKED_MARGIN"} and readiness_detail not in errors:
             errors.append(readiness_detail)
+        elif readiness == "PROTECTION_MODE":
+            warnings.append(readiness_detail)
         resolution = tuple(resolved_symbols or ())
         unresolved = [str(row.get("requested") or "") for row in resolution if str(row.get("status") or "") != "BROKER_VERIFIED"]
         if unresolved:
