@@ -10,6 +10,9 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pandas as pd
 
@@ -35,6 +38,7 @@ from backtest.engine import BacktestEngine, BacktestResult, BacktestTrade
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 from analysis.account_monitor import summarize_history, exposure_summary
 from execution.capital_reduction import CapitalReductionEngine
+from execution import capital_reduction as capital_reduction_module
 from analysis.capital_state import AccountCapitalState, CapitalStateService
 from analysis.runtime_telemetry import RuntimeTelemetry
 from strategy.setup_validator import calculate_rr, rr_filter_passes
@@ -465,6 +469,123 @@ async def test_experiment_engine_persistence() -> None:
         assert_true(active and active["id"] == experiment_id and active["policy"]["risk_pct"] == 7.5, "forward DEMO policy assignment was not persisted")
 
 
+async def test_sequential_capital_reduction_planning() -> None:
+    class BrokerFixture:
+        def __init__(self, *, free_margin: float = 1_000.0, valid: bool = True) -> None:
+            self.free_margin = free_margin
+            self.valid = valid
+
+        async def get_symbol_info(self, symbol):
+            if not self.valid:
+                return {"last_tick_time": time.time()}
+            return {
+                "last_tick_time": time.time(), "tick_size": 1.0, "tick_value": 1.0,
+                "contract_size": 1.0, "min_lot": 1.0, "max_lot": 10.0, "step_lot": 0.5,
+            }
+
+        async def get_symbol_price(self, symbol):
+            return 100.0, 101.0
+
+    settings = TradeSettings.defaults()
+    settings.enabled_symbols = ["Sequential Index"]
+    planner = CapitalReductionEngine(settings, BrokerFixture())
+    plan, reason, diagnostic = await planner._plan_round_trip(
+        {"free_margin": 1_000.0, "leverage": 10.0}, remaining=25.0, tolerance=0.0,
+    )
+    assert_true(plan is not None and plan.volume == 10.0 and plan.expected_loss == 10.0, "large reduction was not bounded into a first sequential broker-valid action")
+    assert_true(plan.maximum_reduction == 10.0, "maximum broker-valid sequential reduction was not reported")
+
+    small_plan, small_reason, _ = await planner._plan_round_trip(
+        {"free_margin": 1_000.0, "leverage": 10.0}, remaining=1.2, tolerance=0.0,
+    )
+    assert_true(small_plan is not None and small_plan.volume == 1.0 and small_plan.expected_loss == 1.0, "valid minimum-volume final sequential action was incorrectly rejected")
+
+    step_plan, _, _ = await planner._plan_round_trip(
+        {"free_margin": 1_000.0, "leverage": 10.0}, remaining=5.4, tolerance=0.0,
+    )
+    assert_true(step_plan is not None and step_plan.volume == 5.0, "broker volume-step rounding did not floor the sequential action")
+
+    margin_engine = CapitalReductionEngine(settings, BrokerFixture(free_margin=1.0))
+    margin_plan, margin_reason, margin_diagnostic = await margin_engine._plan_round_trip(
+        {"free_margin": 1.0, "leverage": 10.0}, remaining=5.0, tolerance=0.0,
+    )
+    assert_true(margin_plan is None and margin_diagnostic.get("best_candidate", {}).get("reason") == "insufficient free margin for broker minimum volume", "insufficient free margin was not diagnosed")
+
+    overshoot_plan, overshoot_reason, overshoot_diagnostic = await planner._plan_round_trip(
+        {"free_margin": 1_000.0, "leverage": 10.0}, remaining=0.5, tolerance=0.1,
+    )
+    assert_true(overshoot_plan is None and "target/tolerance" in overshoot_reason, "minimum-loss action that crosses target tolerance was not blocked")
+
+    settings.enabled_symbols = []
+    none_engine = CapitalReductionEngine(settings, BrokerFixture())
+    none_plan, none_reason, none_diagnostic = await none_engine._plan_round_trip(
+        {"free_margin": 1_000.0, "leverage": 10.0}, remaining=5.0, tolerance=0.0,
+    )
+    assert_true(none_plan is None and none_diagnostic.get("best_candidate") is None, "empty broker universe did not fail with diagnostics")
+
+    settings.enabled_symbols = ["Invalid Index"]
+    invalid_engine = CapitalReductionEngine(settings, BrokerFixture(valid=False))
+    invalid_plan, invalid_reason, invalid_diagnostic = await invalid_engine._plan_round_trip(
+        {"free_margin": 1_000.0, "leverage": 10.0}, remaining=5.0, tolerance=0.0,
+    )
+    assert_true(invalid_plan is None and "incomplete broker" in invalid_diagnostic["best_candidate"]["reason"], "broker specification failure was not retained in diagnostics")
+    assert_true(CapitalReductionEngine._effective_tolerance(500.0, 10.0, 3.0) == 15.0, "effective tolerance did not use the greater target-relative amount")
+
+    class SequentialExecutor(BrokerFixture):
+        def __init__(self) -> None:
+            super().__init__()
+            self.accounts = iter([
+                {"broker_account_mode": "demo", "equity": 100.0, "balance": 100.0, "free_margin": 1_000.0, "leverage": 10.0},
+                {"broker_account_mode": "demo", "equity": 94.0, "balance": 94.0, "free_margin": 1_000.0, "leverage": 10.0},
+                {"broker_account_mode": "demo", "equity": 94.0, "balance": 94.0, "free_margin": 1_000.0, "leverage": 10.0},
+                {"broker_account_mode": "demo", "equity": 88.0, "balance": 88.0, "free_margin": 1_000.0, "leverage": 10.0},
+            ])
+            self.submissions = 0
+
+        async def get_account_info(self):
+            return next(self.accounts)
+
+        async def execute_trade(self, **kwargs):
+            self.submissions += 1
+            return SimpleNamespace(success=True, ticket=self.submissions, entry_price=101.0, message="")
+
+        async def close_position(self, ticket):
+            return True
+
+        async def get_closed_position_outcome(self, ticket):
+            return {"pnl": -6.0, "exit_price": 100.0, "closed_deals": [ticket]}
+
+    settings.enabled_symbols = ["Sequential Index"]
+    executor = SequentialExecutor()
+    sequential = CapitalReductionEngine(settings, executor)
+    session = {"id": 1, "status": "active", "target_equity": 80.0, "tolerance": 0.0, "metadata": {"tolerance_percent": 0.0}}
+    actions: list[dict] = []
+
+    async def record_action(**kwargs):
+        actions.append(kwargs)
+        return len(actions)
+
+    with patch.object(capital_reduction_module.db, "get_active_capital_reduction_session", new=AsyncMock(return_value=session)), \
+         patch.object(capital_reduction_module.db, "update_capital_reduction_session", new=AsyncMock()), \
+         patch.object(capital_reduction_module.db, "record_capital_reduction_action", new=record_action):
+        first = await sequential.run_once()
+        second = await sequential.run_once()
+    assert_true(first["state"] == "waiting" and second["state"] == "waiting" and executor.submissions == 2, "large reduction did not progress through sequential broker-valid rounds")
+    closed = [row for row in actions if row.get("action") == "round_trip_closed"]
+    assert_true([row.get("equity_after") for row in closed] == [94.0, 88.0], "sequential reduction did not record actual broker equity after each close")
+    assert_true(first["expected_loss"] != first["equity_before"] - first["equity_after"], "test fixture did not prove realized account movement is distinct from the estimate")
+
+    tolerance_session = {"id": 2, "status": "active", "target_equity": 80.0, "tolerance": 1.0, "metadata": {"tolerance_percent": 0.0}}
+    class ToleranceExecutor(SequentialExecutor):
+        async def get_account_info(self):
+            return {"broker_account_mode": "demo", "equity": 81.0, "balance": 81.0, "free_margin": 1_000.0, "leverage": 10.0}
+    with patch.object(capital_reduction_module.db, "get_active_capital_reduction_session", new=AsyncMock(return_value=tolerance_session)), \
+         patch.object(capital_reduction_module.db, "update_capital_reduction_session", new=AsyncMock()), \
+         patch.object(capital_reduction_module.db, "record_capital_reduction_action", new=AsyncMock()):
+        completed = await CapitalReductionEngine(settings, ToleranceExecutor()).run_once()
+    assert_true(completed["state"] == "completed", "configured tolerance did not complete an already-close session")
+
+
 async def test_chart_activity_notifications() -> None:
     class FakeBot:
         def __init__(self) -> None:
@@ -866,6 +987,7 @@ def run() -> None:
     asyncio.run(test_experiment_engine_persistence())
     asyncio.run(test_chart_activity_notifications())
     asyncio.run(test_capital_reduction_isolation())
+    asyncio.run(test_sequential_capital_reduction_planning())
     asyncio.run(test_broker_authoritative_capital_state())
     asyncio.run(test_sizing_rejection_diagnostic_persistence())
     asyncio.run(test_objective_console_safety())

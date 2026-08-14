@@ -15,22 +15,27 @@ def money(value, currency: str = "USD") -> str:
 def capital_test_view(*, account: Optional[dict], session: Optional[dict], target: Optional[float], tolerance: float) -> str:
     currency = str((account or {}).get("currency") or "USD")
     if session:
-        status = str(session.get("status") or "unknown").upper()
-        title = "🎯 CAPITAL TEST READY" if session.get("capital_test_active") else "🔥 CAPITAL REDUCTION MODE"
+        stored_status = str(session.get("status") or "unknown").upper()
+        runtime_status = str(session.get("runtime_state") or stored_status).upper()
+        title = "🎯 CAPITAL TEST READY" if session.get("capital_test_active") else "🔥 CAPITAL REDUCTION"
+        effective_tolerance = session.get("effective_tolerance", session.get("tolerance"))
         lines = [
             title,
-            f"Session: #{session.get('id')} | Status: {status}",
-            "Purpose: deliberately reduce actual DEMO equity to the selected target; this activity is excluded from strategy learning.",
+            f"Session: #{session.get('id')} | State: {runtime_status}",
+            "Purpose: deliberately reduce actual DEMO equity through broker-valid sequential actions; this activity is excluded from strategy learning.",
             "",
-            f"Initial equity: {money(session.get('initial_equity'), currency)}",
-            f"Target equity: {money(session.get('target_equity'), currency)} ± {money(session.get('tolerance'), currency)}",
+            f"Target capital: {money(session.get('target_equity'), currency)} ± {money(effective_tolerance, currency)} effective tolerance",
             f"Current equity: {money(session.get('current_equity'), currency)}",
-            f"Current balance: {money(session.get('current_balance'), currency)}",
-            f"Remaining: {money(session.get('remaining'), currency)} | Progress: {float(session.get('progress_pct') or 0.0):.2f}%",
-            f"Capital-test mode: {'ACTIVE' if session.get('capital_test_active') else 'PENDING'}",
+            f"Remaining reduction: {money(session.get('remaining'), currency)} | Progress: {float(session.get('progress_pct') or 0.0):.2f}%",
+            f"Session status: {stored_status} | Capital-test mode: {'ACTIVE' if session.get('capital_test_active') else 'PENDING'}",
         ]
         if session.get("error_reason"):
-            lines.append(f"Status detail: {session['error_reason']}")
+            lines.extend(["", f"Reason: {session['error_reason']}"])
+        best = (session.get("last_planning") or {}).get("best_candidate")
+        if best:
+            lines.append("Best available candidate: " + "; ".join(
+                f"{key.replace('_', ' ')}={value}" for key, value in best.items() if value is not None
+            ))
         if session.get("broker_error"):
             lines.append(f"Broker state: unavailable — {session['broker_error']}")
         return "\n".join(lines)
@@ -38,7 +43,7 @@ def capital_test_view(*, account: Optional[dict], session: Optional[dict], targe
     lines = [
         "🎯 CAPITAL TEST — DEMO-ONLY",
         "No capital-reduction session is active.",
-        f"Configured target: {money(target, currency) if target is not None else 'not set'} ± {money(tolerance, currency)}",
+        f"Configured target: {money(target, currency) if target is not None else 'not set'} ± {money(tolerance, currency)} absolute tolerance",
     ]
     if account:
         lines.extend([

@@ -995,21 +995,24 @@ class BotHandlers:
     async def cmd_capital_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Persist an operational DEMO target; no broker action is taken here."""
         if not context.args:
-            await self._render_plain_menu(update, "Usage: /capital_target <target_equity> [tolerance]\nExample: /capital_target 500 10")
+            await self._render_plain_menu(update, "Usage: /capital_target <target_equity> [absolute_tolerance] [target_tolerance_pct]\nExample: /capital_target 500 10 0")
             return
         try:
             target = float(context.args[0])
             tolerance = float(context.args[1]) if len(context.args) > 1 else float(self.settings.capital_reduction_tolerance)
+            tolerance_pct = float(context.args[2]) if len(context.args) > 2 else float(self.settings.capital_reduction_tolerance_pct)
         except ValueError:
-            await self._render_plain_menu(update, "Target and tolerance must be numeric values. Example: /capital_target 500 10")
+            await self._render_plain_menu(update, "Target and tolerance values must be numeric. Example: /capital_target 500 10 0")
             return
-        if target <= 0 or tolerance < 0:
-            await self._render_plain_menu(update, "Target must be positive and tolerance cannot be negative.")
+        if target <= 0 or tolerance < 0 or tolerance_pct < 0:
+            await self._render_plain_menu(update, "Target must be positive and tolerance values cannot be negative.")
             return
         self.settings.capital_reduction_target = target
         self.settings.capital_reduction_tolerance = tolerance
+        self.settings.capital_reduction_tolerance_pct = tolerance_pct
         await db.save_settings(self.settings)
-        await self._render_plain_menu(update, f"Capital-reduction target saved: {target:,.2f} ± {tolerance:,.2f}. No broker trade was placed. Use /capital_start to request the DEMO-only confirmation prompt.", keyboards.capital_test_menu())
+        effective = max(tolerance, target * tolerance_pct / 100.0)
+        await self._render_plain_menu(update, f"Capital-reduction target saved: {target:,.2f} ± {effective:,.2f} effective tolerance (absolute {tolerance:,.2f}; target-relative {tolerance_pct:.2f}%). No broker trade was placed. Use /capital_start to request the DEMO-only confirmation prompt.", keyboards.capital_test_menu())
 
     @admin_only
     async def cmd_capital_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1020,7 +1023,7 @@ class BotHandlers:
             return
         target = self.settings.capital_reduction_target
         if target is None:
-            await self._render_plain_menu(update, "Set a target first: /capital_target <target_equity> [tolerance]")
+            await self._render_plain_menu(update, "Set a target first: /capital_target <target_equity> [absolute_tolerance] [target_tolerance_pct]")
             return
         account = await self.executor.get_account_info()
         broker_mode = str((account or {}).get("broker_account_mode") or "unknown").lower()
@@ -1031,9 +1034,10 @@ class BotHandlers:
         if not account or target >= equity:
             await self._render_plain_menu(update, f"CAPITAL REDUCTION BLOCKED\nTarget must be below current actual DEMO equity. Current equity: {equity:,.2f}; target: {target:,.2f}.")
             return
+        effective_tolerance = max(float(self.settings.capital_reduction_tolerance), float(target) * float(self.settings.capital_reduction_tolerance_pct) / 100.0)
         text = "\n".join([
             "⚠️ DELIBERATE DEMO DRAWDOWN",
-            f"You are requesting deliberate reduction of the actual DEMO account toward {target:,.2f} ± {self.settings.capital_reduction_tolerance:,.2f}.",
+            f"You are requesting deliberate reduction of the actual DEMO account toward {target:,.2f} ± {effective_tolerance:,.2f} effective tolerance.",
             f"Current actual MT5 equity: {equity:,.2f}",
             f"Maximum intended reduction before tolerance: approximately {equity - target:,.2f}",
             "This is DEMO-only. LIVE activation is blocked by both local mode and direct MT5 broker-mode verification.",
@@ -1051,7 +1055,7 @@ class BotHandlers:
         if not engine or self.settings.capital_reduction_target is None:
             await self._render_plain_menu(update, "Capital reduction cannot start: scheduler or target is unavailable.")
             return
-        result = await engine.start(self.settings.capital_reduction_target, self.settings.capital_reduction_tolerance)
+        result = await engine.start(self.settings.capital_reduction_target, self.settings.capital_reduction_tolerance, self.settings.capital_reduction_tolerance_pct)
         if not result.get("ok"):
             await self._render_plain_menu(update, f"CAPITAL REDUCTION NOT STARTED\n{result.get('reason', 'Unknown error')}", keyboards.capital_test_menu())
             return
@@ -1059,7 +1063,7 @@ class BotHandlers:
             "🔥 CAPITAL REDUCTION MODE ACTIVE",
             f"Session: #{result['session_id']}",
             f"Initial actual DEMO equity: {result['initial_equity']:,.2f}",
-            f"Target equity: {result['target_equity']:,.2f} ± {result['tolerance']:,.2f}",
+            f"Target equity: {result['target_equity']:,.2f} ± {max(result['tolerance'], result['target_equity'] * self.settings.capital_reduction_tolerance_pct / 100.0):,.2f} effective tolerance",
             "The scheduler will use only broker-verified DEMO data and isolated CAPITAL_REDUCTION activity records. These actions are excluded from strategy learning.",
         ]), keyboards.capital_test_menu(True))
 

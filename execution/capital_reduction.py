@@ -27,6 +27,8 @@ class ReductionPlan:
     expected_loss: float
     loss_per_lot: float
     required_margin: float
+    minimum_loss: float = 0.0
+    maximum_reduction: float = 0.0
 
 
 class CapitalReductionEngine:
@@ -70,20 +72,40 @@ class CapitalReductionEngine:
         decimals = max(2, int(round(-math.log10(step))) + 2) if step < 1 else 2
         return round(floored, decimals)
 
-    async def _plan_round_trip(self, account: dict, remaining: float, tolerance: float) -> tuple[Optional[ReductionPlan], str]:
-        """Choose a deterministic broker-valid spread-cost action without guessing symbols."""
-        target_loss = max(0.0, remaining - tolerance)
-        if target_loss <= 0:
-            return None, "Target tolerance reached"
+    @staticmethod
+    def _effective_tolerance(target: float, absolute_tolerance: float, percent_tolerance: float) -> float:
+        """Use the larger configured absolute or target-relative DEMO tolerance."""
+        return max(0.0, float(absolute_tolerance), max(0.0, float(target)) * max(0.0, float(percent_tolerance)) / 100.0)
+
+    async def _plan_round_trip(self, account: dict, remaining: float, tolerance: float) -> tuple[Optional[ReductionPlan], str, dict]:
+        """Choose one broker-valid sequential action and retain rejection evidence.
+
+        A reduction session intentionally performs at most one round trip here.
+        The next scheduled pass rereads the actual broker equity and plans again;
+        it never assumes the expected spread cost is the realized account change.
+        """
+        desired_loss = max(0.0, remaining - tolerance)
+        diagnostics: dict = {"remaining_reduction": remaining, "effective_tolerance": tolerance, "desired_reduction": desired_loss, "candidates": []}
+        if desired_loss <= 0:
+            return None, "Target tolerance reached", diagnostics
         leverage = max(1.0, self._number(account.get("leverage"), 1.0))
         free_margin = max(0.0, self._number(account.get("free_margin")))
         candidates: list[ReductionPlan] = []
+        rejections: list[dict] = []
         for symbol in list(self.settings.enabled_symbols):
-            info = await self.executor.get_symbol_info(symbol)
-            bid, ask = await self.executor.get_symbol_price(symbol)
+            diagnostic: dict = {"symbol": symbol}
+            try:
+                info = await self.executor.get_symbol_info(symbol)
+                bid, ask = await self.executor.get_symbol_price(symbol)
+            except Exception as exc:
+                diagnostic.update({"status": "rejected", "reason": f"broker metadata/price request failed: {type(exc).__name__}"})
+                rejections.append(diagnostic)
+                continue
             bid, ask = self._number(bid), self._number(ask)
-            tick_time = self._number(info.get("last_tick_time"))
+            tick_time = self._number((info or {}).get("last_tick_time"))
             if tick_time <= 0 or time.time() - tick_time > self.MAX_TICK_AGE_SECONDS:
+                diagnostic.update({"status": "rejected", "reason": "stale or unavailable broker tick"})
+                rejections.append(diagnostic)
                 continue
             tick_size = self._number(info.get("tick_size") or info.get("pip_size"))
             tick_value = self._number(info.get("tick_value"), 0.0)
@@ -92,36 +114,60 @@ class CapitalReductionEngine:
             maximum = self._number(info.get("max_lot"), 0.0)
             step = self._number(info.get("step_lot"), 0.0)
             if not (ask > bid > 0 and tick_size > 0 and tick_value > 0 and contract_size > 0 and minimum > 0 and maximum >= minimum and step > 0):
+                diagnostic.update({"status": "rejected", "reason": "incomplete broker volume/price/contract specification"})
+                rejections.append(diagnostic)
                 continue
             loss_per_lot = (ask - bid) / tick_size * tick_value
             margin_per_lot = ask * contract_size / leverage
             if loss_per_lot <= 0 or margin_per_lot <= 0:
+                diagnostic.update({"status": "rejected", "reason": "non-positive broker loss or margin calculation"})
+                rejections.append(diagnostic)
                 continue
-            # The target determines desired notional loss; free margin is a
-            # broker integrity constraint. No fixed exposure/risk policy is used.
-            desired_volume = target_loss / loss_per_lot
-            margin_capacity = free_margin / margin_per_lot
-            volume = self._floor_volume(min(desired_volume, margin_capacity), minimum, maximum, step)
+            margin_capacity = self._floor_volume(free_margin / margin_per_lot, minimum, maximum, step)
+            minimum_loss = minimum * loss_per_lot
+            diagnostic.update({"minimum_volume": minimum, "volume_step": step, "minimum_loss": minimum_loss, "minimum_margin": minimum * margin_per_lot, "maximum_margin_valid_volume": margin_capacity})
+            if margin_capacity <= 0:
+                diagnostic.update({"status": "rejected", "reason": "insufficient free margin for broker minimum volume"})
+                rejections.append(diagnostic)
+                continue
+            # A minimum lot can be a valid final sequential action only when it
+            # stays inside the target's lower tolerance boundary.
+            if minimum_loss > remaining + tolerance + 1e-8:
+                diagnostic.update({"status": "rejected", "reason": "broker minimum-volume loss would cross below target tolerance", "overshoot": minimum_loss - remaining})
+                rejections.append(diagnostic)
+                continue
+            requested_volume = max(minimum, desired_loss / loss_per_lot)
+            volume = self._floor_volume(min(requested_volume, margin_capacity), minimum, maximum, step)
             if volume <= 0:
+                diagnostic.update({"status": "rejected", "reason": "no broker-valid volume after minimum/step rounding"})
+                rejections.append(diagnostic)
                 continue
             expected_loss = volume * loss_per_lot
-            # Do not knowingly cross below the lower tolerance boundary because
-            # of one irreducible broker minimum-volume action.
             if expected_loss > remaining + tolerance + 1e-8:
+                diagnostic.update({"status": "rejected", "reason": "rounded broker volume would cross below target tolerance", "overshoot": expected_loss - remaining})
+                rejections.append(diagnostic)
                 continue
+            diagnostic.update({"status": "eligible", "volume": volume, "expected_loss": expected_loss, "required_margin": volume * margin_per_lot})
             candidates.append(ReductionPlan(
                 symbol=symbol, direction="BUY", volume=volume, entry_price=ask,
                 expected_loss=expected_loss, loss_per_lot=loss_per_lot,
-                required_margin=volume * margin_per_lot,
+                required_margin=volume * margin_per_lot, minimum_loss=minimum_loss,
+                maximum_reduction=margin_capacity * loss_per_lot,
             ))
+        diagnostics["candidates"] = rejections
         if not candidates:
-            return None, "No enabled broker instrument can make a valid non-overshooting reduction action with current margin and volume constraints"
-        # Deterministic ranking: maximize expected loss reduction, then stable
-        # lexical symbol order. This is not a random trade selector.
+            best = min(rejections, key=lambda item: float(item.get("overshoot") or float("inf"))) if rejections else None
+            diagnostics["best_candidate"] = best
+            return None, "No broker-valid action can reduce the remaining amount within the configured target/tolerance constraints", diagnostics
+        # Prefer the action closest to the remaining desired reduction. This
+        # makes large reductions sequential (bounded by broker volume/margin)
+        # and allows a valid minimum-volume final action inside tolerance.
         candidates.sort(key=lambda item: (-item.expected_loss, item.symbol))
-        return candidates[0], ""
+        chosen = candidates[0]
+        diagnostics["best_candidate"] = {"symbol": chosen.symbol, "volume": chosen.volume, "expected_loss": chosen.expected_loss, "required_margin": chosen.required_margin, "minimum_loss": chosen.minimum_loss, "maximum_reduction": chosen.maximum_reduction}
+        return chosen, "", diagnostics
 
-    async def start(self, target_equity: float, tolerance: float) -> dict:
+    async def start(self, target_equity: float, tolerance: float, tolerance_percent: float = 0.0) -> dict:
         """Create an explicit session after caller confirmation; never starts on LIVE."""
         async with self._lock:
             active = await db.get_active_capital_reduction_session("demo")
@@ -134,16 +180,17 @@ class CapitalReductionEngine:
             balance = self._number(account.get("balance"))
             target_equity = self._number(target_equity)
             tolerance = self._number(tolerance)
-            if target_equity <= 0 or tolerance < 0 or target_equity >= equity:
+            tolerance_percent = self._number(tolerance_percent)
+            if target_equity <= 0 or tolerance < 0 or tolerance_percent < 0 or target_equity >= equity:
                 return {"ok": False, "reason": "Target must be positive and below current actual DEMO equity; tolerance must be non-negative"}
             session_id = await db.create_capital_reduction_session(
                 broker_login=str(account.get("login") or ""), target_equity=target_equity,
                 tolerance=tolerance, initial_equity=equity, initial_balance=balance,
-                account_mode="demo", metadata={"purpose": "DELIBERATE_DEMO_CAPITAL_REDUCTION", "broker_mode": account.get("broker_account_mode")},
+                account_mode="demo", metadata={"purpose": "DELIBERATE_DEMO_CAPITAL_REDUCTION", "broker_mode": account.get("broker_account_mode"), "tolerance_percent": tolerance_percent},
             )
             await db.record_capital_reduction_action(
-                session_id=session_id, action="session_started", status="active",
-                equity_before=equity, details={"target_equity": target_equity, "tolerance": tolerance, "required_reduction": equity - target_equity},
+                session_id=session_id, action="session_started", status="searching",
+                equity_before=equity, details={"target_equity": target_equity, "absolute_tolerance": tolerance, "tolerance_percent": tolerance_percent, "effective_tolerance": self._effective_tolerance(target_equity, tolerance, tolerance_percent), "required_reduction": equity - target_equity},
             )
             self._consecutive_failures = 0
             return {"ok": True, "session_id": session_id, "initial_equity": equity, "initial_balance": balance, "target_equity": target_equity, "tolerance": tolerance}
@@ -196,7 +243,13 @@ class CapitalReductionEngine:
         target = self._number(session.get("target_equity"))
         current = self._number(session.get("current_equity"), initial)
         intended = max(0.0, initial - target)
+        tolerance_pct = self._number((session.get("metadata") or {}).get("tolerance_percent"))
+        session["effective_tolerance"] = self._effective_tolerance(target, self._number(session.get("tolerance")), tolerance_pct)
         session["remaining"] = max(0.0, current - target)
+        terminal_state = {"completed": "COMPLETE", "blocked": "BLOCKED", "failed": "BLOCKED", "cancelled": "CANCELLED"}.get(str(session.get("status") or "").lower())
+        session["runtime_state"] = terminal_state or str((session.get("metadata") or {}).get("runtime_state") or "SEARCHING")
+        session["last_planning"] = (session.get("metadata") or {}).get("last_planning") or {}
+
         session["progress_pct"] = max(0.0, min(100.0, (initial - current) / intended * 100 if intended else 100.0))
         session["actions"] = await db.get_capital_reduction_actions(session["id"], limit=20)
         return session
@@ -217,18 +270,28 @@ class CapitalReductionEngine:
             equity = self._number(account.get("equity"))
             balance = self._number(account.get("balance"))
             target = self._number(session.get("target_equity"))
-            tolerance = self._number(session.get("tolerance"))
-            await db.update_capital_reduction_session(session["id"], current_equity=equity, current_balance=balance)
-            if equity <= target + tolerance:
+            tolerance = self._effective_tolerance(target, self._number(session.get("tolerance")), self._number((session.get("metadata") or {}).get("tolerance_percent")))
+            remaining = max(0.0, equity - target)
+            runtime_metadata = dict(session.get("metadata") or {})
+            runtime_metadata["runtime_state"] = "SEARCHING"
+            runtime_metadata["remaining_reduction"] = remaining
+            runtime_metadata["effective_tolerance"] = tolerance
+            await db.update_capital_reduction_session(session["id"], current_equity=equity, current_balance=balance, metadata=runtime_metadata)
+            if remaining <= tolerance:
                 await db.update_capital_reduction_session(session["id"], status="completed", current_equity=equity, current_balance=balance, capital_test_active=True, error_reason="Target tolerance reached")
                 await db.record_capital_reduction_action(session_id=session["id"], action="target_reached", status="completed", equity_before=equity, equity_after=equity)
                 return {"state": "completed", "session_id": session["id"], "equity": equity, "balance": balance}
 
-            plan, reason = await self._plan_round_trip(account, equity - target, tolerance)
+            plan, reason, diagnostic = await self._plan_round_trip(account, remaining, tolerance)
+            metadata = dict(runtime_metadata)
+            metadata["last_planning"] = diagnostic
             if not plan:
-                await db.update_capital_reduction_session(session["id"], status="paused", error_reason=reason)
-                await db.record_capital_reduction_action(session_id=session["id"], action="planning_blocked", status="paused", equity_before=equity, details={"reason": reason})
-                return {"state": "paused", "reason": reason, "session_id": session["id"]}
+                await db.update_capital_reduction_session(session["id"], status="blocked", error_reason=reason, metadata=metadata)
+                await db.record_capital_reduction_action(session_id=session["id"], action="planning_blocked", status="blocked", equity_before=equity, details={"reason": reason, **diagnostic})
+                return {"state": "blocked", "reason": reason, "session_id": session["id"], "remaining": remaining, "tolerance": tolerance, "best_candidate": diagnostic.get("best_candidate")}
+            metadata["runtime_state"] = "EXECUTING"
+            await db.update_capital_reduction_session(session["id"], error_reason="", metadata=metadata)
+            await db.record_capital_reduction_action(session_id=session["id"], action="planning_selected", status="executing", symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=plan.entry_price, equity_before=equity, details={"remaining": remaining, "effective_tolerance": tolerance, "expected_loss": plan.expected_loss, "required_margin": plan.required_margin, "minimum_loss": plan.minimum_loss, "maximum_reduction": plan.maximum_reduction})
 
             comment = f"{self.COMMENT_PREFIX}:{session['id']}"
             result = await self.executor.execute_trade(
@@ -270,6 +333,12 @@ class CapitalReductionEngine:
                     "closed_deals": (outcome or {}).get("closed_deals"),
                 },
             )
-            if refreshed:
-                await db.update_capital_reduction_session(session["id"], current_equity=equity_after, current_balance=balance_after)
-            return {"state": "round_trip_closed", "session_id": session["id"], "ticket": result.ticket, "expected_loss": plan.expected_loss, "equity_before": equity, "equity_after": equity_after}
+            remaining_after = max(0.0, equity_after - target) if equity_after is not None else None
+            waiting_metadata = dict(metadata)
+            waiting_metadata["runtime_state"] = "WAITING"
+            waiting_metadata["remaining_reduction"] = remaining_after
+            await db.update_capital_reduction_session(
+                session["id"], current_equity=equity_after if refreshed else None,
+                current_balance=balance_after if refreshed else None, metadata=waiting_metadata,
+            )
+            return {"state": "waiting", "session_id": session["id"], "ticket": result.ticket, "expected_loss": plan.expected_loss, "equity_before": equity, "equity_after": equity_after, "remaining_after": remaining_after, "effective_tolerance": tolerance}
