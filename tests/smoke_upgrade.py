@@ -26,6 +26,7 @@ from analysis.indicators import causal_swing_highs
 from analysis.liquidity import build_liquidity_pools
 from execution.manager import ManagementState, TradeManager
 from executors.base import Position
+from executors.mt5 import MT5Executor
 from risk.manager import RiskManager
 from storage import db
 from data.universe import DerivMarketUniverse
@@ -49,6 +50,26 @@ from bot.handlers import BotHandlers  # noqa: F401 — validates Telegram contro
 def assert_true(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def test_broker_stop_normalization() -> None:
+    buy = MT5Executor._normalise_protective_levels(
+        direction="BUY", bid=100.00, ask=100.10, sl=100.08, tp=100.12,
+        point=0.01, tick_size=0.01, digits=2, stops_level=10, freeze_level=0,
+    )
+    assert_true(buy["valid"] and buy["changed"], "BUY stops near ask were not normalized")
+    assert_true(buy["sl"] == 100.00 and buy["tp"] == 100.20 and buy["minimum_distance"] == 0.10, "BUY stops were not rounded away from ask by broker stop level")
+    sell = MT5Executor._normalise_protective_levels(
+        direction="SELL", bid=100.00, ask=100.10, sl=100.03, tp=99.97,
+        point=0.01, tick_size=0.01, digits=2, stops_level=5, freeze_level=20,
+    )
+    assert_true(sell["valid"] and sell["changed"], "SELL stops near bid were not normalized")
+    assert_true(sell["sl"] == 100.20 and sell["tp"] == 99.80 and sell["minimum_distance"] == 0.20, "SELL stops did not honor the larger freeze distance and tick rounding")
+    invalid = MT5Executor._normalise_protective_levels(
+        direction="BUY", bid=100.00, ask=100.10, sl=0.0, tp=100.20,
+        point=0.01, tick_size=0.01, digits=2, stops_level=10, freeze_level=0,
+    )
+    assert_true(not invalid["valid"] and "positive" in invalid["reason"], "missing SL/TP did not fail before order submission")
 
 
 def test_runtime_telemetry() -> None:
@@ -1038,6 +1059,7 @@ async def test_demo_live_partitioning() -> None:
 
 
 def run() -> None:
+    test_broker_stop_normalization()
     test_runtime_telemetry()
     test_full_precision_rr_validation()
     asyncio.run(test_single_flight_scan_guard())

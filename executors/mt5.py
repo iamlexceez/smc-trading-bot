@@ -11,7 +11,7 @@ If MT5 is not available, the bot logs a clear error and exits in live mode.
 from __future__ import annotations
 
 import logging
-from decimal import Decimal, ROUND_FLOOR, InvalidOperation
+from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -377,6 +377,8 @@ class MT5Executor(BaseExecutor):
         normalized_volume = self._normalise_broker_volume(volume_min, volume_min, volume_max, volume_step)
         result.update({
             "visible": bool(getattr(info, "visible", False)),
+            "trade_stops_level": getattr(info, "trade_stops_level", None),
+            "trade_freeze_level": getattr(info, "trade_freeze_level", None),
             "trade_mode": getattr(info, "trade_mode", None),
             "order_mode": getattr(info, "order_mode", None),
             "bid": bid, "ask": ask, "last": last,
@@ -415,6 +417,81 @@ class MT5Executor(BaseExecutor):
                     result["margin_error"] = f"MT5 order_calc_margin returned no data: {mt5.last_error()}"
         except Exception as exc:
             result["margin_error"] = f"MT5 order_calc_margin raised {type(exc).__name__}: {exc}"
+        return result
+
+    @staticmethod
+    def _round_to_tick(value: float, tick_size: float, digits: int, *, upward: bool) -> float:
+        """Round away from the current market price onto a broker price increment."""
+        value_d = Decimal(str(value))
+        tick_d = Decimal(str(tick_size))
+        if tick_d <= 0:
+            return round(float(value), max(0, int(digits)))
+        rounding = ROUND_CEILING if upward else ROUND_FLOOR
+        steps = (value_d / tick_d).to_integral_value(rounding=rounding)
+        return round(float(steps * tick_d), max(0, int(digits)))
+
+    @classmethod
+    def _normalise_protective_levels(
+        cls, *, direction: str, bid: float, ask: float, sl: float, tp: float,
+        point: float, tick_size: float, digits: int, stops_level: float, freeze_level: float,
+    ) -> dict:
+        """Normalize entry SL/TP away from the correct executable quote side.
+
+        The larger of MT5's stop and freeze distances is honored. Both values
+        are expressed in broker points, and every resulting price is rounded to
+        the advertised trade tick size in the direction away from market.
+        """
+        buy = str(direction).upper() != "SELL"
+        reference = ask if buy else bid
+        minimum_points = max(0.0, float(stops_level or 0.0), float(freeze_level or 0.0))
+        minimum_distance = minimum_points * float(point or 0.0)
+        if reference <= 0 or point <= 0 or tick_size <= 0:
+            return {"valid": False, "reason": "Missing positive broker quote, point, or tick size", "sl": sl, "tp": tp}
+        if sl <= 0 or tp <= 0:
+            return {"valid": False, "reason": "Protective SL and TP must both be positive", "sl": sl, "tp": tp}
+        original_sl, original_tp = float(sl), float(tp)
+        if buy:
+            normalized_sl = cls._round_to_tick(min(original_sl, reference - minimum_distance), tick_size, digits, upward=False)
+            normalized_tp = cls._round_to_tick(max(original_tp, reference + minimum_distance), tick_size, digits, upward=True)
+            valid = normalized_sl < reference and normalized_tp > reference
+        else:
+            normalized_sl = cls._round_to_tick(max(original_sl, reference + minimum_distance), tick_size, digits, upward=True)
+            normalized_tp = cls._round_to_tick(min(original_tp, reference - minimum_distance), tick_size, digits, upward=False)
+            valid = normalized_sl > reference and normalized_tp < reference
+        return {
+            "valid": bool(valid), "reason": "" if valid else "Normalized SL/TP remains on an invalid market side",
+            "sl": normalized_sl, "tp": normalized_tp, "changed": normalized_sl != original_sl or normalized_tp != original_tp,
+            "entry_price": reference, "bid": bid, "ask": ask, "point": point, "tick_size": tick_size,
+            "digits": digits, "trade_stops_level": stops_level, "trade_freeze_level": freeze_level,
+            "minimum_distance": minimum_distance,
+        }
+
+    async def validate_market_order_stops(self, symbol: str, direction: str, sl: float, tp: float) -> dict:
+        """Read fresh MT5 constraints and normalize an entry order's SL/TP without submitting it."""
+        result = {"available": False, "symbol": symbol, "direction": direction, "sl": sl, "tp": tp}
+        if not MT5_AVAILABLE:
+            result["reason"] = "MetaTrader5 package not available"
+            return result
+        if not await self._ensure_connected():
+            result["reason"] = f"MT5 not connected: {mt5.last_error()}"
+            return result
+        if not mt5.symbol_select(symbol, True):
+            result["reason"] = f"MT5 symbol_select failed: {mt5.last_error()}"
+            return result
+        info = mt5.symbol_info(symbol)
+        tick = mt5.symbol_info_tick(symbol)
+        if info is None or tick is None:
+            result["reason"] = f"MT5 symbol metadata/tick unavailable: {mt5.last_error()}"
+            return result
+        result = self._normalise_protective_levels(
+            direction=direction, bid=float(getattr(tick, "bid", 0.0) or 0.0), ask=float(getattr(tick, "ask", 0.0) or 0.0),
+            sl=float(sl), tp=float(tp), point=float(getattr(info, "point", 0.0) or 0.0),
+            tick_size=float(getattr(info, "trade_tick_size", getattr(info, "point", 0.0)) or 0.0),
+            digits=int(getattr(info, "digits", 0) or 0),
+            stops_level=float(getattr(info, "trade_stops_level", 0.0) or 0.0),
+            freeze_level=float(getattr(info, "trade_freeze_level", 0.0) or 0.0),
+        )
+        result.update({"available": True, "symbol": symbol, "direction": direction})
         return result
 
     async def get_broker_margin_for_volume(
@@ -612,6 +689,19 @@ class MT5Executor(BaseExecutor):
             return ExecutionResult(success=False, message=f"No tick for {symbol}")
 
         price = tick.ask if direction == "BUY" else tick.bid
+        stop_check = self._normalise_protective_levels(
+            direction=direction, bid=float(getattr(tick, "bid", 0.0) or 0.0), ask=float(getattr(tick, "ask", 0.0) or 0.0),
+            sl=float(sl), tp=float(tp), point=float(getattr(info, "point", 0.0) or 0.0),
+            tick_size=float(getattr(info, "trade_tick_size", getattr(info, "point", 0.0)) or 0.0),
+            digits=int(getattr(info, "digits", 0) or 0),
+            stops_level=float(getattr(info, "trade_stops_level", 0.0) or 0.0),
+            freeze_level=float(getattr(info, "trade_freeze_level", 0.0) or 0.0),
+        )
+        if not stop_check.get("valid"):
+            return ExecutionResult(success=False, message=f"Pre-submit broker stop validation failed: {stop_check.get('reason')}", entry_price=float(price or 0.0), sl=float(sl), tp=float(tp), lot_size=float(lot_size))
+        sl, tp = float(stop_check["sl"]), float(stop_check["tp"])
+        if stop_check.get("changed"):
+            logger.info("Broker-normalized entry stops for %s %s: sl=%s tp=%s minimum_distance=%s", symbol, direction, sl, tp, stop_check.get("minimum_distance"))
 
         # Determine filling mode dynamically
         filling_mode = mt5.ORDER_FILLING_IOC
@@ -639,7 +729,36 @@ class MT5Executor(BaseExecutor):
             "type_filling": filling_mode,
         }
 
+        # MT5 validates the exact server-side stop rules without submitting an
+        # order. This catches broker-specific constraints beyond symbol_info.
+        check = mt5.order_check(request)
+        if check is None:
+            return ExecutionResult(success=False, message=f"Pre-submit MT5 order_check returned None: {mt5.last_error()}", entry_price=float(price or 0.0), sl=sl, tp=tp, lot_size=float(lot_size))
+        if check.retcode != mt5.TRADE_RETCODE_DONE:
+            return ExecutionResult(success=False, message=f"Pre-submit MT5 order_check failed: retcode={check.retcode}, comment={check.comment}", entry_price=float(price or 0.0), sl=sl, tp=tp, lot_size=float(lot_size))
+
         result = mt5.order_send(request)
+        invalid_stops_code = getattr(mt5, "TRADE_RETCODE_INVALID_STOPS", 10016)
+        if result is not None and result.retcode == invalid_stops_code:
+            # A quote can move after order_check. Re-read the broker quote and
+            # retry once with freshly normalized levels; never loop or force it.
+            latest_info = mt5.symbol_info(symbol)
+            latest_tick = mt5.symbol_info_tick(symbol)
+            if latest_info is not None and latest_tick is not None:
+                retry = self._normalise_protective_levels(
+                    direction=direction, bid=float(getattr(latest_tick, "bid", 0.0) or 0.0), ask=float(getattr(latest_tick, "ask", 0.0) or 0.0),
+                    sl=sl, tp=tp, point=float(getattr(latest_info, "point", 0.0) or 0.0),
+                    tick_size=float(getattr(latest_info, "trade_tick_size", getattr(latest_info, "point", 0.0)) or 0.0),
+                    digits=int(getattr(latest_info, "digits", 0) or 0),
+                    stops_level=float(getattr(latest_info, "trade_stops_level", 0.0) or 0.0),
+                    freeze_level=float(getattr(latest_info, "trade_freeze_level", 0.0) or 0.0),
+                )
+                if retry.get("valid"):
+                    request.update({"price": float(retry["entry_price"]), "sl": float(retry["sl"]), "tp": float(retry["tp"])})
+                    retry_check = mt5.order_check(request)
+                    if retry_check is not None and retry_check.retcode == mt5.TRADE_RETCODE_DONE:
+                        result = mt5.order_send(request)
+                        sl, tp, price = float(retry["sl"]), float(retry["tp"]), float(retry["entry_price"])
 
         if result is None:
             return ExecutionResult(success=False, message=f"order_send returned None: {mt5.last_error()}")
@@ -778,19 +897,45 @@ class MT5Executor(BaseExecutor):
             return False
 
         pos = positions[0]
-        
+
         # If no changes requested, return True
         if (sl is None or sl == pos.sl) and (tp is None or tp == pos.tp):
             return True
 
+        desired_sl = float(sl) if sl is not None else float(pos.sl or 0.0)
+        desired_tp = float(tp) if tp is not None else float(pos.tp or 0.0)
+        if not mt5.symbol_select(pos.symbol, True):
+            logger.error("modify_position symbol_select failed for #%s: %s", ticket, mt5.last_error())
+            return False
+        info = mt5.symbol_info(pos.symbol)
+        tick = mt5.symbol_info_tick(pos.symbol)
+        direction = "BUY" if int(getattr(pos, "type", -1)) == getattr(mt5, "POSITION_TYPE_BUY", 0) else "SELL"
+        if info is None or tick is None:
+            logger.error("modify_position metadata/tick unavailable for #%s: %s", ticket, mt5.last_error())
+            return False
+        stop_check = self._normalise_protective_levels(
+            direction=direction, bid=float(getattr(tick, "bid", 0.0) or 0.0), ask=float(getattr(tick, "ask", 0.0) or 0.0),
+            sl=desired_sl, tp=desired_tp, point=float(getattr(info, "point", 0.0) or 0.0),
+            tick_size=float(getattr(info, "trade_tick_size", getattr(info, "point", 0.0)) or 0.0),
+            digits=int(getattr(info, "digits", 0) or 0),
+            stops_level=float(getattr(info, "trade_stops_level", 0.0) or 0.0),
+            freeze_level=float(getattr(info, "trade_freeze_level", 0.0) or 0.0),
+        )
+        if not stop_check.get("valid"):
+            logger.error("modify_position pre-submit broker stop validation failed for #%s: %s", ticket, stop_check.get("reason"))
+            return False
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": ticket,
-            "sl": float(sl) if sl is not None else pos.sl,
-            "tp": float(tp) if tp is not None else pos.tp,
+            "sl": float(stop_check["sl"]),
+            "tp": float(stop_check["tp"]),
             "magic": pos.magic,
         }
 
+        check = mt5.order_check(request)
+        if check is None or check.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error("modify_position pre-submit MT5 order_check failed for #%s: %s", ticket, mt5.last_error() if check is None else check.comment)
+            return False
         result = mt5.order_send(request)
         if result is None:
             logger.error(f"modify_position order_send returned None: {mt5.last_error()}")

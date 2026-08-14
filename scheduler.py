@@ -1288,6 +1288,53 @@ class MarketScheduler:
             consecutive_losses = await db.get_consecutive_losses(account_mode=self.settings.trading_mode)
             open_positions = await self.executor.get_open_positions()
             sym_info = await self._execution_symbol_spec(symbol, signal.direction)
+            stop_preflight = await self.executor.validate_market_order_stops(
+                symbol, signal.direction, signal.stop_loss, signal.take_profit
+            )
+            if stop_preflight.get("available"):
+                if not stop_preflight.get("valid"):
+                    signal.passed = False
+                    signal.rejection_reason = f"Broker stop validation failed: {stop_preflight.get('reason') or 'invalid protective levels'}"
+                    self.telemetry.record_rejection(signal.rejection_reason)
+                    if setup_id is not None:
+                        await db.update_setup_record(setup_id, status="broker_stop_rejected", rejection_reason=signal.rejection_reason)
+                        await db.record_execution_event(
+                            account_mode=self.settings.trading_mode, symbol=symbol, setup_id=setup_id,
+                            status="broker_stop_rejected", requested_price=signal.entry_price,
+                            reason=signal.rejection_reason, details={"broker_stop_preflight": stop_preflight},
+                        )
+                    await self._chart_activity(
+                        "execution_rejected", symbol,
+                        f"⛔ **BROKER STOP BLOCK — {symbol}**\nReason: `{signal.rejection_reason}`\nBroker constraints were checked before order submission. No order was sent.",
+                        fingerprint=f"{setup_id}:broker-stop:{stop_preflight.get('reason')}", essential=True,
+                    )
+                    return False
+                original_levels = (signal.entry_price, signal.stop_loss, signal.take_profit)
+                signal.entry_price = float(stop_preflight.get("entry_price") or signal.entry_price)
+                signal.stop_loss = float(stop_preflight.get("sl") or signal.stop_loss)
+                signal.take_profit = float(stop_preflight.get("tp") or signal.take_profit)
+                risk_distance = abs(signal.entry_price - signal.stop_loss)
+                reward_distance = abs(signal.take_profit - signal.entry_price)
+                signal.rr_ratio = reward_distance / risk_distance if risk_distance > 0 else 0.0
+                if stop_preflight.get("changed"):
+                    await self._chart_activity(
+                        "broker_stop_normalized", symbol,
+                        f"📐 **BROKER STOPS NORMALIZED — {symbol}**\nEntry side price: `{signal.entry_price:.8g}` | SL: `{signal.stop_loss:.8g}` | TP: `{signal.take_profit:.8g}`\nMinimum broker distance: `{float(stop_preflight.get('minimum_distance') or 0.0):.8g}` | Actual RR after normalization: `1:{signal.rr_ratio:.4f}`",
+                        fingerprint=f"{setup_id}:broker-stop-normalized:{signal.stop_loss}:{signal.take_profit}", essential=True,
+                    )
+                signal_rr_floor = self._objective_min_rr()
+                if signal_rr_floor > 0 and signal.rr_ratio < signal_rr_floor:
+                    signal.passed = False
+                    signal.rejection_reason = "RR fell below the configured minimum after broker stop normalization"
+                    self.telemetry.record_rejection(signal.rejection_reason)
+                    if setup_id is not None:
+                        await db.update_setup_record(setup_id, status="broker_stop_rejected", rejection_reason=signal.rejection_reason)
+                    await self._chart_activity(
+                        "execution_rejected", symbol,
+                        f"⛔ **BROKER STOP / RR BLOCK — {symbol}**\nActual RR after broker-normalized stops: `1:{signal.rr_ratio:.4f}` | Required minimum: `1:{signal_rr_floor:.4f}`\nNo order was submitted.",
+                        fingerprint=f"{setup_id}:broker-stop-rr:{signal.rr_ratio:.8f}", essential=True,
+                    )
+                    return False
             pip = sym_info.get("pip_size", pip_value(symbol))
             spread = sym_info.get("spread", 0) * pip
 
@@ -1357,6 +1404,7 @@ class MarketScheduler:
                                 "fixed_volume": signal.experimental_policy.get("fixed_volume"),
                                 "experimental_policy": dict(signal.experimental_policy),
                                 "broker_spec": sym_info,
+                                "broker_stop_preflight": stop_preflight,
                             },
                         },
                     )

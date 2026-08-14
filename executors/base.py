@@ -103,6 +103,16 @@ class BaseExecutor(ABC):
         """
         return {}
 
+    async def validate_market_order_stops(
+        self, symbol: str, direction: str, sl: float, tp: float
+    ) -> dict:
+        """Return broker-normalized protective levels before a market order.
+
+        Executors without broker stop metadata return ``available=False`` so
+        callers retain their existing behavior rather than inventing limits.
+        """
+        return {"available": False, "symbol": symbol, "direction": direction, "sl": sl, "tp": tp}
+
     async def get_broker_margin_for_volume(
         self, symbol: str, direction: str, volume: float, price: float | None = None
     ) -> dict:
