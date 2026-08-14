@@ -27,6 +27,7 @@ from analysis.scoring import TradeSignal, format_signal_report
 from analysis.indicators import pip_value, atr
 from strategy.setup_scorer import score_setup_quality
 from strategy.setup_validator import EntryMode, SetupValidator
+from strategy.selection import evaluate_strategies
 from analysis.sessions import check_trading_session
 from analysis.confirmation import get_confirmation
 from analysis.liquidity import build_liquidity_pools, select_market_target
@@ -1093,6 +1094,26 @@ class MarketScheduler:
             "ltf_confirmation": checks.get("LTF confirmation", False),
         }
 
+    @staticmethod
+    def _strategy_observed_features(features: dict) -> set[str]:
+        """Map already-observed setup features to declarative registry requirements."""
+        observed: set[str] = set()
+        if features.get("liquidity_sweep"):
+            observed.add("liquidity_sweep")
+        if features.get("directional_displacement"):
+            observed.add("displacement")
+        if features.get("structure_event") or features.get("bos_choch"):
+            observed.add("structure_event")
+        if features.get("zone_retest") or features.get("zone_supply_demand") or features.get("zone_order_block") or features.get("zone_fvg"):
+            observed.add("zone")
+        if features.get("zone_order_block"):
+            observed.add("order_block")
+        if features.get("zone_fvg"):
+            observed.add("fvg")
+        if features.get("htf_context"):
+            observed.add("htf_alignment")
+        return observed
+
     async def _evaluate_counterfactuals(self, symbol: str, timeframe: str, df) -> None:
         """Resolve rejected setups only with candles that closed after detection.
 
@@ -1342,6 +1363,41 @@ class MarketScheduler:
             rr_reference=required_rr,
         )
         features = self._feature_snapshot(df, structure, htf_structures, float(atr_val), validation)
+        observed_features = self._strategy_observed_features(features)
+        regime = str(regime_context.get("regime") or "UNKNOWN")
+        context_evidence = await db.get_strategy_evidence_for_context(
+            self.settings.trading_mode, symbol, regime, primary_tf
+        )
+        strategy_assessments = evaluate_strategies(
+            regime=regime,
+            timeframe=primary_tf,
+            observed_features=observed_features,
+            setup_quality=quality.score,
+            evidence_by_strategy=context_evidence,
+        )
+        if strategy_assessments:
+            selected_assessment = strategy_assessments[0]
+            selected_strategy = selected_assessment.identifier
+            strategy_score = selected_assessment.score
+            strategy_evidence = dict(context_evidence.get(selected_strategy) or {
+                "sample_size": selected_assessment.sample_size,
+                "expectancy_r": selected_assessment.expectancy_r,
+                "confidence": selected_assessment.confidence,
+            })
+        else:
+            # A setup remains an observable candidate; lack of a registry fit is
+            # reported as uncertainty, never hidden or reclassified as evidence.
+            selected_assessment = None
+            selected_strategy = "unclassified_observation"
+            strategy_score = 0.0
+            strategy_evidence = {"sample_size": 0, "expectancy_r": None, "confidence": "UNKNOWN"}
+        if setup_id is not None:
+            await db.update_setup_record(
+                setup_id,
+                setup_type=selected_strategy,
+                strategy_id=selected_strategy,
+                regime=regime,
+            )
         policy_ok, policy_reason = policy.accepts(
             score=quality.score, rr_ratio=validation.rr_ratio, features=features,
         )
@@ -1376,7 +1432,7 @@ class MarketScheduler:
             zones=zones,
             timeframe=primary_tf,
             entry_mode=policy.entry_model,
-            setup_type="Experimental Market Candidate",
+            setup_type=selected_strategy,
             created_at=datetime.utcnow().isoformat(),
             expires_at=(datetime.utcnow() + timedelta(minutes=self.settings.max_signal_age_minutes)).isoformat(),
             validation=validation,
@@ -1393,6 +1449,16 @@ class MarketScheduler:
         # not an independent entry trigger and is retained with the final thesis.
         signal.market_context = regime_context
         signal.symbol_profile = profile
+        signal.htf_bias = [item.trend.value for item in htf_structures]
+        signal.selected_strategy = selected_strategy
+        signal.strategy_score = strategy_score
+        signal.strategy_evidence = strategy_evidence
+        signal.strategy_assessments = [assessment.__dict__ for assessment in strategy_assessments]
+        signal.registry_observed_features = sorted(observed_features)
+        signal.layering_suitable = bool(
+            selected_strategy == "layered_continuation"
+            and str(strategy_evidence.get("confidence") or "UNKNOWN") in {"PROMISING", "VALIDATED", "STRONG_EVIDENCE"}
+        )
         return signal
 
     async def scan_markets(self) -> list[TradeSignal]:
@@ -1999,10 +2065,14 @@ class MarketScheduler:
             thesis = {
                 "rank": rank, "classification": opportunity.classification, "opportunity_score": opportunity.score,
                 "instrument": signal.symbol, "regime": opportunity.context.get("regime", "UNKNOWN"),
-                "strategy": signal.setup_type, "direction": signal.direction, "entry": signal.entry_price,
+                "strategy": getattr(signal, "selected_strategy", signal.setup_type), "direction": signal.direction, "entry": signal.entry_price,
                 "invalidation": signal.stop_loss, "target": signal.take_profit, "expected_rr": signal.rr_ratio,
-                "historical_evidence": historical.get(signal.symbol, {}), "current_confirmation": list(opportunity.rationale),
-                "portfolio_conflict": opportunity.portfolio_conflict,
+                "setup_score": signal.score, "strategy_score": getattr(signal, "strategy_score", 0.0),
+                "historical_evidence": dict(getattr(signal, "strategy_evidence", {}) or {}),
+                "current_confirmation": list(opportunity.rationale), "strategy_assessments": list(getattr(signal, "strategy_assessments", []) or []),
+                "observed_features": list(getattr(signal, "registry_observed_features", []) or []),
+                "layering_suitability": bool(getattr(signal, "layering_suitable", False)),
+                "portfolio_conflict": opportunity.portfolio_conflict, "opportunity_board": dict(opportunity.details),
             }
             signal.opportunity_thesis = thesis
             if signal.setup_id is not None:
@@ -2013,7 +2083,8 @@ class MarketScheduler:
                 )
         self.last_opportunity_ranking = [
             {"symbol": item.symbol, "score": item.score, "classification": item.classification,
-             "rationale": list(item.rationale), "context": dict(item.context), "portfolio_conflict": item.portfolio_conflict}
+             "rationale": list(item.rationale), "context": dict(item.context),
+             "portfolio_conflict": item.portfolio_conflict, "details": dict(item.details)}
             for item in ranked
         ]
         best = ranked[0]
@@ -2021,7 +2092,7 @@ class MarketScheduler:
         logger.info("[OPPORTUNITY RANKING] candidates=%s selected=%s score=%.2f regime=%s", len(ranked), best.symbol, best.score, best.context.get("regime"))
         await self._chart_activity(
             "best_opportunity", selected.symbol,
-            f"🎯 **BEST CURRENT OPPORTUNITY — {selected.symbol}**\nRank: `1/{len(ranked)}` | Opportunity score: `{best.score:.1f}`\nRegime: `{best.context.get('regime', 'UNKNOWN')}` | Direction: `{selected.direction}`\nThesis: {'; '.join(best.rationale)}\nOnly this strongest current thesis proceeds to final broker and portfolio validation.",
+            f"🎯 **BEST CURRENT OPPORTUNITY — {selected.symbol}**\nRank: `1/{len(ranked)}` | Opportunity score: `{best.score:.1f}`\nRegime: `{best.context.get('regime', 'UNKNOWN')}` | Strategy: `{getattr(selected, 'selected_strategy', selected.setup_type)}`\nDirection: `{selected.direction}` | Strategy evidence: `{dict(getattr(selected, 'strategy_evidence', {}) or {}).get('confidence', 'UNKNOWN')}`\nThesis: {'; '.join(best.rationale)}\nOnly this strongest current thesis proceeds to final broker and portfolio validation.",
             fingerprint=f"{selected.setup_id}:opportunity:{best.score:.4f}",
         )
         primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"
@@ -2358,6 +2429,28 @@ class MarketScheduler:
                         "max_adverse_r": trade.get("max_adverse_r", 0.0),
                     },
                 )
+                setup = await db.get_setup_record(int(setup_id))
+                if setup and setup.get("strategy_id") and setup.get("regime") and pnl_r is not None:
+                    evidence = await db.upsert_strategy_evidence(
+                        self.settings.trading_mode,
+                        str(setup.get("symbol") or trade["symbol"]),
+                        str(setup["strategy_id"]),
+                        str(setup["regime"]),
+                        str(setup.get("timeframe") or ""),
+                        pnl_r=pnl_r,
+                        mae_r=float(trade.get("max_adverse_r") or 0.0),
+                        mfe_r=float(trade.get("max_favorable_r") or 0.0),
+                    )
+                    await db.record_execution_event(
+                        account_mode=self.settings.trading_mode,
+                        symbol=str(setup.get("symbol") or trade["symbol"]),
+                        setup_id=int(setup_id),
+                        trade_id=int(trade["id"]),
+                        ticket=int(ticket),
+                        status="strategy_evidence_updated",
+                        reason=str(evidence.get("confidence") or "UNKNOWN"),
+                        details={"strategy_evidence": evidence},
+                    )
 
     async def manage_open_positions(self):
         """Instrument real position-management checks and broker outcomes."""

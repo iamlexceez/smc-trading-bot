@@ -149,6 +149,8 @@ async def main():
         BotCommand("sizingtest", "Read-only full broker lot-size calculation for latest rejected setup"),
         BotCommand("engine", "Actual scheduler, scanner, analysis, execution, and task diagnostics"),
         BotCommand("learning", "Measured learning status"),
+        BotCommand("learned", "Plain-language objective and strategy evidence"),
+        BotCommand("opportunities", "Current ranked strategy opportunity board"),
         BotCommand("experiments", "Policy experiment lifecycle"),
         BotCommand("champion", "Current validated champion policy"),
         BotCommand("challengers", "Forward-DEMO challenger policies"),

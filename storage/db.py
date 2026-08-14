@@ -94,6 +94,28 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_mode TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                regime TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                trades INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                losses INTEGER NOT NULL DEFAULT 0,
+                expectancy_r REAL,
+                profit_factor REAL,
+                average_mae_r REAL,
+                average_mfe_r REAL,
+                max_drawdown_r REAL,
+                sample_size INTEGER NOT NULL DEFAULT 0,
+                confidence TEXT NOT NULL DEFAULT 'UNKNOWN',
+                updated_at TEXT NOT NULL,
+                UNIQUE(account_mode, symbol, strategy_id, regime, timeframe)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS execution_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
@@ -422,10 +444,13 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await _ensure_column(db, "trade_baskets", "objective_phase_id", "INTEGER")
         await _ensure_column(db, "setup_records", "policy_version", "TEXT")
         await _ensure_column(db, "setup_records", "experiment_id", "INTEGER")
+        await _ensure_column(db, "setup_records", "strategy_id", "TEXT")
+        await _ensure_column(db, "setup_records", "regime", "TEXT")
         await _ensure_column(db, "trade_baskets", "policy_version", "TEXT")
         await _ensure_column(db, "trade_baskets", "experiment_id", "INTEGER")
         await _ensure_column(db, "trade_baskets", "account_mode", "TEXT NOT NULL DEFAULT 'demo'")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode_status ON trades(account_mode, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_evidence_context ON strategy_evidence(account_mode, symbol, regime, strategy_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_demo_session ON trades(demo_session_id, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_objective_phase ON trades(objective_phase_id, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_setups_objective_phase ON setup_records(objective_phase_id, status)")
@@ -562,6 +587,8 @@ async def record_setup(
     policy_version: Optional[str] = None,
     experiment_id: Optional[int] = None,
     objective_phase_id: Optional[int] = None,
+    strategy_id: Optional[str] = None,
+    regime: Optional[str] = None,
     db_path: str = DB_PATH,
 ) -> int:
     """Store every qualifying, rejected, and executed setup hypothesis."""
@@ -571,13 +598,13 @@ async def record_setup(
             """INSERT INTO setup_records
                (detected_at, updated_at, account_mode, symbol, timeframe, direction, setup_type,
                 status, rejection_reason, entry_price, stop_loss, take_profit, rr_ratio,
-                quality_score, validation_json, features_json, policy_version, experiment_id, objective_phase_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                quality_score, validation_json, features_json, policy_version, experiment_id, objective_phase_id, strategy_id, regime)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 now, now, account_mode, symbol, timeframe, direction, setup_type, status,
                 rejection_reason, entry_price, stop_loss, take_profit, rr_ratio, quality_score,
                 json.dumps(validation or {}, sort_keys=True), json.dumps(features or {}, sort_keys=True),
-                policy_version, experiment_id, objective_phase_id,
+                policy_version, experiment_id, objective_phase_id, strategy_id, regime,
             ),
         )
         await conn.commit()
@@ -588,9 +615,12 @@ async def update_setup_record(
     setup_id: int,
     *,
     status: Optional[str] = None,
+    setup_type: Optional[str] = None,
     rejection_reason: Optional[str] = None,
     trade_id: Optional[int] = None,
     outcome: Optional[dict] = None,
+    strategy_id: Optional[str] = None,
+    regime: Optional[str] = None,
     db_path: str = DB_PATH,
 ) -> None:
     """Update a setup's execution link or counterfactual/realized outcome."""
@@ -598,9 +628,12 @@ async def update_setup_record(
     values: list = [datetime.utcnow().isoformat()]
     for column, value in (
         ("status", status),
+        ("setup_type", setup_type),
         ("rejection_reason", rejection_reason),
         ("trade_id", trade_id),
         ("outcome_json", json.dumps(outcome, sort_keys=True) if outcome is not None else None),
+        ("strategy_id", strategy_id),
+        ("regime", regime),
     ):
         if value is not None:
             assignments.append(f"{column} = ?")
@@ -711,6 +744,21 @@ async def get_symbol_profile(
     metrics = json.loads(row[0] or "{}")
     metrics["updated_at"] = row[1]
     return metrics
+
+
+async def get_setup_record(setup_id: int, db_path: str = DB_PATH) -> Optional[dict]:
+    """Fetch one persisted setup context for outcome reconciliation."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM setup_records WHERE id = ?", (int(setup_id),))
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["features"] = json.loads(result.pop("features_json") or "{}")
+    result["validation"] = json.loads(result.pop("validation_json") or "{}")
+    result["outcome"] = json.loads(result.pop("outcome_json") or "{}")
+    return result
 
 
 async def get_symbol_setup_metrics(
@@ -2506,5 +2554,191 @@ async def get_demo_session_symbol_summary(session_id: int, db_path: str = DB_PAT
                  ))
                GROUP BY symbol ORDER BY pnl DESC, trades DESC""",
             (int(session_id),),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+def _strategy_confidence(sample_size: int, expectancy_r: Optional[float]) -> str:
+    """Classify evidence depth by the documented completed-outcome sample bands."""
+    del expectancy_r
+    if sample_size < 3:
+        return "UNKNOWN"
+    if sample_size < 10:
+        return "EARLY"
+    if sample_size < 20:
+        return "OBSERVED"
+    if sample_size < 50:
+        return "PROMISING"
+    if sample_size < 100:
+        return "VALIDATED"
+    return "STRONG_EVIDENCE"
+
+
+async def upsert_strategy_evidence(
+    account_mode: str,
+    symbol: str,
+    strategy_id: str,
+    regime: str,
+    timeframe: str,
+    pnl_r: Optional[float] = None,
+    mae_r: Optional[float] = None,
+    mfe_r: Optional[float] = None,
+    db_path: str = DB_PATH,
+) -> dict:
+    """Rebuild one evidence context from completed recorded trades.
+
+    The optional outcome arguments document the just-reconciled trade. The
+    aggregate is deliberately rebuilt from durable broker-confirmed trade rows,
+    making repeated reconciliation idempotent and preventing duplicate learning.
+    """
+    del pnl_r, mae_r, mfe_r
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT t.pnl_r, t.max_adverse_r, t.max_favorable_r,
+                      COALESCE(t.closed_at, t.timestamp) AS event_time
+                 FROM trades t
+                 JOIN setup_records s ON s.id = t.setup_id
+                WHERE t.account_mode = ? AND t.status = 'closed'
+                  AND t.pnl_r IS NOT NULL AND s.symbol = ? AND s.strategy_id = ?
+                  AND s.regime = ? AND s.timeframe = ?
+                ORDER BY event_time ASC, t.id ASC""",
+            (account_mode, symbol, strategy_id, regime, timeframe),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        outcomes: list[tuple[float, float, float]] = []
+        for row in rows:
+            try:
+                pnl = float(row["pnl_r"])
+            except (TypeError, ValueError):
+                continue
+            if not __import__("math").isfinite(pnl):
+                continue
+            def finite_or_zero(value: Any) -> float:
+                try:
+                    number = float(value or 0.0)
+                    return number if __import__("math").isfinite(number) else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+            outcomes.append((pnl, finite_or_zero(row["max_adverse_r"]), finite_or_zero(row["max_favorable_r"])))
+        trades = len(outcomes)
+        wins = sum(1 for pnl, _, _ in outcomes if pnl > 0)
+        losses = sum(1 for pnl, _, _ in outcomes if pnl < 0)
+        expectancy = (sum(pnl for pnl, _, _ in outcomes) / trades) if trades else None
+        gross_profit = sum(pnl for pnl, _, _ in outcomes if pnl > 0)
+        gross_loss = abs(sum(pnl for pnl, _, _ in outcomes if pnl < 0))
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (None if gross_profit == 0 else float("inf"))
+        average_mae = (sum(mae for _, mae, _ in outcomes) / trades) if trades else None
+        average_mfe = (sum(mfe for _, _, mfe in outcomes) / trades) if trades else None
+        cumulative = peak = max_drawdown = 0.0
+        for pnl, _, _ in outcomes:
+            cumulative += pnl
+            peak = max(peak, cumulative)
+            max_drawdown = min(max_drawdown, cumulative - peak)
+        confidence = _strategy_confidence(trades, expectancy)
+        now = datetime.utcnow().isoformat()
+        await conn.execute(
+            """INSERT INTO strategy_evidence
+                   (account_mode, symbol, strategy_id, regime, timeframe, trades, wins, losses,
+                    expectancy_r, profit_factor, average_mae_r, average_mfe_r, max_drawdown_r,
+                    sample_size, confidence, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(account_mode, symbol, strategy_id, regime, timeframe) DO UPDATE SET
+                   trades=excluded.trades, wins=excluded.wins, losses=excluded.losses,
+                   expectancy_r=excluded.expectancy_r, profit_factor=excluded.profit_factor,
+                   average_mae_r=excluded.average_mae_r, average_mfe_r=excluded.average_mfe_r,
+                   max_drawdown_r=excluded.max_drawdown_r, sample_size=excluded.sample_size,
+                   confidence=excluded.confidence, updated_at=excluded.updated_at""",
+            (account_mode, symbol, strategy_id, regime, timeframe, trades, wins, losses,
+             expectancy, profit_factor, average_mae, average_mfe, max_drawdown,
+             trades, confidence, now),
+        )
+        await conn.commit()
+    return {
+        "account_mode": account_mode, "symbol": symbol, "strategy_id": strategy_id,
+        "regime": regime, "timeframe": timeframe, "trades": trades, "wins": wins,
+        "losses": losses, "expectancy_r": expectancy, "profit_factor": profit_factor,
+        "average_mae_r": average_mae, "average_mfe_r": average_mfe,
+        "max_drawdown_r": max_drawdown, "sample_size": trades, "confidence": confidence,
+        "updated_at": now,
+    }
+
+
+async def get_strategy_evidence(
+    account_mode: str, symbol: str, strategy_id: str, regime: str, timeframe: str,
+    db_path: str = DB_PATH,
+) -> dict:
+    """Return one context or an explicit UNKNOWN baseline; never fabricate samples."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT * FROM strategy_evidence WHERE account_mode = ? AND symbol = ?
+                  AND strategy_id = ? AND regime = ? AND timeframe = ?""",
+            (account_mode, symbol, strategy_id, regime, timeframe),
+        )
+        row = await cursor.fetchone()
+    if row:
+        return dict(row)
+    return {"account_mode": account_mode, "symbol": symbol, "strategy_id": strategy_id,
+            "regime": regime, "timeframe": timeframe, "trades": 0, "wins": 0,
+            "losses": 0, "expectancy_r": None, "profit_factor": None,
+            "average_mae_r": None, "average_mfe_r": None, "max_drawdown_r": None,
+            "sample_size": 0, "confidence": "UNKNOWN"}
+
+
+async def get_strategy_evidence_for_context(
+    account_mode: str, symbol: str, regime: str, timeframe: str, db_path: str = DB_PATH,
+) -> dict[str, dict]:
+    """Return recorded strategy metrics for a live candidate's exact context."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT * FROM strategy_evidence WHERE account_mode = ? AND symbol = ?
+                  AND regime = ? AND timeframe = ?""",
+            (account_mode, symbol, regime, timeframe),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    return {row["strategy_id"]: row for row in rows}
+
+
+async def get_best_strategies_for_symbol(
+    account_mode: str, symbol: str, regime: str, db_path: str = DB_PATH,
+) -> list[dict]:
+    """Rank stored evidence only; rows remain clearly labelled by sample confidence."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT strategy_id, timeframe, SUM(sample_size) AS sample_size,
+                      SUM(wins) AS wins, SUM(losses) AS losses,
+                      CASE WHEN SUM(sample_size) > 0
+                           THEN SUM(expectancy_r * sample_size) / SUM(sample_size) END AS expectancy_r,
+                      AVG(average_mae_r) AS average_mae_r, AVG(average_mfe_r) AS average_mfe_r
+                 FROM strategy_evidence
+                WHERE account_mode = ? AND symbol = ? AND regime = ?
+                GROUP BY strategy_id, timeframe
+                ORDER BY expectancy_r DESC, sample_size DESC, strategy_id ASC""",
+            (account_mode, symbol, regime),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    for row in rows:
+        row["confidence"] = _strategy_confidence(int(row.get("sample_size") or 0), row.get("expectancy_r"))
+    return rows
+
+
+async def get_strategy_evidence_summary(
+    account_mode: str, days: int = 30, db_path: str = DB_PATH,
+) -> list[dict]:
+    """Summarize durable evidence updated during the requested reporting horizon."""
+    since = (datetime.utcnow() - timedelta(days=max(1, int(days)))).isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT symbol, strategy_id, regime, timeframe, sample_size, wins, losses,
+                      expectancy_r, profit_factor, average_mae_r, average_mfe_r,
+                      max_drawdown_r, confidence, updated_at
+                 FROM strategy_evidence
+                WHERE account_mode = ? AND updated_at >= ?
+                ORDER BY expectancy_r DESC, sample_size DESC, symbol ASC, strategy_id ASC""",
+            (account_mode, since),
         )
         return [dict(row) for row in await cursor.fetchall()]

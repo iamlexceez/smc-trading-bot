@@ -5,7 +5,7 @@ candidates.  It does not create entries, replace broker checks, or submit trades
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Any, Iterable
 
@@ -101,6 +101,7 @@ class Opportunity:
     rationale: tuple[str, ...]
     context: dict[str, Any]
     portfolio_conflict: float
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 def rank_opportunities(
@@ -122,6 +123,9 @@ def rank_opportunities(
         context = dict(contexts.get(symbol) or {})
         evidence = dict(historical.get(symbol) or {})
         quality = max(0.0, min(100.0, _finite(getattr(signal, "score", 0.0))))
+        selected_strategy = str(getattr(signal, "selected_strategy", "") or "unclassified")
+        strategy_score = max(0.0, min(100.0, _finite(getattr(signal, "strategy_score", 0.0))))
+        strategy_evidence = dict(getattr(signal, "strategy_evidence", {}) or {})
         adx = max(0.0, min(60.0, _finite(context.get("adx")))) / 60.0
         atr_ratio = _finite(context.get("atr_ratio"), 1.0)
         volatility_fit = max(0.0, 1.0 - min(abs(atr_ratio - 1.0), 1.0))
@@ -131,8 +135,8 @@ def rank_opportunities(
         evidence_strength = min(sample / 20.0, 1.0) * max(expectancy, 0.0)
         profile_expectancy = max(0.0, min(1.0, _finite(getattr(profile, "expectancy_r", 0.0))))
         conflict = 1.0 if symbol in open_set else 0.0
-        score = quality * 0.58 + adx * 10.0 + volatility_fit * 8.0 + momentum * 7.0 + evidence_strength * 12.0 + profile_expectancy * 5.0 - conflict * 18.0
-        rationale = [f"setup quality {quality:.1f}/100", f"{context.get('regime', 'UNKNOWN').lower()} regime"]
+        score = quality * 0.48 + strategy_score * 0.10 + adx * 10.0 + volatility_fit * 8.0 + momentum * 7.0 + evidence_strength * 12.0 + profile_expectancy * 5.0 - conflict * 18.0
+        rationale = [f"setup quality {quality:.1f}/100", f"{context.get('regime', 'UNKNOWN').lower()} regime", f"strategy {selected_strategy} score {strategy_score:.1f}/100"]
         if evidence_strength > 0:
             rationale.append(f"positive completed-outcome evidence n={sample}")
         elif sample:
@@ -142,10 +146,33 @@ def rank_opportunities(
         if conflict:
             rationale.append("existing same-instrument exposure")
         classification = "BEST_OPPORTUNITY" if score >= 65.0 else ("GOOD_OPPORTUNITY" if score >= 45.0 else "WATCHLIST")
-        ranked.append(Opportunity(symbol, round(score, 4), classification, tuple(rationale), context, conflict))
+        details = {
+            "instrument": symbol,
+            "regime": context.get("regime", "UNKNOWN"),
+            "strategy": selected_strategy,
+            "direction": getattr(signal, "direction", ""),
+            "timeframe": getattr(signal, "timeframe", ""),
+            "htf_bias": list(getattr(signal, "htf_bias", []) or []),
+            "entry": _finite(getattr(signal, "entry_price", None)),
+            "stop_loss": _finite(getattr(signal, "stop_loss", None)),
+            "take_profit": _finite(getattr(signal, "take_profit", None)),
+            "rr": _finite(getattr(signal, "rr_ratio", None)),
+            "setup_score": quality,
+            "strategy_score": strategy_score,
+            "historical_expectancy_r": strategy_evidence.get("expectancy_r"),
+            "confidence": strategy_evidence.get("confidence", "UNKNOWN"),
+            "sample_size": strategy_evidence.get("sample_size", 0),
+            "average_mae_r": strategy_evidence.get("average_mae_r"),
+            "average_mfe_r": strategy_evidence.get("average_mfe_r"),
+            "layering_suitability": bool(getattr(signal, "layering_suitable", False)),
+            "portfolio_conflict": conflict,
+            "thesis": list(rationale),
+        }
+        ranked.append(Opportunity(symbol, round(score, 4), classification, tuple(rationale), context, conflict, details))
     ranked.sort(key=lambda item: (-item.score, item.portfolio_conflict, item.symbol))
     if ranked:
-        ranked[0] = Opportunity(ranked[0].symbol, ranked[0].score, "BEST_OPPORTUNITY", ranked[0].rationale, ranked[0].context, ranked[0].portfolio_conflict)
+        top = ranked[0]
+        ranked[0] = Opportunity(top.symbol, top.score, "BEST_OPPORTUNITY", top.rationale, top.context, top.portfolio_conflict, top.details)
     return ranked
 
 

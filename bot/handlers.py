@@ -529,6 +529,7 @@ class BotHandlers:
             "`/objective [set|confirm|start|cancel|history|explain|pause]` — saved objective template and explicit DEMO session controls\n"
             "`/session` — current saved-objective DEMO session\n"
             "`/learned` — plain-language evidence summary across saved objective sessions\n"
+            "`/opportunities` — current ranked strategy, regime, evidence, and thesis board\n"
             "`/activity [detailed|essential|off]` — chart-study notification mode\n"
             "`/settings` — autonomy, alerts, and explicit DEMO/LIVE controls\n"
             "`/emergency` — pause new execution and optionally close positions\n\n"
@@ -629,7 +630,14 @@ class BotHandlers:
             lines.append(f"- {task.get('name')}: interval/trigger={task.get('interval') or task.get('trigger')}; first={task.get('first_started') or 'not yet'}; last run={task.get('last_started') or 'not yet'}; success={task.get('last_success') or 'never'}; failure={task.get('last_failure') or 'none'}; next={task.get('next_run') or 'not scheduled'}")
             if task.get("last_error"):
                 lines.append(f"  error: {task['last_error']}")
+        ranking = list(getattr(self.scheduler, "last_opportunity_ranking", []) or [])
+        top_opportunity = ranking[0] if ranking else {}
+        top_details = dict(top_opportunity.get("details") or {})
         lines.extend([
+            "", "STRATEGY / OPPORTUNITY SELECTION",
+            "Registry selection: ACTIVE for validated candidates; it ranks declared strategy families from existing setup observations, regime fit, and closed-trade evidence.",
+            f"Strategies evaluated on current board: `{len({str((item.get('details') or {}).get('strategy') or '') for item in ranking if (item.get('details') or {}).get('strategy')})}` | Ranked opportunities: `{len(ranking)}`.",
+            f"Top opportunity: `{top_opportunity.get('symbol') or 'none'}` | strategy `{top_details.get('strategy') or 'UNKNOWN'}` | regime `{top_details.get('regime') or 'UNKNOWN'}` | score `{float(top_opportunity.get('score') or 0.0):.1f}` | evidence `{top_details.get('confidence') or 'UNKNOWN'}`.",
             "", "PROCESS-LIFETIME COUNTERS",
             f"Scan cycles: {lifetime.get('scan_cycles_started', 0)} started / {lifetime.get('scan_cycles_completed', 0)} completed / {lifetime.get('scan_cycles_failed', 0)} failed / {lifetime.get('scan_cycles_skipped_overlap', 0)} overlap-skipped",
             f"Symbols: {lifetime.get('symbols_attempted', 0)} attempted / {lifetime.get('symbols_analyzed', 0)} analyzed | Candles: {lifetime.get('candle_requests', 0)} requested / {lifetime.get('failed_candle_requests', 0)} failed",
@@ -856,6 +864,7 @@ class BotHandlers:
         sessions = await db.get_objective_sessions(int(active["id"]))
         current = await db.get_demo_session_report(int(session_id)) if session_id else None
         symbol_rows = await db.get_demo_session_symbol_summary(int(session_id)) if session_id else []
+        strategy_evidence = await db.get_strategy_evidence_summary(mode, days=90)
         lines = ["🧠 WHAT I'VE LEARNED SO FAR", ""]
         if current and int(current.get("strategy_trades") or 0) > 0:
             lines.append(f"CURRENT SESSION — observed `{current.get('strategy_trades', 0)}` completed strategy trades; `{current.get('wins', 0)}` wins and `{current.get('losses', 0)}` losses.")
@@ -872,11 +881,38 @@ class BotHandlers:
                 lines.append(f"OBSERVED: `{weak.get('symbol')}` has the weakest current-session realized result: `${float(weak.get('pnl') or 0.0):.2f}` across `{int(weak.get('trades') or 0)}` trades.")
         else:
             lines.append("UNKNOWN: no instrument has enough closed session outcomes yet to be favored or avoided.")
+        observed_strategy_rows = [row for row in strategy_evidence if int(row.get("sample_size") or 0) > 0]
+        lines.extend(["", "STRATEGY EVIDENCE"])
+        if observed_strategy_rows:
+            for row in observed_strategy_rows[:3]:
+                expectancy = row.get("expectancy_r")
+                expectancy_text = "UNKNOWN" if expectancy is None else f"{float(expectancy):+.2f}R"
+                lines.append(f"{row.get('confidence') or 'UNKNOWN'}: `{row.get('symbol')}` × `{row.get('strategy_id')}` in `{row.get('regime')}` ({row.get('timeframe')}) has n={int(row.get('sample_size') or 0)} and expectancy {expectancy_text}.")
+            regime_totals: dict[tuple[str, str], dict] = {}
+            for row in observed_strategy_rows:
+                key = (str(row.get("regime") or "UNKNOWN"), str(row.get("strategy_id") or "UNKNOWN"))
+                bucket = regime_totals.setdefault(key, {"n": 0, "weighted": 0.0})
+                n = int(row.get("sample_size") or 0)
+                bucket["n"] += n
+                bucket["weighted"] += float(row.get("expectancy_r") or 0.0) * n
+            best_regime, best_values = sorted(regime_totals.items(), key=lambda item: (-(item[1]["weighted"] / max(item[1]["n"], 1)), -item[1]["n"], item[0]))[0]
+            regime_expectancy = best_values["weighted"] / max(best_values["n"], 1)
+            lines.append(f"Best observed regime × strategy: `{best_regime[0]}` × `{best_regime[1]}` — n={best_values['n']}, weighted expectancy {regime_expectancy:+.2f}R. This remains a sample-labelled observation, not a guarantee.")
+            layered = [row for row in observed_strategy_rows if row.get("strategy_id") == "layered_continuation"]
+            if layered:
+                layer_n = sum(int(row.get("sample_size") or 0) for row in layered)
+                layer_e = sum(float(row.get("expectancy_r") or 0.0) * int(row.get("sample_size") or 0) for row in layered) / max(layer_n, 1)
+                lines.append(f"Layering finding: layered continuation has n={layer_n} recorded completed outcomes with weighted expectancy {layer_e:+.2f}R. It remains eligible only when the original thesis, fresh confirmation, evidence, and broker checks all agree.")
+            else:
+                lines.append("Layering finding: UNKNOWN — no closed broker-confirmed layered-continuation outcome exists yet, so layering has no evidence advantage.")
+        else:
+            lines.append("UNKNOWN: no closed broker-confirmed strategy × instrument × regime outcome exists yet. Strategies are selected by current fit, but none is favored from outcome evidence.")
         ranking = list(getattr(self.scheduler, "last_opportunity_ranking", []) or []) if self.scheduler else []
         if ranking:
             best = ranking[0]
             lines.extend(["", "BEST CURRENT OPPORTUNITY"])
-            lines.append(f"{best.get('symbol')} — {best.get('context', {}).get('regime', 'UNKNOWN')} | opportunity score {float(best.get('score') or 0.0):.1f}.")
+            details = dict(best.get("details") or {})
+            lines.append(f"{best.get('symbol')} — {details.get('strategy') or 'UNKNOWN'} in {details.get('regime') or best.get('context', {}).get('regime', 'UNKNOWN')} | opportunity score {float(best.get('score') or 0.0):.1f} | evidence {details.get('confidence') or 'UNKNOWN'} (n={int(details.get('sample_size') or 0)}).")
             lines.append("Why: " + "; ".join(best.get("rationale") or ["current closed-candle and stored-evidence context is available"]) + ".")
         else:
             lines.append("CURRENT OPPORTUNITY — UNKNOWN. No current closed-candle ranking has produced a thesis-qualified candidate yet.")
@@ -889,6 +925,47 @@ class BotHandlers:
         lines.append("Uncertain: whether current results persist across additional phases and reset-separated DEMO sessions.")
         lines.append(f"Historical context: `{len(sessions)}` saved session(s), `{len(completed)}` completed/failed session(s).")
         await self._render_plain_menu(update, "\n".join(lines))
+
+    @admin_only
+    async def cmd_opportunities(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the latest descriptive opportunity board without submitting or altering orders."""
+        ranking = list(getattr(self.scheduler, "last_opportunity_ranking", []) or []) if self.scheduler else []
+        if not ranking:
+            await self._render_plain_menu(
+                update,
+                "OPPORTUNITY BOARD — READ-ONLY\n\nNo current thesis-qualified candidate has been ranked yet. The next completed scan will analyze the broker-validated objective universe before selective execution.",
+            )
+            return
+        lines = ["OPPORTUNITY BOARD — READ-ONLY", "", "Ranks are descriptive. Only the strongest current thesis may proceed to the existing final broker, sizing, portfolio, and execution checks."]
+        for rank, item in enumerate(ranking[:10], start=1):
+            details = dict(item.get("details") or {})
+            expectancy = details.get("historical_expectancy_r")
+            expectancy_text = "UNKNOWN" if expectancy is None else f"{float(expectancy):+.2f}R"
+            lines.extend([
+                "",
+                f"{rank}. {item.get('symbol')} — {item.get('classification')}",
+                f"Strategy: {details.get('strategy') or 'UNKNOWN'} | Regime: {details.get('regime') or item.get('context', {}).get('regime', 'UNKNOWN')} | Direction: {details.get('direction') or 'UNKNOWN'} | Timeframe: {details.get('timeframe') or 'UNKNOWN'}",
+                f"Opportunity score: {float(item.get('score') or 0.0):.1f}/100 | Setup: {float(details.get('setup_score') or 0.0):.1f}/100 | Strategy fit: {float(details.get('strategy_score') or 0.0):.1f}/100",
+                f"Completed evidence: {details.get('confidence') or 'UNKNOWN'} | n={int(details.get('sample_size') or 0)} | expectancy {expectancy_text} | MAE {details.get('average_mae_r') if details.get('average_mae_r') is not None else 'UNKNOWN'}R | MFE {details.get('average_mfe_r') if details.get('average_mfe_r') is not None else 'UNKNOWN'}R",
+                f"Entry {details.get('entry')} | SL {details.get('stop_loss')} | TP {details.get('take_profit')} | actual RR 1:{float(details.get('rr') or 0.0):.2f}",
+                f"Layering evidence-supported: {'YES' if details.get('layering_suitability') else 'NO'} | Portfolio impact: {float(details.get('portfolio_conflict') or 0.0):.1f}",
+                "Thesis: " + "; ".join(item.get("rationale") or ["no descriptive thesis available"]),
+            ])
+        report = "\n".join(lines)
+        if len(report) <= 3900:
+            await self._render_plain_menu(update, report)
+            return
+        await self._render_plain_menu(update, "\n".join(lines[:4]))
+        chunk: list[str] = []
+        size = 0
+        for line in lines[4:]:
+            if chunk and size + len(line) + 1 > 3500:
+                await update.effective_chat.send_message("\n".join(chunk))
+                chunk, size = [], 0
+            chunk.append(line)
+            size += len(line) + 1
+        if chunk:
+            await update.effective_chat.send_message("\n".join(chunk))
 
     @admin_only
     async def cmd_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2551,6 +2628,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("demo_auto_resume", self.cmd_demo_auto_resume))
         app.add_handler(CommandHandler("learning", self.cmd_learning))
         app.add_handler(CommandHandler("learned", self.cmd_learned))
+        app.add_handler(CommandHandler("opportunities", self.cmd_opportunities))
         app.add_handler(CommandHandler("session", self.cmd_session))
         app.add_handler(CommandHandler("experiments", self.cmd_experiments))
         app.add_handler(CommandHandler("champion", self.cmd_champion))

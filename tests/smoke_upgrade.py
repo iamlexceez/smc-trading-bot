@@ -46,6 +46,8 @@ from analysis.capital_protection import calculate_capital_protection
 from analysis.opportunity import market_context, rank_opportunities
 from analysis.runtime_telemetry import RuntimeTelemetry
 from strategy.setup_validator import calculate_rr, rr_filter_passes
+from strategy.registry import applicable_strategies, definitions
+from strategy.selection import evaluate_strategies, evidence_class
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
 from bot.handlers import BotHandlers, admin_only  # noqa: F401 — validates Telegram control imports.
 from telegram.error import BadRequest
@@ -97,6 +99,51 @@ def test_opportunity_context_and_ranking() -> None:
     ranked = rank_opportunities(candidates, profiles=profiles, contexts=contexts, historical=historical, open_symbols=["Boom 500 Index"])
     assert_true(ranked[0].symbol == "Boom 100 Index" and ranked[0].classification == "BEST_OPPORTUNITY", "portfolio-aware ranking did not penalize duplicate same-instrument exposure")
     assert_true("existing same-instrument exposure" in ranked[-1].rationale, "portfolio conflict was not retained in the opportunity thesis rationale")
+    assert_true("strategy" in ranked[0].details and "confidence" in ranked[0].details and "thesis" in ranked[0].details, "opportunity board did not retain complete strategy thesis details")
+
+
+def test_strategy_registry_and_selection() -> None:
+    assert_true(len(definitions()) >= 10, "strategy registry did not expose the declared strategy families")
+    trending = applicable_strategies("TRENDING", "M15", {"structure_event", "displacement", "htf_alignment"})
+    trending_ids = {item.identifier for item in trending}
+    assert_true("bos_choch_continuation" in trending_ids and "trend_continuation" in trending_ids, "trending structural setup did not map to continuation strategies")
+    assessments = evaluate_strategies(
+        regime="TRENDING", timeframe="M15", observed_features={"structure_event", "displacement", "htf_alignment"}, setup_quality=80.0,
+        evidence_by_strategy={
+            "bos_choch_continuation": {"sample_size": 20, "expectancy_r": 0.35},
+            "trend_continuation": {"sample_size": 20, "expectancy_r": -0.25},
+        },
+    )
+    assert_true(assessments and assessments[0].identifier == "bos_choch_continuation", "strategy selection did not prefer stronger matching completed evidence")
+    assert_true(evidence_class(0, None) == "UNKNOWN" and evidence_class(4, 0.2) == "EARLY", "evidence confidence misclassified small samples")
+    assert_true(evidence_class(20, 0.2) == "PROMISING" and evidence_class(60, -0.2) == "VALIDATED", "confidence bands did not use the documented completed-outcome sample sizes")
+
+
+async def test_strategy_evidence_persistence() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "strategy_evidence.db")
+        await db.init_db(path)
+        setup_id = await db.record_setup(
+            account_mode="demo", symbol="Boom 100 Index", timeframe="M15", direction="BUY",
+            setup_type="bos_choch_continuation", status="executed", entry_price=100.0,
+            stop_loss=99.0, take_profit=103.0, strategy_id="bos_choch_continuation",
+            regime="TRENDING", db_path=path,
+        )
+        trade_id = await db.record_trade(
+            "Boom 100 Index", "BUY", 100.0, 99.0, 103.0, 0.1, 10.0, 3.0,
+            "mt5", "{}", setup_id=setup_id, account_mode="demo", db_path=path,
+        )
+        await db.close_trade(trade_id, 12.0, path, pnl_r=1.2, max_favorable_r=1.6, max_adverse_r=-0.3)
+        evidence = await db.upsert_strategy_evidence(
+            "demo", "Boom 100 Index", "bos_choch_continuation", "TRENDING", "M15", db_path=path,
+        )
+        assert_true(evidence["sample_size"] == 1 and evidence["wins"] == 1 and evidence["expectancy_r"] == 1.2, "strategy evidence did not aggregate completed outcome correctly")
+        repeated = await db.upsert_strategy_evidence(
+            "demo", "Boom 100 Index", "bos_choch_continuation", "TRENDING", "M15", db_path=path,
+        )
+        assert_true(repeated["sample_size"] == 1, "rebuilding strategy evidence duplicated a reconciled trade")
+        lookup = await db.get_strategy_evidence("demo", "Boom 100 Index", "bos_choch_continuation", "TRENDING", "M15", path)
+        assert_true(lookup["confidence"] == "UNKNOWN" and lookup["average_mae_r"] == -0.3 and lookup["average_mfe_r"] == 1.6, "strategy evidence lost MAE/MFE or documented confidence")
 
 
 def test_runtime_telemetry() -> None:
@@ -1384,6 +1431,7 @@ def run() -> None:
     test_broker_stop_normalization()
     test_runtime_telemetry()
     test_opportunity_context_and_ranking()
+    test_strategy_registry_and_selection()
     test_full_precision_rr_validation()
     asyncio.run(test_single_flight_scan_guard())
     test_scanner_eligibility_handoff()
@@ -1397,6 +1445,7 @@ def run() -> None:
     asyncio.run(test_deriv_market_universe())
     asyncio.run(test_basket_persistence())
     asyncio.run(test_learning_telemetry_persistence())
+    asyncio.run(test_strategy_evidence_persistence())
     asyncio.run(test_model_governance_persistence())
     asyncio.run(test_experiment_engine_persistence())
     asyncio.run(test_chart_activity_notifications())
