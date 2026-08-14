@@ -1987,7 +1987,7 @@ class MarketScheduler:
         if not candidates:
             logger.info("[OPPORTUNITY RANKING] no thesis-qualified candidates across %s analyzed symbols", len(scan_symbols))
             return
-        positions = await self.executor.get_positions() if self.executor else []
+        positions = await self.executor.get_open_positions() if self.executor else []
         open_symbols = [str(getattr(position, "symbol", "")) for position in positions]
         historical = {str(row.get("symbol")): row for row in research["market_selection"].get("rankings", [])}
         profiles = {signal.symbol: getattr(signal, "symbol_profile", None) for signal in candidates}
