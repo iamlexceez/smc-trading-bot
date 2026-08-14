@@ -94,17 +94,36 @@ class CapitalReductionEngine:
             return None, str((result or {}).get("error") or "broker margin probe returned no margin")
         return margin, str((result or {}).get("margin_source") or "order_calc_margin")
 
-    async def _plan_round_trip(self, account: dict, remaining: float, tolerance: float, overshoot_tolerance: float = 0.0) -> tuple[Optional[ReductionPlan], str, dict]:
+    @staticmethod
+    def _proximity_taper(remaining: float, tolerance: float, initial_required_reduction: Optional[float]) -> tuple[float, float]:
+        """Return remaining-progress ratio and a quadratic aggression factor.
+
+        A session begins at factor 1.0. As actual broker equity approaches the
+        finish band, the factor approaches zero, shrinking the optional
+        lower-bound overshoot and therefore the largest selectable volume.
+        """
+        active_remaining = max(0.0, float(remaining) - max(0.0, float(tolerance)))
+        reference = max(active_remaining, float(initial_required_reduction or 0.0) - max(0.0, float(tolerance)))
+        if reference <= 1e-12:
+            return 0.0, 0.0
+        ratio = max(0.0, min(1.0, active_remaining / reference))
+        return ratio, ratio * ratio
+
+    async def _plan_round_trip(self, account: dict, remaining: float, tolerance: float, overshoot_tolerance: float = 0.0, initial_required_reduction: Optional[float] = None) -> tuple[Optional[ReductionPlan], str, dict]:
         """Choose the largest practical broker-valid DEMO reduction action.
 
         Each invocation returns one action only. The scheduler closes it, rereads
         actual broker equity, and invokes this planner again for the next round.
         """
         overshoot_tolerance = max(0.0, self._number(overshoot_tolerance))
+        proximity_ratio, aggression_factor = self._proximity_taper(remaining, tolerance, initial_required_reduction)
+        tapered_overshoot = overshoot_tolerance * aggression_factor
         diagnostics: dict = {
-            "mode": "AGGRESSIVE", "remaining_reduction": remaining,
-            "effective_tolerance": tolerance, "overshoot_tolerance": overshoot_tolerance,
-            "maximum_permitted_reduction": remaining + overshoot_tolerance,
+            "mode": "AGGRESSIVE_TAPERED", "remaining_reduction": remaining,
+            "effective_tolerance": tolerance, "configured_overshoot_tolerance": overshoot_tolerance,
+            "tapered_overshoot_tolerance": tapered_overshoot,
+            "proximity_ratio": proximity_ratio, "aggression_factor": aggression_factor,
+            "maximum_permitted_reduction": remaining + tapered_overshoot,
             "candidates": [], "valid_candidate_count": 0,
         }
         if remaining <= tolerance:
@@ -152,7 +171,7 @@ class CapitalReductionEngine:
                 diagnostic.update({"status": "rejected", "reason": "insufficient free margin for broker minimum volume"})
                 inspected.append(diagnostic)
                 continue
-            permitted_loss = remaining + overshoot_tolerance
+            permitted_loss = remaining + tapered_overshoot
             if minimum_loss > permitted_loss + 1e-8:
                 diagnostic.update({"status": "rejected", "reason": "broker minimum-volume loss exceeds configured overshoot envelope", "overshoot": minimum_loss - remaining})
                 inspected.append(diagnostic)
@@ -183,7 +202,7 @@ class CapitalReductionEngine:
             return None, "No executable broker-valid reduction action is available", diagnostics
         candidates.sort(key=lambda item: (-item.expected_loss, item.symbol))
         chosen = candidates[0]
-        diagnostics["best_candidate"] = {"symbol": chosen.symbol, "volume": chosen.volume, "expected_loss": chosen.expected_loss, "required_margin": chosen.required_margin, "minimum_loss": chosen.minimum_loss, "maximum_reduction": chosen.maximum_reduction, "reason": "Largest valid reduction candidate"}
+        diagnostics["best_candidate"] = {"symbol": chosen.symbol, "volume": chosen.volume, "expected_loss": chosen.expected_loss, "required_margin": chosen.required_margin, "minimum_loss": chosen.minimum_loss, "maximum_reduction": chosen.maximum_reduction, "proximity_ratio": proximity_ratio, "aggression_factor": aggression_factor, "tapered_overshoot_tolerance": tapered_overshoot, "reason": "Largest valid reduction candidate under target-proximity taper"}
         return chosen, "", diagnostics
 
     async def start(
@@ -210,11 +229,11 @@ class CapitalReductionEngine:
             session_id = await db.create_capital_reduction_session(
                 broker_login=str(account.get("login") or ""), target_equity=target_equity,
                 tolerance=tolerance, initial_equity=equity, initial_balance=balance,
-                account_mode="demo", metadata={"purpose": "DELIBERATE_DEMO_CAPITAL_REDUCTION", "broker_mode": account.get("broker_account_mode"), "tolerance_percent": tolerance_percent, "overshoot_tolerance": overshoot_tolerance, "overshoot_tolerance_percent": overshoot_tolerance_percent, "mode": "AGGRESSIVE"},
+                account_mode="demo", metadata={"purpose": "DELIBERATE_DEMO_CAPITAL_REDUCTION", "broker_mode": account.get("broker_account_mode"), "tolerance_percent": tolerance_percent, "overshoot_tolerance": overshoot_tolerance, "overshoot_tolerance_percent": overshoot_tolerance_percent, "mode": "AGGRESSIVE_TAPERED"},
             )
             await db.record_capital_reduction_action(
                 session_id=session_id, action="session_started", status="searching",
-                equity_before=equity, details={"target_equity": target_equity, "absolute_tolerance": tolerance, "tolerance_percent": tolerance_percent, "effective_tolerance": self._effective_tolerance(target_equity, tolerance, tolerance_percent), "overshoot_tolerance": self._effective_tolerance(target_equity, overshoot_tolerance, overshoot_tolerance_percent), "mode": "AGGRESSIVE", "required_reduction": equity - target_equity},
+                equity_before=equity, details={"target_equity": target_equity, "absolute_tolerance": tolerance, "tolerance_percent": tolerance_percent, "effective_tolerance": self._effective_tolerance(target_equity, tolerance, tolerance_percent), "overshoot_tolerance": self._effective_tolerance(target_equity, overshoot_tolerance, overshoot_tolerance_percent), "mode": "AGGRESSIVE_TAPERED", "required_reduction": equity - target_equity},
             )
             self._consecutive_failures = 0
             return {"ok": True, "session_id": session_id, "initial_equity": equity, "initial_balance": balance, "target_equity": target_equity, "tolerance": tolerance}
@@ -301,28 +320,33 @@ class CapitalReductionEngine:
                 self._number((session.get("metadata") or {}).get("overshoot_tolerance_percent", self.settings.capital_reduction_overshoot_tolerance_pct)),
             )
             remaining = max(0.0, equity - target)
+            initial_required_reduction = max(0.0, self._number(session.get("initial_equity")) - target)
             runtime_metadata = dict(session.get("metadata") or {})
             runtime_metadata["runtime_state"] = "SEARCHING"
             runtime_metadata["remaining_reduction"] = remaining
             runtime_metadata["effective_tolerance"] = tolerance
             runtime_metadata["overshoot_tolerance"] = overshoot_tolerance
-            runtime_metadata["mode"] = "AGGRESSIVE"
+            runtime_metadata["mode"] = "AGGRESSIVE_TAPERED"
+            runtime_metadata["initial_required_reduction"] = initial_required_reduction
             await db.update_capital_reduction_session(session["id"], current_equity=equity, current_balance=balance, metadata=runtime_metadata)
             if remaining <= tolerance:
                 await db.update_capital_reduction_session(session["id"], status="completed", current_equity=equity, current_balance=balance, capital_test_active=True, error_reason="Target tolerance reached")
                 await db.record_capital_reduction_action(session_id=session["id"], action="target_reached", status="completed", equity_before=equity, equity_after=equity)
-                return {"state": "completed", "session_id": session["id"], "equity": equity, "balance": balance, "target": target, "remaining": remaining, "tolerance": tolerance, "mode": "AGGRESSIVE"}
+                return {"state": "completed", "session_id": session["id"], "equity": equity, "balance": balance, "target": target, "remaining": remaining, "tolerance": tolerance, "mode": "AGGRESSIVE_TAPERED"}
 
-            plan, reason, diagnostic = await self._plan_round_trip(account, remaining, tolerance, overshoot_tolerance)
+            plan, reason, diagnostic = await self._plan_round_trip(account, remaining, tolerance, overshoot_tolerance, initial_required_reduction)
             metadata = dict(runtime_metadata)
             metadata["last_planning"] = diagnostic
+            metadata["proximity_ratio"] = diagnostic.get("proximity_ratio")
+            metadata["aggression_factor"] = diagnostic.get("aggression_factor")
+            metadata["tapered_overshoot_tolerance"] = diagnostic.get("tapered_overshoot_tolerance")
             if not plan:
                 await db.update_capital_reduction_session(session["id"], status="blocked", error_reason=reason, metadata=metadata)
                 await db.record_capital_reduction_action(session_id=session["id"], action="planning_blocked", status="blocked", equity_before=equity, details={"reason": reason, **diagnostic})
-                return {"state": "blocked", "reason": reason, "session_id": session["id"], "target": target, "current_equity": equity, "remaining": remaining, "tolerance": tolerance, "overshoot_tolerance": overshoot_tolerance, "mode": "AGGRESSIVE", "valid_candidate_count": diagnostic.get("valid_candidate_count", 0), "best_candidate": diagnostic.get("best_candidate"), "diagnostic": diagnostic}
+                return {"state": "blocked", "reason": reason, "session_id": session["id"], "target": target, "current_equity": equity, "remaining": remaining, "tolerance": tolerance, "overshoot_tolerance": overshoot_tolerance, "mode": "AGGRESSIVE_TAPERED", "valid_candidate_count": diagnostic.get("valid_candidate_count", 0), "best_candidate": diagnostic.get("best_candidate"), "diagnostic": diagnostic}
             metadata["runtime_state"] = "EXECUTING"
             await db.update_capital_reduction_session(session["id"], error_reason="", metadata=metadata)
-            await db.record_capital_reduction_action(session_id=session["id"], action="planning_selected", status="executing", symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=plan.entry_price, equity_before=equity, details={"mode": "AGGRESSIVE", "remaining": remaining, "effective_tolerance": tolerance, "overshoot_tolerance": overshoot_tolerance, "valid_candidate_count": diagnostic.get("valid_candidate_count", 0), "reason": "Largest valid reduction candidate", "expected_loss": plan.expected_loss, "required_margin": plan.required_margin, "minimum_loss": plan.minimum_loss, "maximum_reduction": plan.maximum_reduction})
+            await db.record_capital_reduction_action(session_id=session["id"], action="planning_selected", status="executing", symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=plan.entry_price, equity_before=equity, details={"mode": "AGGRESSIVE_TAPERED", "remaining": remaining, "effective_tolerance": tolerance, "configured_overshoot_tolerance": overshoot_tolerance, "tapered_overshoot_tolerance": diagnostic.get("tapered_overshoot_tolerance"), "proximity_ratio": diagnostic.get("proximity_ratio"), "aggression_factor": diagnostic.get("aggression_factor"), "valid_candidate_count": diagnostic.get("valid_candidate_count", 0), "reason": "Largest valid reduction candidate under target-proximity taper", "expected_loss": plan.expected_loss, "required_margin": plan.required_margin, "minimum_loss": plan.minimum_loss, "maximum_reduction": plan.maximum_reduction})
 
             comment = f"{self.COMMENT_PREFIX}:{session['id']}"
             result = await self.executor.execute_trade(
@@ -372,8 +396,11 @@ class CapitalReductionEngine:
             # equity/free margin after the close. It is evidence only here; the
             # following scheduled cycle still performs the one permitted order.
             if refreshed and remaining_after is not None and remaining_after > tolerance:
-                next_plan, next_reason, next_diagnostic = await self._plan_round_trip(refreshed, remaining_after, tolerance, overshoot_tolerance)
+                next_plan, next_reason, next_diagnostic = await self._plan_round_trip(refreshed, remaining_after, tolerance, overshoot_tolerance, initial_required_reduction)
                 waiting_metadata["last_planning"] = next_diagnostic
+                waiting_metadata["proximity_ratio"] = next_diagnostic.get("proximity_ratio")
+                waiting_metadata["aggression_factor"] = next_diagnostic.get("aggression_factor")
+                waiting_metadata["tapered_overshoot_tolerance"] = next_diagnostic.get("tapered_overshoot_tolerance")
                 if not next_plan:
                     await db.update_capital_reduction_session(
                         session["id"], status="blocked", current_equity=equity_after,
@@ -384,7 +411,7 @@ class CapitalReductionEngine:
                         equity_before=equity, equity_after=equity_after,
                         details={"reason": next_reason, **next_diagnostic},
                     )
-                    return {"state": "blocked", "session_id": session["id"], "ticket": result.ticket, "target": target, "current_equity": equity_after, "remaining": remaining_after, "tolerance": tolerance, "overshoot_tolerance": overshoot_tolerance, "mode": "AGGRESSIVE", "valid_candidate_count": next_diagnostic.get("valid_candidate_count", 0), "best_candidate": next_diagnostic.get("best_candidate"), "reason": next_reason}
+                    return {"state": "blocked", "session_id": session["id"], "ticket": result.ticket, "target": target, "current_equity": equity_after, "remaining": remaining_after, "tolerance": tolerance, "overshoot_tolerance": overshoot_tolerance, "mode": "AGGRESSIVE_TAPERED", "valid_candidate_count": next_diagnostic.get("valid_candidate_count", 0), "best_candidate": next_diagnostic.get("best_candidate"), "reason": next_reason}
             await db.update_capital_reduction_session(
                 session["id"], current_equity=equity_after if refreshed else None,
                 current_balance=balance_after if refreshed else None, metadata=waiting_metadata,

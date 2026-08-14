@@ -545,11 +545,22 @@ async def test_sequential_capital_reduction_planning() -> None:
         {"free_margin": 1_000.0, "leverage": 10.0}, remaining=25.0, tolerance=0.0, overshoot_tolerance=0.0,
     )
     assert_true(fastest is not None and fastest.symbol == "Fast Index" and fastest.expected_loss == 25.0, "aggressive planner did not choose the largest valid reduction candidate")
-    assert_true(fastest_diagnostic["valid_candidate_count"] == 2 and fastest_diagnostic["best_candidate"]["reason"] == "Largest valid reduction candidate", "aggressive diagnostics did not retain candidate ranking evidence")
+    assert_true(fastest_diagnostic["valid_candidate_count"] == 2 and "target-proximity taper" in fastest_diagnostic["best_candidate"]["reason"], "aggressive diagnostics did not retain candidate ranking evidence")
     overshoot_allowed, _, overshoot_allowed_diagnostic = await aggressive._plan_round_trip(
         {"free_margin": 1_000.0, "leverage": 10.0}, remaining=8.0, tolerance=0.0, overshoot_tolerance=2.0,
     )
     assert_true(overshoot_allowed is not None and overshoot_allowed.symbol == "Fast Index" and overshoot_allowed.expected_loss == 10.0, "bounded overshoot did not permit the strongest valid final reduction")
+    far_plan, _, far_diagnostic = await aggressive._plan_round_trip(
+        {"free_margin": 1_000.0, "leverage": 10.0}, remaining=100.0, tolerance=0.0,
+        overshoot_tolerance=100.0, initial_required_reduction=100.0,
+    )
+    near_plan, _, near_diagnostic = await aggressive._plan_round_trip(
+        {"free_margin": 1_000.0, "leverage": 10.0}, remaining=10.0, tolerance=0.0,
+        overshoot_tolerance=100.0, initial_required_reduction=100.0,
+    )
+    assert_true(far_plan is not None and near_plan is not None and far_plan.expected_loss > near_plan.expected_loss, "target-proximity taper did not reduce the selected action near the target")
+    assert_true(far_diagnostic["aggression_factor"] == 1.0 and near_diagnostic["aggression_factor"] < 0.02, "target-proximity aggression factor did not tighten quadratically")
+    assert_true(near_diagnostic["tapered_overshoot_tolerance"] < far_diagnostic["tapered_overshoot_tolerance"], "target-proximity taper did not shrink the permitted overshoot")
 
     class SequentialExecutor(BrokerFixture):
         def __init__(self) -> None:
