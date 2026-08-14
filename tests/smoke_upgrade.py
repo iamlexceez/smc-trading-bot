@@ -176,6 +176,16 @@ async def test_engine_scanner_gate_rendering() -> None:
     assert_true("BROKER_UNIVERSE_EMPTY" in captured.get("text", ""), "engine report did not render the latest scanner gate")
 
 
+def test_pause_resume_command_registration() -> None:
+    bot_handler = object.__new__(BotHandlers)
+    registered = []
+    app = SimpleNamespace(add_handler=lambda handler: registered.append(handler))
+    BotHandlers.setup(bot_handler, app)
+    command_sets = [set(getattr(handler, "commands", set())) for handler in registered]
+    assert_true(any("resume" in commands for commands in command_sets), "implemented /resume handler is absent from Telegram command registration")
+    assert_true(any("pause" in commands for commands in command_sets), "implemented /pause handler is absent from Telegram command registration")
+
+
 def test_scanner_gate_telemetry() -> None:
     probe = object.__new__(scheduler.MarketScheduler)
     probe.last_scan_gate = {}
@@ -1527,6 +1537,7 @@ async def test_strategy_transition_evidence_persistence() -> None:
 def run() -> None:
     test_broker_stop_normalization()
     asyncio.run(test_engine_scanner_gate_rendering())
+    test_pause_resume_command_registration()
     test_scanner_gate_telemetry()
     test_runtime_telemetry()
     test_opportunity_context_and_ranking()
