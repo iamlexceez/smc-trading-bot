@@ -89,6 +89,7 @@ def score_setup_quality(
     extreme_score: float = 90.0,
     historical_expectancy_r: Optional[float] = None,
     ote_aligned: bool = False,
+    rr_reference: float = 0.0,
 ) -> SetupQualityResult:
     """Score a setup with transparent fixed weights totaling 100 points."""
     mode = validation.entry_mode
@@ -130,7 +131,7 @@ def score_setup_quality(
         confirmation_detail = "Earlier entry permitted after hard structural confirmation"
     factors.append(_factor("LTF confirmation", confirmation_quality, 10.0, confirmation_detail))
 
-    rr_quality, rr_detail = _rr_quality(validation.rr_ratio, 3.0)
+    rr_quality, rr_detail = _rr_quality(validation.rr_ratio, max(0.0, float(rr_reference)))
     factors.append(_factor("RR quality", rr_quality, 10.0, rr_detail))
 
     factors.append(_factor("OTE confluence", 1.0 if ote_aligned else 0.0, 5.0, "Confirmed OTE alignment" if ote_aligned else "Optional OTE not aligned"))

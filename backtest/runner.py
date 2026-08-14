@@ -140,14 +140,15 @@ if __name__ == "__main__":
     parser.add_argument("--days", type=int, default=180, help="Days of history (default: 180)")
     parser.add_argument("--balance", type=float, default=10000, help="Initial balance (default: 10000)")
     parser.add_argument("--score", type=float, default=40, help="Score threshold (default: 40)")
-    parser.add_argument("--rr", type=float, default=3.0, help="Min RR ratio (default: 3.0)")
+    parser.add_argument("--rr", type=float, default=None, help="Optional configured min-RR override; 0 disables RR filtering")
     parser.add_argument("--risk", type=float, default=1.0, help="Risk per trade %% (default: 1.0)")
 
     args = parser.parse_args()
 
     settings = TradeSettings.defaults()
     settings.score_threshold = args.score
-    settings.min_rr_ratio = args.rr
+    if args.rr is not None:
+        settings.min_rr_ratio = max(0.0, args.rr)
     settings.risk_per_trade = args.risk
 
     result = asyncio.run(run_backtest(

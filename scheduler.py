@@ -908,8 +908,9 @@ class MarketScheduler:
         if atr_val <= 0 or (isinstance(atr_val, float) and atr_val != atr_val):
             atr_val = current_price * 0.002
 
-        policy_rr_floor = float(policy.rr_target) if policy.rr_target is not None else 0.0
-        required_rr = max(float(self.settings.min_rr_ratio), policy_rr_floor)
+        # The persisted setting is the sole RR filter. An experimental policy's
+        # rr_target remains a TP-model input and never raises the filter floor.
+        required_rr = max(0.0, float(self.settings.min_rr_ratio))
         validator = SetupValidator(
             min_rr=required_rr,
             min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
@@ -928,7 +929,7 @@ class MarketScheduler:
             zones=zones,
             entry_mode=entry_mode,
             ltf_df=ltf_df,
-            target_rr=required_rr,
+            target_rr=policy.rr_target,
             stop_model=policy.stop_model,
             target_model=policy.target_model,
         )
@@ -973,7 +974,7 @@ class MarketScheduler:
             risk_distance = abs(validation.entry_price - validation.stop_loss) if validation.stop_loss else 0.0
             await self._chart_activity(
                 "validation_rejected", symbol,
-                f"⛔ **SETUP REJECTED — {symbol}**\nDirection: `{direction}`\nEntry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}` | TP: `{validation.take_profit:.5f}`\nRisk distance: `{risk_distance:.5f}` | Reward distance: `{reward_distance:.5f}`\nRR: `1:{validation.rr_ratio:.8f}` | Required minimum: `1:{required_rr:.8f}`\nReason: `{reason}`\nTP source: `{validation.target_source or 'none'}`\nTP detail: {validation.target_reason or 'No valid target source'}\nNo sizing performed. No order submitted.",
+                f"⛔ **SETUP REJECTED — {symbol}**\nDirection: `{direction}`\nTP source: `{validation.target_source or 'none'}` | TP price: `{validation.take_profit:.5f}`\nEntry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}`\nRisk distance: `{risk_distance:.5f}` | Reward distance: `{reward_distance:.5f}`\nActual RR: `1:{validation.rr_ratio:.8f}` | Configured minimum RR: `1:{required_rr:.8f}`\nFinal decision: `{reason}`\nTP detail: {validation.target_reason or 'No valid target source'}\nNo sizing performed. No order submitted.",
                 fingerprint=f"{bar_time}:{direction}:{reason}:{validation.rr_ratio:.8f}",
             )
             return None
@@ -985,6 +986,7 @@ class MarketScheduler:
         quality = score_setup_quality(
             validation, structure, min_score=0.0,
             extreme_score=self.settings.extreme_setup_score, historical_expectancy_r=None,
+            rr_reference=required_rr,
         )
         features = self._feature_snapshot(df, structure, htf_structures, float(atr_val), validation)
         policy_ok, policy_reason = policy.accepts(
@@ -1065,11 +1067,8 @@ class MarketScheduler:
         try:
             # Defensive assertion: an RR-invalid signal must never reach final
             # revalidation, broker sizing, margin validation, or execution.
-            signal_rr_floor = max(
-                float(self.settings.min_rr_ratio),
-                float(signal.experimental_policy.get("rr_target") or 0.0),
-            )
-            if float(signal.rr_ratio) < signal_rr_floor:
+            signal_rr_floor = max(0.0, float(self.settings.min_rr_ratio))
+            if signal_rr_floor > 0.0 and float(signal.rr_ratio) < signal_rr_floor:
                 signal.passed = False
                 signal.rejection_reason = "RR_VALIDATION_ERROR"
                 self.telemetry.increment("setups_rr_checked")
@@ -1080,7 +1079,7 @@ class MarketScheduler:
                     await db.update_setup_record(signal.setup_id, status="rejected", rejection_reason=signal.rejection_reason)
                 await self._chart_activity(
                     "execution_rejected", symbol,
-                    f"⛔ **SETUP REJECTED — {symbol}**\nReason: `{signal.rejection_reason}`\nRR: `1:{signal.rr_ratio:.8f}` | Required minimum: `1:{signal_rr_floor:.8f}`\nNo sizing performed. No order submitted.",
+                    f"⛔ **SETUP REJECTED — {symbol}**\nTP source: `{signal.target_source or 'recorded signal'}` | TP price: `{signal.take_profit:.5f}`\nRisk distance: `{abs(signal.entry_price - signal.stop_loss):.5f}` | Reward distance: `{abs(signal.take_profit - signal.entry_price):.5f}`\nActual RR: `1:{signal.rr_ratio:.8f}` | Configured minimum RR: `1:{signal_rr_floor:.8f}`\nFinal decision: `{signal.rejection_reason}`\nNo sizing performed. No order submitted.",
                     fingerprint=f"{signal.setup_id}:rr-assert:{signal.rr_ratio:.8f}", essential=True,
                 )
                 return False

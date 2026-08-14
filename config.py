@@ -73,6 +73,8 @@ class TradeSettings:
     max_consecutive_losses: int = 3
     max_trades_per_day: int = 10
     max_open_positions: int = 2
+    # The sole authoritative RR filter. ``0`` disables RR rejection while
+    # preserving TP selection and actual-RR calculation/reporting.
     min_rr_ratio: float = 3.0
     # Quality ranks already-valid setups; it never replaces or relaxes a
     # structural validity gate. A zero floor allows DEMO research to observe
@@ -274,7 +276,7 @@ class TradeSettings:
             max_consecutive_losses=int(d.get("max_consecutive_losses", 3)),
             max_trades_per_day=int(d.get("max_trades_per_day", 10)),
             max_open_positions=int(d.get("max_open_positions", 2)),
-            min_rr_ratio=float(d.get("min_rr_ratio", 3.0)),
+            min_rr_ratio=max(0.0, float(d.get("min_rr_ratio", 3.0))),
             score_threshold=max(0.0, float(d.get("score_threshold", 0.0))),
             min_setup_score=max(0.0, float(d.get("min_setup_score", 0.0))),
             extreme_setup_score=float(d.get("extreme_setup_score", 90.0)),
@@ -376,7 +378,7 @@ class TradeSettings:
             max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3")),
             max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "10")),
             max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "2")),
-            min_rr_ratio=float(os.getenv("MIN_RR_RATIO", "3.0")),
+            min_rr_ratio=max(0.0, float(os.getenv("MIN_RR_RATIO", "3.0"))),
             score_threshold=float(os.getenv("SCORE_THRESHOLD", "0.0")),
             min_setup_score=float(os.getenv("MIN_SETUP_SCORE", "0.0")),
             extreme_setup_score=float(os.getenv("EXTREME_SETUP_SCORE", "90.0")),

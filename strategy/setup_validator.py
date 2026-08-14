@@ -97,6 +97,12 @@ def calculate_rr(direction: str, entry_price: float, stop_loss: float, take_prof
     return risk_distance, reward_distance, reward_distance / risk_distance
 
 
+def rr_filter_passes(actual_rr: float, configured_min_rr: float) -> bool:
+    """Apply the sole configurable RR filter; zero disables rejection by RR."""
+    minimum = max(0.0, float(configured_min_rr))
+    return minimum <= 0.0 or float(actual_rr) >= minimum
+
+
 def _event_matches_direction(event_type: StructureEventType, direction: str) -> bool:
     if direction == "BUY":
         return event_type in (StructureEventType.BOS_BULLISH, StructureEventType.CHOCH_BULLISH)
@@ -207,7 +213,7 @@ class SetupValidator:
 
     def __init__(
         self,
-        min_rr: float = 3.0,
+        min_rr: float = 0.0,
         min_sweep_penetration_atr: float = 0.05,
         displacement_body_ratio: float = 0.60,
         displacement_range_ratio: float = 1.20,
@@ -316,8 +322,9 @@ class SetupValidator:
         stop_valid = (requested_direction == "BUY" and 0 < stop_loss < entry) or (requested_direction == "SELL" and stop_loss > entry)
         result.checks.append(ValidationCheck("Executable stop", stop_valid, f"SL {stop_loss:.5f}" if stop_valid else "Could not derive valid stop"))
         risk = abs(entry - stop_loss)
+        # 1) TP selection: choose only the target produced by the selected
+        # market/policy target model. It never receives the RR filter value.
         target_candidates = select_market_targets(pools, requested_direction, entry)
-        required_rr = float(target_rr if target_rr is not None else self.min_rr)
         result.target_candidates = [
             {
                 "level": float(pool.level), "kind": pool.kind.value, "timeframe": pool.timeframe,
@@ -326,27 +333,13 @@ class SetupValidator:
             for pool in target_candidates
         ]
         target_pool = None
-        if target_model in {"liquidity", "structure", "dynamic", "adaptive"}:
-            # Preserve the nearest legitimate target first, then evaluate farther
-            # opposing structural pools only if they meet the required RR.
-            for pool in target_candidates:
-                candidate_rr = abs(float(pool.level) - entry) / risk if risk > 0 else 0.0
-                if candidate_rr >= required_rr:
-                    target_pool = pool
-                    result.target_source = f"liquidity:{pool.kind.value}"
-                    result.target_reason = f"Selected opposing unswept {pool.kind.value} liquidity at {pool.level:.5f}; RR {candidate_rr:.8f} meets {required_rr:.8f}"
-                    break
-            if target_pool is None and target_candidates:
-                # Keep the nearest structural target as diagnostic evidence. It
-                # remains RR-invalid and cannot pass into sizing or execution.
-                nearest = target_candidates[0]
-                target_pool = nearest
-                result.target_source = f"liquidity:{nearest.kind.value}"
-                result.target_reason = f"Nearest opposing unswept {nearest.kind.value} liquidity at {nearest.level:.5f} has RR {abs(float(nearest.level) - entry) / risk if risk > 0 else 0.0:.8f}; no legitimate structural alternative met {required_rr:.8f}"
+        if target_model in {"liquidity", "structure", "dynamic", "adaptive"} and target_candidates:
+            target_pool = target_candidates[0]
+            result.target_source = f"liquidity:{target_pool.kind.value}"
+            result.target_reason = f"Selected nearest opposing unswept {target_pool.kind.value} liquidity at {target_pool.level:.5f}"
         elif risk > 0 and target_rr is not None:
-            target_pool = None
-            result.target_source = "policy_rr_fallback"
-            result.target_reason = f"Policy fixed-RR target at {target_rr:.8f}R"
+            result.target_source = "policy_rr_target"
+            result.target_reason = f"Policy target model requested {target_rr:.8f}R"
         result.target_pool = target_pool
         if target_pool is not None:
             take_profit = float(target_pool.level)
@@ -357,10 +350,17 @@ class SetupValidator:
         result.take_profit = take_profit
         target_valid = (requested_direction == "BUY" and take_profit > entry) or (requested_direction == "SELL" and 0 < take_profit < entry)
         result.checks.append(ValidationCheck("Executable target", target_valid, f"TP {take_profit:.5f}" if target_valid else "Could not derive valid target"))
+
+        # 2) Actual RR calculation: always calculated from the TP and SL chosen above.
         _, _, result.rr_ratio = calculate_rr(requested_direction, entry, stop_loss, take_profit) if target_valid else (0.0, 0.0, 0.0)
-        rr_valid = target_valid and result.rr_ratio >= required_rr
-        result.checks.append(ValidationCheck("Minimum RR", rr_valid, f"RR {result.rr_ratio:.8f}; minimum {required_rr:.8f}; {result.target_reason or 'No target source'}"))
-        # Full-precision RR is a hard pre-sizing execution prerequisite.
+
+        # 3) RR filtering: only the explicitly configured ``min_rr`` controls
+        # rejection. Zero disables filtering without altering TP or actual RR.
+        configured_min_rr = max(0.0, float(self.min_rr))
+        rr_filter_enabled = configured_min_rr > 0.0
+        rr_valid = target_valid and rr_filter_passes(result.rr_ratio, configured_min_rr)
+        filter_text = f"minimum {configured_min_rr:.8f}" if rr_filter_enabled else "filter disabled (configured minimum 0)"
+        result.checks.append(ValidationCheck("Minimum RR", rr_valid, f"Actual RR {result.rr_ratio:.8f}; {filter_text}; {result.target_reason or 'No target source'}"))
         result.valid = stop_valid and target_valid and rr_valid
         return result
 
@@ -506,7 +506,7 @@ class SetupValidator:
             result.checks.append(
                 ValidationCheck(
                     "Minimum RR",
-                    result.rr_ratio >= self.min_rr,
+                    rr_filter_passes(result.rr_ratio, self.min_rr),
                     f"RR 1:{result.rr_ratio:.2f}; minimum 1:{self.min_rr:.2f}",
                 )
             )
@@ -525,6 +525,7 @@ class SetupValidator:
 
 __all__ = [
     "calculate_rr",
+    "rr_filter_passes",
     "EntryMode",
     "SetupValidationResult",
     "SetupValidator",

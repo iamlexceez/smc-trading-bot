@@ -1519,13 +1519,17 @@ class BotHandlers:
         if context.args:
             try:
                 val = float(context.args[0])
-                self.settings.min_rr_ratio = max(1.0, min(val, 20.0))
+                if val < 0 or val == float("inf") or val != val:
+                    raise ValueError
+                self.settings.min_rr_ratio = val
                 await db.save_settings(self.settings)
-                await update.message.reply_text(f"✅ Min RR set to 1:{self.settings.min_rr_ratio}")
+                state = "RR filtering disabled" if val == 0 else f"Min RR set to 1:{val:g}"
+                await update.message.reply_text(f"✅ {state}")
             except ValueError:
-                await update.message.reply_text("Usage: /rr 3.0")
+                await update.message.reply_text("Usage: /rr 0  (disable filtering)  or  /rr 3.0")
         else:
-            await update.message.reply_text(f"Current min RR: 1:{self.settings.min_rr_ratio}\nUsage: /rr 3.0")
+            state = "DISABLED (actual RR is still calculated and reported)" if self.settings.min_rr_ratio == 0 else f"1:{self.settings.min_rr_ratio:g}"
+            await update.message.reply_text(f"Current min RR: {state}\nUsage: /rr 0  or  /rr 3.0")
 
     @admin_only
     async def cmd_score(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1972,7 +1976,7 @@ class BotHandlers:
             )
         elif data == "set_rr":
             await query.edit_message_text(
-                f"Current min RR: 1:{self.settings.min_rr_ratio}\nUse command: /rr 3.0\n(Range: 1.0 - 20.0)",
+                f"Current min RR: {'DISABLED' if self.settings.min_rr_ratio == 0 else '1:' + format(self.settings.min_rr_ratio, 'g')}\nUse command: /rr 0 to disable filtering, or /rr 3.0\n(Range: 0 or any positive value)",
                 reply_markup=keyboards.settings_menu()
             )
         elif data == "set_score":

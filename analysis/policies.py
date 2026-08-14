@@ -81,8 +81,9 @@ class ExperimentalPolicy:
         """Policy-level decision only; it does not validate operational safety."""
         if self.score_floor is not None and score < self.score_floor:
             return False, f"Policy score floor {self.score_floor:.2f} not met"
-        if self.rr_target is not None and rr_ratio < self.rr_target:
-            return False, f"Policy RR target {self.rr_target:.2f} not met"
+        # ``rr_target`` is an experimental target-construction input, not an
+        # execution filter. The configured TradeSettings.min_rr_ratio is the
+        # sole authoritative RR filter and may be disabled at zero.
         required = set(self.required_features)
         entry_requirements = {
             "confirmation": {"ltf_confirmation"},

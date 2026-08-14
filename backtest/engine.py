@@ -258,7 +258,7 @@ class BacktestEngine:
                     htf_structures.append(analyze_structure(htf_slice, lookback=3))
 
             entry_mode = EntryMode.CONFIRMED if self.policy.entry_model == "confirmation" else EntryMode.AGGRESSIVE
-            required_rr = max(float(self.settings.min_rr_ratio), float(self.policy.rr_target or 0.0))
+            required_rr = max(0.0, float(self.settings.min_rr_ratio))
             validator = SetupValidator(
                 min_rr=required_rr,
                 min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
@@ -279,13 +279,17 @@ class BacktestEngine:
                     zones=zones,
                     entry_mode=entry_mode,
                     ltf_df=slice_df,
-                    target_rr=required_rr,
+                    target_rr=self.policy.rr_target,
                     stop_model=self.policy.stop_model,
                     target_model=self.policy.target_model,
                 )
                 if not validation.valid:
                     continue
-                quality = score_setup_quality(validation, structure, min_score=0.0, extreme_score=self.settings.extreme_setup_score)
+                quality = score_setup_quality(
+                    validation, structure, min_score=0.0,
+                    extreme_score=self.settings.extreme_setup_score,
+                    rr_reference=required_rr,
+                )
                 features = {check.name.lower().replace("/", "_").replace(" ", "_"): check.passed for check in validation.checks}
                 features.update({
                     "bos_choch": features.get("bos_choch_confirmation", False),
