@@ -1356,14 +1356,14 @@ def test_causal_replay_safety() -> None:
     management.open_trade = replay_trade("BUY", 98.0, 110.0)
     management.open_trade.experimental_policy = management_policy.to_dict()
     history = pd.DataFrame([
-        {"time": pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(minutes=index), "open": 100.0, "high": 100.1, "low": 99.9, "close": 100.0, "volume": 1.0}
+        {"time": pd.Timestamp("2026-01-01T00:00:00Z") + pd.to_timedelta(index, unit="min"), "open": 100.0, "high": 100.1, "low": 99.9, "close": 100.0, "volume": 1.0}
         for index in range(29)
     ] + [{"time": pd.Timestamp("2026-01-01T00:29:00Z"), "open": 100.0, "high": 101.1, "low": 99.2, "close": 101.0, "volume": 1.0}])
     management.replay_management_bar(history, len(history) - 1, 0.01)
     assert_true(management.open_trade.sl_modifications == 1 and management.open_trade.breakeven_activated, "replay management action was not recorded from the existing TradeManager")
 
     bars = pd.DataFrame([
-        {"time": pd.Timestamp("2026-01-02T00:00:00Z") + pd.Timedelta(minutes=index), "open": 100.0 + index * 0.01, "high": 100.1 + index * 0.01, "low": 99.9 + index * 0.01, "close": 100.0 + index * 0.01, "volume": 1.0}
+        {"time": pd.Timestamp("2026-01-02T00:00:00Z") + pd.to_timedelta(index, unit="min"), "open": 100.0 + index * 0.01, "high": 100.1 + index * 0.01, "low": 99.9 + index * 0.01, "close": 100.0 + index * 0.01, "volume": 1.0}
         for index in range(55)
     ])
     causal = make_engine(); result = causal.run(bars, [], "TEST", "M5")

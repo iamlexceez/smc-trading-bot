@@ -21,6 +21,19 @@ def _finite(value: Any, default: float = 0.0) -> float:
     return number if math.isfinite(number) else default
 
 
+def uncertainty_label(sample_size: int, conservative_ev: float, *, conflict: bool = False) -> str:
+    """Classify uncertainty separately from technical setup score."""
+    if conflict:
+        return "CONFLICTED"
+    if sample_size < 3:
+        return "INSUFFICIENT_EVIDENCE"
+    if sample_size < 10:
+        return "HIGH"
+    if sample_size < 30:
+        return "MEDIUM"
+    return "LOW" if conservative_ev > 0 else "MEDIUM"
+
+
 def atr_series(frame: pd.DataFrame, period: int = 14) -> pd.Series:
     high_low = frame["high"] - frame["low"]
     high_close = (frame["high"] - frame["close"].shift()).abs()
@@ -172,6 +185,7 @@ def rank_opportunities(
         )
         geometry_fit = 1.0 if geometry_valid else 0.0
         conflict = 1.0 if symbol in open_set else 0.0
+        uncertainty = uncertainty_label(sample, conservative_ev, conflict=bool(conflict))
         score = quality * 0.45 + strategy_score * 0.10 + adx * 8.0 + volatility_fit * 7.0 + momentum * 6.0 + evidence_strength * 12.0 + target_reach_fit * 4.0 + profile_expectancy * 4.0 + geometry_fit * 4.0 - conflict * 18.0
         rationale = [f"setup quality {quality:.1f}/100", f"{context.get('regime', 'UNKNOWN').lower()} regime", f"strategy {selected_strategy} score {strategy_score:.1f}/100"]
         if evidence_strength > 0:
@@ -204,6 +218,7 @@ def rank_opportunities(
             "expectancy_ci95_high_r": strategy_evidence.get("expectancy_ci95_high_r"),
             "target_reach_probability": target_reach,
             "confidence": strategy_evidence.get("confidence", "UNKNOWN"),
+            "uncertainty": uncertainty,
             "evidence_stage": strategy_evidence.get("evidence_stage", "exploration"),
             "sample_size": strategy_evidence.get("sample_size", 0),
             "average_mae_r": strategy_evidence.get("average_mae_r"),
@@ -215,13 +230,24 @@ def rank_opportunities(
             "primary_thesis": dict(getattr(signal, "primary_thesis", {}) or {}),
             "alternative_theses": list(getattr(signal, "alternative_theses", []) or []),
             "thesis": list(rationale),
+            "why_selected": "Pending comparative ranking; this field is filled after all eligible candidates are ordered.",
+            "why_not_selected": "Pending comparative ranking; this field is filled after all eligible candidates are ordered.",
         }
         ranked.append(Opportunity(symbol, round(score, 4), classification, tuple(rationale), context, conflict, details))
     ranked.sort(key=lambda item: (-item.score, item.portfolio_conflict, item.symbol))
     if ranked:
         top = ranked[0]
-        ranked[0] = Opportunity(top.symbol, top.score, "BEST_OPPORTUNITY", top.rationale, top.context, top.portfolio_conflict, top.details)
+        top_details = dict(top.details)
+        top_details["why_selected"] = f"Ranked first at {top.score:.1f}; strongest eligible combination of setup quality, context, evidence, and execution geometry."
+        top_details["why_not_selected"] = ""
+        ranked[0] = Opportunity(top.symbol, top.score, "BEST_OPPORTUNITY", top.rationale, top.context, top.portfolio_conflict, top_details)
+        for index, item in enumerate(ranked[1:], start=2):
+            details = dict(item.details)
+            gap = top.score - item.score
+            details["why_selected"] = ""
+            details["why_not_selected"] = f"Ranked #{index}, {gap:.1f} points behind the leading opportunity; review its uncertainty, evidence, and portfolio impact before selection."
+            ranked[index - 1] = Opportunity(item.symbol, item.score, item.classification, item.rationale, item.context, item.portfolio_conflict, details)
     return ranked
 
 
-__all__ = ["Opportunity", "adx_series", "atr_series", "market_context", "rank_opportunities", "rsi_series"]
+__all__ = ["Opportunity", "adx_series", "atr_series", "market_context", "rank_opportunities", "rsi_series", "uncertainty_label"]

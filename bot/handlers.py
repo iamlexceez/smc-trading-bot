@@ -959,11 +959,12 @@ class BotHandlers:
                 f"{rank}. {item.get('symbol')} — {item.get('classification')}",
                 f"Strategy: {details.get('strategy') or 'UNKNOWN'} | Evidence stage: {details.get('evidence_stage') or 'exploration'} | Regime: {details.get('regime') or item.get('context', {}).get('regime', 'UNKNOWN')} | Transition: {details.get('regime_transition') or 'UNKNOWN'} | Direction: {details.get('direction') or 'UNKNOWN'} | Timeframe: {details.get('timeframe') or 'UNKNOWN'}",
                 f"Opportunity score: {float(item.get('score') or 0.0):.1f}/100 | Setup: {float(details.get('setup_score') or 0.0):.1f}/100 | Strategy fit: {float(details.get('strategy_score') or 0.0):.1f}/100",
-                f"Completed evidence: {details.get('confidence') or 'UNKNOWN'} | n={int(details.get('sample_size') or 0)} | expectancy {expectancy_text} | conservative EV {conservative_ev_text} | uncertainty {uncertainty_text}",
+                f"Completed evidence: {details.get('confidence') or 'UNKNOWN'} | n={int(details.get('sample_size') or 0)} | expectancy {expectancy_text} | conservative EV {conservative_ev_text} | uncertainty {details.get('uncertainty') or uncertainty_text}",
                 f"MAE {details.get('average_mae_r') if details.get('average_mae_r') is not None else 'UNKNOWN'}R | MFE {details.get('average_mfe_r') if details.get('average_mfe_r') is not None else 'UNKNOWN'}R | target-reach {details.get('target_reach_probability') if details.get('target_reach_probability') is not None else 'UNKNOWN'} | geometry present: {'YES' if details.get('execution_geometry_present') else 'NO'}",
                 f"Entry {details.get('entry')} | SL {details.get('stop_loss')} | TP {details.get('take_profit')} | actual RR 1:{float(details.get('rr') or 0.0):.2f}",
                 f"Layering evidence-supported: {'YES' if details.get('layering_suitability') else 'NO'} | Portfolio impact: {float(details.get('portfolio_conflict') or 0.0):.1f}",
                 "Thesis: " + "; ".join(item.get("rationale") or ["no descriptive thesis available"]),
+                "Selection: " + (details.get("why_selected") or details.get("why_not_selected") or "comparative explanation unavailable"),
             ])
         report = "\n".join(lines)
         if len(report) <= 3900:
