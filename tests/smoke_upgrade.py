@@ -971,6 +971,49 @@ async def test_objective_phase_lifecycle() -> None:
         assert_true(failed and failed["status"] == "failed" and failed["completion_reason"] == "CAPITAL_EXHAUSTED", "verified phase failure was not preserved")
 
 
+async def test_legacy_objective_phase_migration() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "legacy_objective.db")
+        await db.init_db(path)
+        account = {"equity": 50.0, "free_margin": 50.0, "currency": "USD"}
+        objective = TradingObjective(raw_instruction="legacy", account_mode="demo", starting_capital=50.0, target_capital=500.0)
+        await db.create_objective_draft(
+            account_mode="demo", raw_instruction="legacy", objective=objective.to_dict(), account_snapshot=account,
+            broker_universe=["Boom 100 Index"], context={"operational": {"allowed_symbols": ["Boom 100 Index"], "full_auto": True}}, db_path=path,
+        )
+        active = await db.confirm_objective_draft("demo", db_path=path)
+        engine = object.__new__(scheduler.MarketScheduler)
+        engine.settings = TradeSettings.defaults()
+        engine.settings.market_ranking_lookback_days = 30
+        engine.last_capital_state = {"account": account, "demo_session_id": None, "minimum_operating_capital": 1.0}
+        async def _notify(_message: str, *args, **kwargs):
+            return None
+        engine._notify = _notify
+        original_summary = db.get_management_learning_summary
+        original_create = db.create_objective_phase_plan
+        original_update = db.update_active_objective_context
+        async def _summary(**kwargs):
+            return await original_summary(db_path=path, **kwargs)
+        async def _create(**kwargs):
+            return await original_create(db_path=path, **kwargs)
+        async def _update(objective_id, context):
+            return await original_update(objective_id, context, db_path=path)
+        db.get_management_learning_summary = _summary
+        db.create_objective_phase_plan = _create
+        db.update_active_objective_context = _update
+        try:
+            migrated = await engine._ensure_objective_phase_plan(active)
+        finally:
+            db.get_management_learning_summary = original_summary
+            db.create_objective_phase_plan = original_create
+            db.update_active_objective_context = original_update
+        phases = await db.list_objective_phases(active["id"], db_path=path)
+        phase_data = (migrated.get("context") or {}).get("operational") or {}
+        assert_true(phases and phases[0]["status"] == "active", "legacy confirmed objective did not receive an active phase")
+        assert_true(phase_data.get("phase_plan", {}).get("phase_targets", [])[-1] == 500.0, "legacy phase migration changed the objective target")
+        assert_true(phase_data.get("allowed_symbols") == ["Boom 100 Index"], "legacy phase migration changed the broker-resolved objective allowlist")
+
+
 def test_causal_replay_safety() -> None:
     def make_engine(policy: ExperimentalPolicy | None = None) -> BacktestEngine:
         return BacktestEngine(settings=TradeSettings.defaults(), policy=policy or ExperimentalPolicy(
@@ -1164,6 +1207,7 @@ def run() -> None:
     asyncio.run(test_sizing_rejection_diagnostic_persistence())
     asyncio.run(test_objective_console_safety())
     asyncio.run(test_objective_phase_lifecycle())
+    asyncio.run(test_legacy_objective_phase_migration())
     test_causal_replay_safety()
     asyncio.run(test_adaptive_management_learning_evidence())
     test_research_governance_rankings()

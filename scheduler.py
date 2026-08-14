@@ -42,6 +42,7 @@ from analysis.account_monitor import AccountReconciliationEngine
 from analysis.capital_state import AccountCapitalState, CapitalStateService
 from analysis.runtime_telemetry import RuntimeTelemetry
 from analysis.objectives import phase_for_equity
+from analysis.objective_phases import plan_objective_phases
 from data.provider import DataProvider
 from data.universe import DerivMarketUniverse
 
@@ -129,6 +130,56 @@ class MarketScheduler:
     def _execution_symbol_is_selected(self, symbol: str) -> bool:
         return str(symbol) in self._execution_selected_symbols
 
+    async def _ensure_objective_phase_plan(self, active: dict) -> dict:
+        """Backfill one phase plan for a legacy confirmed growth objective.
+
+        This is idempotent and preserves the exact confirmed target, mode, and
+        allowed instruments. It is a lifecycle migration, not a strategy reset.
+        """
+        context = dict(active.get("context") or {})
+        operational = dict(context.get("operational") or {})
+        if operational.get("phase_plan") or operational.get("terminal"):
+            return active
+        objective = dict(active.get("objective") or {})
+        try:
+            target = float(objective.get("target_capital"))
+            starting = float(objective.get("starting_capital") or (self.last_capital_state.get("account") or {}).get("equity"))
+        except (TypeError, ValueError):
+            return active
+        if starting <= 0 or target <= starting:
+            return active
+        evidence = await db.get_management_learning_summary(
+            account_mode="demo", days=self.settings.market_ranking_lookback_days
+        )
+        plan = plan_objective_phases(
+            starting_equity=starting, target_equity=target,
+            minimum_operating_capital=float(self.last_capital_state.get("minimum_operating_capital") or 0.0),
+            historical_evidence=evidence,
+        )
+        allowed = list(operational.get("allowed_symbols") or active.get("broker_universe") or [])
+        phases = await db.create_objective_phase_plan(
+            objective_id=int(active["id"]), demo_session_id=self.last_capital_state.get("demo_session_id"),
+            starting_equity=starting, phase_targets=list(plan.phase_targets),
+            policy_snapshot={"model_version": self.settings.active_model_version, "migration": "legacy_confirmed_objective"},
+            instruments=allowed,
+        )
+        active_phase = phases[0]
+        operational.update({
+            "phase_plan": plan.to_dict(), "phase_id": active_phase["id"],
+            "phase_number": active_phase["phase_number"], "phase_target_equity": active_phase["target_equity"],
+            "phase_status": active_phase["status"],
+        })
+        context["operational"] = operational
+        migrated = await db.update_active_objective_context(int(active["id"]), context)
+        if migrated:
+            logger.info("Backfilled %s adaptive phases for confirmed objective v%s", len(phases), active.get("version"))
+            await self._notify(
+                "🎯 **OBJECTIVE PHASE PLAN ACTIVATED**\n"
+                f"Objective v{active.get('version')} | Phase 1: `${float(active_phase['starting_equity']):.2f}` → `${float(active_phase['target_equity']):.2f}`\n"
+                f"Adaptive milestones: `{len(phases)}`. The existing full-auto DEMO execution path remains active."
+            )
+        return migrated or active
+
     async def _apply_operational_objective(self, broker_usable_symbols: list[str] | tuple[str, ...], snapshot: dict) -> list[str]:
         """Return the objective-scoped execution universe from fresh broker facts.
 
@@ -140,6 +191,7 @@ class MarketScheduler:
         if not active:
             self._operational_objective = {}
             return list(snapshot["market_selection"]["selected_symbols"])
+        active = await self._ensure_objective_phase_plan(active)
         if active.get("is_paused"):
             self._operational_objective = {"id": active.get("id"), "version": active.get("version"), "status": "PAUSED"}
             snapshot["market_selection"] = {
