@@ -41,6 +41,7 @@ from analysis.research_governance import ResearchGovernance
 from analysis.account_monitor import AccountReconciliationEngine
 from analysis.capital_state import AccountCapitalState, CapitalStateService
 from analysis.runtime_telemetry import RuntimeTelemetry
+from analysis.objectives import phase_for_equity
 from data.provider import DataProvider
 from data.universe import DerivMarketUniverse
 
@@ -96,6 +97,10 @@ class MarketScheduler:
         # Separate from broker eligibility: this is the current bounded,
         # evidence-governed cohort permitted to open new strategy exposure.
         self._execution_selected_symbols: tuple[str, ...] = ()
+        # Confirmed Objective Console state. It scopes the existing scanner and
+        # final execution gate, but never replaces broker eligibility or the
+        # existing MT5 execution/risk/management engines.
+        self._operational_objective: dict = {}
         # One full scan can be lengthy across a broker-verified universe. All
         # triggers share this guard, preventing duplicate analysis or execution.
         self._scan_lock = asyncio.Lock()
@@ -118,6 +123,64 @@ class MarketScheduler:
     def _execution_symbol_is_selected(self, symbol: str) -> bool:
         return str(symbol) in self._execution_selected_symbols
 
+    async def _apply_operational_objective(self, broker_usable_symbols: list[str] | tuple[str, ...], snapshot: dict) -> list[str]:
+        """Return the objective-scoped execution universe from fresh broker facts.
+
+        An explicit confirmed objective is an allowlist, never a hint. If its
+        previously resolved broker symbols are no longer usable, selection fails
+        closed rather than silently substituting another instrument.
+        """
+        active = await db.get_active_objective(self.settings.trading_mode)
+        if not active:
+            self._operational_objective = {}
+            return list(snapshot["market_selection"]["selected_symbols"])
+        if active.get("is_paused"):
+            self._operational_objective = {"id": active.get("id"), "version": active.get("version"), "status": "PAUSED"}
+            snapshot["market_selection"] = {
+                **snapshot["market_selection"], "state": "objective_paused",
+                "selected_symbols": [], "disabled_symbols": sorted({str(symbol) for symbol in broker_usable_symbols}),
+            }
+            return []
+        context = dict(active.get("context") or {})
+        operational = dict(context.get("operational") or {})
+        if not operational:
+            self._operational_objective = {}
+            return list(snapshot["market_selection"]["selected_symbols"])
+        usable = {str(symbol) for symbol in broker_usable_symbols}
+        resolved = [str(symbol) for symbol in operational.get("allowed_symbols") or []]
+        explicit = bool(operational.get("explicit_symbol_universe"))
+        unavailable = [symbol for symbol in resolved if symbol not in usable]
+        if explicit and (not resolved or unavailable):
+            self._operational_objective = {
+                **operational, "id": active.get("id"), "version": active.get("version"),
+                "status": "BROKER_RESOLUTION_BLOCKED", "unavailable_symbols": unavailable,
+            }
+            snapshot["market_selection"] = {
+                **snapshot["market_selection"], "state": "objective_resolution_blocked",
+                "selected_symbols": [], "disabled_symbols": sorted(usable),
+            }
+            return []
+        selected = resolved if explicit else list(snapshot["market_selection"]["selected_symbols"])
+        current_equity = ((getattr(self, "last_capital_state", {}) or {}).get("account") or {}).get("equity")
+        operational_phase = phase_for_equity(operational.get("starting_capital"), current_equity)
+        self._operational_objective = {
+            **operational, "id": active.get("id"), "version": active.get("version"),
+            "status": "ACTIVE", "allowed_symbols": selected,
+            "phase": operational_phase if operational_phase != "UNAVAILABLE" else operational.get("phase", "UNAVAILABLE"),
+            "current_equity": current_equity,
+        }
+        snapshot["market_selection"] = {
+            **snapshot["market_selection"],
+            "state": "objective_explicit_universe" if explicit else snapshot["market_selection"]["state"],
+            "selected_symbols": selected,
+            "disabled_symbols": sorted(usable - set(selected)),
+        }
+        return selected
+
+    def _objective_min_rr(self) -> float:
+        value = self._operational_objective.get("minimum_rr") if self._operational_objective else None
+        return max(0.0, float(self.settings.min_rr_ratio if value is None else value))
+
     async def refresh_research_governance(self, broker_usable_symbols: list[str] | tuple[str, ...]) -> dict:
         """Select the bounded execution cohort from fresh broker facts and DEMO evidence.
 
@@ -134,12 +197,12 @@ class MarketScheduler:
         snapshot = self.research_governance.governance_snapshot(
             broker_usable_symbols, outcomes, models
         )
-        selected = list(snapshot["market_selection"]["selected_symbols"])
+        selected = await self._apply_operational_objective(broker_usable_symbols, snapshot)
         self._set_execution_selected_symbols(selected)
         self.settings.enabled_symbols = selected
         self.last_research_governance = snapshot
         logger.info(
-            "[RESEARCH GOVERNANCE] state=%s broker_usable=%s selected=%s disabled=%s top_strategies=%s",
+            "[EXECUTION UNIVERSE] state=%s broker_usable=%s selected=%s disabled=%s top_strategies=%s",
             snapshot["market_selection"]["state"],
             snapshot["market_selection"]["universe_size"],
             len(selected),
@@ -992,7 +1055,7 @@ class MarketScheduler:
 
         # The persisted setting is the sole RR filter. An experimental policy's
         # rr_target remains a TP-model input and never raises the filter floor.
-        required_rr = max(0.0, float(self.settings.min_rr_ratio))
+        required_rr = self._objective_min_rr()
         validator = SetupValidator(
             min_rr=required_rr,
             min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
@@ -1123,7 +1186,8 @@ class MarketScheduler:
     async def scan_markets(self) -> list[TradeSignal]:
         """Scan only the current broker-validated usable handoff and return accepted signals."""
         signals = []
-        for symbol in self._analysis_eligible_symbols:
+        scan_symbols = self._execution_selected_symbols or self._analysis_eligible_symbols
+        for symbol in scan_symbols:
             try:
                 signal = await self.analyze_symbol(symbol)
                 if signal and signal.passed:
@@ -1312,15 +1376,16 @@ class MarketScheduler:
             # Reserve risk for the planned basket now. Layers are not blindly
             # opened together: only L1 executes; each later layer is contingent
             # on fresh thesis confirmation and remaining basket risk.
+            objective_layering_disabled = bool(self._operational_objective) and str(self._operational_objective.get("layering_preference") or "enabled") == "disabled"
             layers = self.risk_manager.get_layering_plan(
                 sizing.final_volume,
                 signal.entry_price,
                 signal.stop_loss,
                 sym_info,
                 account_equity=equity,
-                allocation=list(signal.experimental_policy.get("layer_allocation") or [1.0]),
-                max_layers=int(signal.experimental_policy.get("max_layers", 0)),
-                layer_style=str(signal.experimental_policy.get("layer_style", "none")),
+                allocation=([1.0] if objective_layering_disabled else list(signal.experimental_policy.get("layer_allocation") or [1.0])),
+                max_layers=(0 if objective_layering_disabled else int(signal.experimental_policy.get("max_layers", 0))),
+                layer_style=("none" if objective_layering_disabled else str(signal.experimental_policy.get("layer_style", "none"))),
             )
             if not layers:
                 signal.passed = False

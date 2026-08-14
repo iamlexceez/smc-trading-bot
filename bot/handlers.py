@@ -39,7 +39,7 @@ from storage import db
 from analysis.scoring import format_signal_report
 from analysis.profiler import profiler
 from analysis.order_flow import order_flow
-from analysis.objectives import ObjectiveInterpreter, ObjectivePreview, ObjectiveValidation, ObjectiveValidator, TradingObjective, phase_for_equity
+from analysis.objectives import ObjectiveInterpreter, ObjectivePreview, ObjectiveValidation, ObjectiveValidator, TradingObjective, phase_for_equity, resolve_requested_symbols
 from bot.account_views import LiveAccountViews
 from bot.capital_views import capital_actions_view, capital_test_view, demo_session_report_view
 from risk.manager import RiskManager
@@ -157,6 +157,14 @@ class BotHandlers:
         capital_state = str((capital or {}).get("state") or "NOT YET VERIFIED")
         minimum_operating = float((capital or {}).get("minimum_operating_capital") or 0.0)
         capital_action = "RESET DEMO ACCOUNT" if capital_state == "CAPITAL_EXHAUSTED" else ("USE /resume AFTER VERIFIED RESET" if capital_state == "AWAITING_RESUME" else "MONITORING")
+        active_objective = await db.get_active_objective(self.settings.trading_mode)
+        if active_objective and not active_objective.get("is_paused"):
+            operational = (active_objective.get("context") or {}).get("operational") or {}
+            objective_line = f"Objective v{active_objective.get('version')}: FULL AUTO | {len(operational.get('allowed_symbols') or [])} operational instrument(s) | phase {operational.get('phase', 'UNAVAILABLE')}"
+        elif active_objective:
+            objective_line = f"Objective v{active_objective.get('version')}: OPERATIONAL PAUSE"
+        else:
+            objective_line = "Objective: no confirmed operational objective"
         return "\n".join([
             "🤖 **DERIV AUTONOMOUS RESEARCH SYSTEM**",
             f"Mode: `{self.settings.trading_mode.upper()}` | Autonomous execution: `{'ON' if self.settings.auto_trade and not self.settings.is_paused else 'OFF'}`",
@@ -165,6 +173,7 @@ class BotHandlers:
             f"Champion: `{model_text}` | Forward-DEMO challenger: `{experiment_text}`",
             f"Capital state: `{capital_state}` | Minimum operating capital: `${minimum_operating:.2f}` | Action: `{capital_action}`",
             f"Research engine: `{'enabled' if self.settings.self_optimization_enabled else 'disabled'}` — policy variables are learned from evidence, not fixed global caps.",
+            f"{objective_line}",
             "\nUse the research controls below. LIVE always requires a separate explicit confirmation.",
         ])
 
@@ -192,6 +201,25 @@ class BotHandlers:
         return account, state, ()
 
     @staticmethod
+    def _operational_objective_config(objective: TradingObjective, *, resolved_symbols: tuple[str, ...], broker_usable_symbols: tuple[str, ...], account: dict, phase: str) -> dict:
+        explicit = bool(objective.requested_symbols)
+        allowed = list(resolved_symbols) if explicit else list(broker_usable_symbols)
+        return {
+            "status": "ACTIVE", "account_mode": objective.account_mode,
+            "starting_capital": objective.starting_capital if objective.starting_capital is not None else account.get("equity"),
+            "target_capital": objective.target_capital,
+            "growth_preference": objective.growth_preference,
+            "capital_protection_preference": objective.capital_protection_preference,
+            "allowed_symbols": allowed, "explicit_symbol_universe": explicit,
+            "minimum_rr": objective.minimum_rr,
+            "layering_preference": objective.layering_preference,
+            "adaptive_sizing": objective.adaptive_sizing,
+            "adaptive_management": objective.adaptive_management,
+            "adaptive_learning": objective.adaptive_learning,
+            "full_auto": True, "phase": phase,
+        }
+
+    @staticmethod
     def _format_objective_preview(preview: ObjectivePreview, *, heading: str = "🎯 **OBJECTIVE DRAFT**") -> str:
         objective = preview.objective
         validation = preview.validation
@@ -205,12 +233,13 @@ class BotHandlers:
             f"Target capital: `${objective.target_capital:,.2f}`" if objective.target_capital is not None else "Target capital: Not specified",
             f"Target multiple: `{multiple}`",
             f"Growth preference: `{objective.growth_preference.upper()}` | Capital protection: `{objective.capital_protection_preference.upper()}`",
-            f"Minimum RR context: `{rr}` | Layering preference: `{objective.layering_preference.upper()}`",
+            f"Minimum RR: `{rr}` | Layering: `{objective.layering_preference.upper()}` | Mode: `FULL AUTO`",
             f"Adaptive sizing: `{'ON' if objective.adaptive_sizing else 'OFF'}` | Adaptive TP/SL: `{'ON' if objective.adaptive_management else 'OFF'}` | Learning: `{'ON' if objective.adaptive_learning else 'OFF'}`",
             f"Phase: `{preview.phase}` | Inherited account mode: `{objective.account_mode.upper()}`",
             "", "**Fresh broker evidence**",
             f"State: `{account.get('state') or 'current reconciliation'}` | Equity: `{account.get('currency') or 'USD'} {float(account.get('equity') or 0.0):,.2f}` | Free margin: `{account.get('currency') or 'USD'} {float(account.get('free_margin') or 0.0):,.2f}`",
             f"Broker-usable symbols: `{usable}`",
+            "Resolved active instruments: " + (", ".join(f"{row.get('requested')} → {row.get('broker_symbol') or 'UNRESOLVED'} ({row.get('status')})" for row in preview.resolved_symbols) if preview.resolved_symbols else "Dynamic broker-verified Synthetic Indices / Gold universe"),
         ]
         if validation.errors:
             lines.extend(["", "**Errors — confirmation blocked**", *[f"❌ {item}" for item in validation.errors]])
@@ -236,11 +265,14 @@ class BotHandlers:
                 return
             account, state, usable = await self._objective_facts(refresh=True)
             objective = ObjectiveInterpreter().parse(instruction, account_mode=mode)
-            validation = ObjectiveValidator.validate(objective, account_snapshot=account, account_state=state, broker_usable_symbols=usable)
-            preview = ObjectivePreview(objective, validation, {**account, "state": state}, usable, phase_for_equity(objective.starting_capital, account.get("equity")))
+            resolved, resolution = resolve_requested_symbols(objective.requested_symbols, usable)
+            validation = ObjectiveValidator.validate(objective, account_snapshot=account, account_state=state, broker_usable_symbols=usable, resolved_symbols=resolution)
+            phase = phase_for_equity(objective.starting_capital or account.get("equity"), account.get("equity"))
+            preview = ObjectivePreview(objective, validation, {**account, "state": state}, usable, phase, resolution)
+            operational = self._operational_objective_config(objective, resolved_symbols=resolved, broker_usable_symbols=usable, account=account, phase=phase)
             await db.create_objective_draft(
                 account_mode=mode, raw_instruction=instruction, objective=objective.to_dict(), account_snapshot={**account, "state": state},
-                broker_universe=list(usable), context=preview.to_dict(),
+                broker_universe=list(usable), context={**preview.to_dict(), "operational": operational},
             )
             await reply.reply_text(self._format_objective_preview(preview) + "\n\nUse `/objective confirm` to apply this valid draft or `/objective cancel` to discard it.", parse_mode="Markdown")
             return
@@ -253,15 +285,39 @@ class BotHandlers:
             objective = TradingObjective.from_dict(draft["objective"])
             # The configured account mode is authoritative; an instruction can never switch it.
             objective = TradingObjective.from_dict({**objective.to_dict(), "account_mode": mode})
-            validation = ObjectiveValidator.validate(objective, account_snapshot=account, account_state=state, broker_usable_symbols=usable)
-            preview = ObjectivePreview(objective, validation, {**account, "state": state}, usable, phase_for_equity(objective.starting_capital, account.get("equity")))
+            resolved, resolution = resolve_requested_symbols(objective.requested_symbols, usable)
+            validation = ObjectiveValidator.validate(objective, account_snapshot=account, account_state=state, broker_usable_symbols=usable, resolved_symbols=resolution)
+            phase = phase_for_equity(objective.starting_capital or account.get("equity"), account.get("equity"))
+            preview = ObjectivePreview(objective, validation, {**account, "state": state}, usable, phase, resolution)
+            operational = self._operational_objective_config(objective, resolved_symbols=resolved, broker_usable_symbols=usable, account=account, phase=phase)
             if not validation.valid:
                 await reply.reply_text(self._format_objective_preview(preview) + "\n\n❌ Objective was not activated.", parse_mode="Markdown")
                 return
             active = await db.confirm_objective_draft(
-                mode, objective=objective.to_dict(), account_snapshot={**account, "state": state}, broker_universe=list(usable), context=preview.to_dict(),
+                mode, objective=objective.to_dict(), account_snapshot={**account, "state": state}, broker_universe=list(usable), context={**preview.to_dict(), "operational": operational},
             )
-            await reply.reply_text(self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active['version']} ACTIVE**") + "\n\nThe objective is now recorded as research context. It cannot directly submit or modify an MT5 trade.", parse_mode="Markdown")
+            # Explicit confirmation activates DEMO full auto through the existing
+            # scheduler; the parser never owns MT5 submission itself.
+            if mode == "demo":
+                self.settings.auto_trade = True
+                # This is the existing optimizer switch; it remains background
+                # work and is never an execution prerequisite.
+                self.settings.self_optimization_enabled = bool(objective.adaptive_learning)
+                await db.save_settings(self.settings)
+                if self.scheduler:
+                    self.scheduler.settings = self.settings
+                    self.scheduler.risk_manager.settings = self.settings
+                    if not self.settings.is_paused:
+                        self.scheduler._start_background_task("objective_activation_scan", self.scheduler.activate_and_scan_now())
+            active_text = self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active['version']} ACTIVE**")
+            active_text += "\n\n🟢 **FULL AUTO DEMO ACTIVE**\nThe existing scanner is now evaluating only the resolved objective universe. Valid setups continue through existing SMC, sizing, broker, TP/SL, position-management, and MT5 execution gates. Learning runs in the background."
+            await reply.reply_text(active_text, parse_mode="Markdown")
+            return
+        if action == "resume":
+            changed = await db.set_objective_paused(mode, False)
+            if changed and self.scheduler and self.settings.auto_trade and not self.settings.is_paused:
+                self.scheduler._start_background_task("objective_resume_scan", self.scheduler.activate_and_scan_now())
+            await reply.reply_text("Operational objective resumed; the existing DEMO scanner is refreshing the confirmed objective universe." if changed else "No active objective exists to resume.")
             return
         if action == "cancel":
             cancelled = await db.cancel_objective_draft(mode)
@@ -280,14 +336,15 @@ class BotHandlers:
             return
         if action == "pause":
             changed = await db.set_objective_paused(mode, True)
-            await reply.reply_text("Objective-driven research context paused. The scanner, broker safety checks, and current position management remain unchanged." if changed else "No active objective exists to pause.")
+            await reply.reply_text("Operational objective paused. New objective-scoped scanning is suspended; broker safety checks and current position management remain active." if changed else "No active objective exists to pause.")
             return
         active = await db.get_active_objective(mode)
         if action == "explain" and active:
             context_data = active.get("context") or {}
             await reply.reply_text(
-                f"🎯 **OBJECTIVE EXPLANATION — v{active.get('version')}**\n\nPhase: `{context_data.get('phase', 'UNAVAILABLE')}` | paused: `{'YES' if active.get('is_paused') else 'NO'}`\n"
-                "The objective supplies user intent and reporting context only. The existing experimental-policy engine still selects, validates, and evaluates policies from historical, validation, out-of-sample, and forward-DEMO evidence. It does not set a lot, SL, TP, margin amount, or submit an order.",
+                f"🧠 **ACTIVE OBJECTIVE — v{active.get('version')}**\n\nPhase: `{context_data.get('phase', 'UNAVAILABLE')}` | operational pause: `{'YES' if active.get('is_paused') else 'NO'}`\n"
+                f"Mode: `FULL AUTO {active.get('account_mode', 'demo').upper()}`\nAllowed instruments: `{', '.join((context_data.get('operational') or {}).get('allowed_symbols') or []) or 'dynamic broker-verified universe'}`\n"
+                "The confirmed objective controls the existing scanner and new-exposure allowlist. Existing SMC, policy, sizing, broker margin, TP/SL, position-management, emergency-stop, and MT5 execution components remain the only mechanisms that decide and submit technically valid orders. Learning continues in the background and does not wait before scanning.",
                 parse_mode="Markdown",
             )
             return
@@ -300,8 +357,12 @@ class BotHandlers:
             bool(validation_data.get("valid", True)), tuple(validation_data.get("errors") or ()),
             tuple(validation_data.get("warnings") or ()), tuple(validation_data.get("info") or ()),
         )
-        preview = ObjectivePreview(objective, validation, active.get("account_snapshot") or {}, tuple(active.get("broker_universe") or ()), str((active.get("context") or {}).get("phase") or "UNAVAILABLE"))
-        await reply.reply_text(self._format_objective_preview(preview, heading=f"🎯 **ACTIVE OBJECTIVE v{active.get('version')}**") + ("\n\n⏸ Objective-driven research context is paused." if active.get("is_paused") else ""), parse_mode="Markdown")
+        current_account, current_state, current_usable = await self._objective_facts(refresh=False)
+        display_account = {**(current_account or active.get("account_snapshot") or {}), "state": current_state}
+        operational = (active.get("context") or {}).get("operational") or {}
+        display_phase = phase_for_equity(operational.get("starting_capital") or objective.starting_capital, display_account.get("equity"))
+        preview = ObjectivePreview(objective, validation, display_account, current_usable or tuple(active.get("broker_universe") or ()), display_phase, tuple((active.get("context") or {}).get("resolved_symbols") or ()))
+        await reply.reply_text(self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active.get('version')} ACTIVE**") + ("\n\n⏸ Operational objective is paused." if active.get("is_paused") else "\n\n🟢 Scanner and automatic execution use this objective's operational universe."), parse_mode="Markdown")
 
     @admin_only
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

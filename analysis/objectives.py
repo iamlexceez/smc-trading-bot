@@ -1,9 +1,10 @@
-"""Natural-language objective domain layer for the autonomous research system.
+"""Natural-language operational-objective domain layer.
 
 This module intentionally has no broker, MT5, executor, scheduler, or order
-imports.  It accepts only already-obtained account/universe facts and returns
-user-intent context.  Existing broker validation and experimental policy
-selection remain authoritative for every execution decision.
+imports. It turns confirmed user intent plus already-obtained broker facts
+into a strict operational configuration for the existing trading pipeline.
+The existing execution engine remains authoritative for broker validation and
+order submission.
 """
 
 from __future__ import annotations
@@ -20,6 +21,34 @@ _RR_PATTERNS = (
 )
 _DAILY_RE = re.compile(r"(?:daily|per\s+day)[^0-9]{0,24}([0-9]+(?:\.[0-9]+)?)\s*%", re.I)
 _SYMBOL_RE = re.compile(r"\b(?:XAU[A-Za-z]{3,12}|[A-Z]{6})\b")
+_EXPLICIT_INSTRUMENT_RE = re.compile(
+    r"\b(?:boom|crash|volatility|jump|range\s+break|step|drift\s+switch|trek|skew\s+step)\s*\d+(?:\s*\(\s*\d+s?\s*\))?(?:\s+index)?\b|\bxauusd(?:micro)?\b",
+    re.I,
+)
+
+
+def _symbol_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def resolve_requested_symbols(requested_symbols: Iterable[str], broker_usable_symbols: Iterable[str]) -> tuple[tuple[str, ...], tuple[dict[str, str], ...]]:
+    """Resolve each explicitly requested instrument to one current broker symbol.
+
+    Matching is strict after case/spacing/punctuation normalization. A phrase
+    may never silently expand to another product family or a substitute market.
+    """
+    usable = tuple(str(symbol).strip() for symbol in broker_usable_symbols if str(symbol).strip())
+    by_key = {_symbol_key(symbol): symbol for symbol in usable}
+    resolved: list[str] = []
+    evidence: list[dict[str, str]] = []
+    for requested in requested_symbols:
+        actual = by_key.get(_symbol_key(requested))
+        if actual:
+            resolved.append(actual)
+            evidence.append({"requested": str(requested), "broker_symbol": actual, "status": "BROKER_VERIFIED"})
+        else:
+            evidence.append({"requested": str(requested), "broker_symbol": "", "status": "UNRESOLVED", "reason": "No broker-valid matching symbol found"})
+    return tuple(resolved), tuple(evidence)
 
 
 @dataclass(frozen=True)
@@ -38,6 +67,7 @@ class TradingObjective:
     adaptive_learning: bool = True
     layering_preference: str = "enabled"  # enabled | disabled | unspecified
     account_mode: str = "demo"  # inherited from the existing bot; never parsed as a switch.
+    full_auto: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -80,9 +110,11 @@ class ObjectivePreview:
     account_snapshot: dict[str, Any]
     broker_usable_symbols: tuple[str, ...]
     phase: str
+    resolved_symbols: tuple[dict[str, str], ...] = ()
     execution_boundary: str = (
-        "Objective context cannot calculate lots, submit orders, modify positions, "
-        "or bypass broker, margin, portfolio, RR, or emergency-stop validation."
+        "After confirmation, the operational objective scopes the existing scanner and "
+        "auto-execution pipeline. The existing execution engine still owns broker, margin, "
+        "portfolio, RR, emergency-stop, and order-submission validation."
     )
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +124,7 @@ class ObjectivePreview:
             "account_snapshot": dict(self.account_snapshot),
             "broker_usable_symbols": list(self.broker_usable_symbols),
             "phase": self.phase,
+            "resolved_symbols": [dict(row) for row in self.resolved_symbols],
             "execution_boundary": self.execution_boundary,
         }
 
@@ -117,7 +150,15 @@ class ObjectiveInterpreter:
         target = money[1] if len(money) >= 2 else None
         rr = next((match.search(low) for match in _RR_PATTERNS if match.search(low)), None)
         daily = _DAILY_RE.search(low)
-        symbols = tuple(sorted(set(symbol.upper() for symbol in _SYMBOL_RE.findall(text))))
+        explicit_phrases = [match.group(0).strip() for match in _EXPLICIT_INSTRUMENT_RE.finditer(text)]
+        symbols_list: list[str] = []
+        seen_symbol_keys: set[str] = set()
+        for candidate in [*explicit_phrases, *(symbol.upper() for symbol in _SYMBOL_RE.findall(text))]:
+            key = _symbol_key(candidate)
+            if key and key not in seen_symbol_keys:
+                symbols_list.append(candidate)
+                seen_symbol_keys.add(key)
+        symbols = tuple(symbols_list)
         requested_universe = ["synthetic_indices", "gold"]
         if "synthetic" not in low and ("gold" in low or "xau" in low):
             requested_universe = ["gold"]
@@ -142,6 +183,7 @@ class ObjectiveInterpreter:
             # This deliberately inherits the active configured mode. A sentence
             # can never independently switch DEMO to LIVE.
             account_mode=str(account_mode or "demo").lower(),
+            full_auto=any(term in low for term in ("fully automate", "full auto", "automatic execution", "automate everything")),
         )
 
 
@@ -171,6 +213,7 @@ class ObjectiveValidator:
         account_snapshot: Optional[dict[str, Any]],
         account_state: str,
         broker_usable_symbols: Iterable[str],
+        resolved_symbols: Optional[Iterable[dict[str, str]]] = None,
     ) -> ObjectiveValidation:
         errors: list[str] = []
         warnings: list[str] = []
@@ -191,26 +234,32 @@ class ObjectiveValidator:
             errors.append("Minimum RR cannot be negative; use 0 to disable RR filtering while retaining RR calculation.")
         if objective.daily_target_percent is not None and not 0 < objective.daily_target_percent <= 100:
             errors.append("Daily target percentage must be greater than 0 and no more than 100.")
+        if objective.full_auto and objective.account_mode != "demo":
+            errors.append("FULL AUTO objective activation is DEMO-only; LIVE requires the separate existing mode confirmation and never auto-activates from an objective.")
         if not usable:
             errors.append("Broker-approved target universe is unavailable; objective confirmation is blocked.")
         if not account or account.get("equity") is None or account.get("free_margin") is None:
             errors.append("Fresh broker account state is unavailable; objective confirmation is blocked.")
         if state in {"ACCOUNT_STATE_UNKNOWN", "TARGET_UNIVERSE_INITIALIZING", "TARGET_UNIVERSE_EMPTY", "TARGET_SYMBOLS_VALIDATING", "TARGET_SYMBOLS_INVALID"}:
             errors.append(f"Current broker account state is {state}; objective confirmation is blocked.")
-        usable_by_upper = {symbol.upper(): symbol for symbol in usable}
-        unsupported = [symbol for symbol in objective.requested_symbols if symbol.upper() not in usable_by_upper]
-        if unsupported:
-            errors.append("Unsupported or unavailable requested instrument(s): " + ", ".join(unsupported) + ".")
+        resolution = tuple(resolved_symbols or ())
+        unresolved = [str(row.get("requested") or "") for row in resolution if str(row.get("status") or "") != "BROKER_VERIFIED"]
+        if unresolved:
+            errors.append("Unsupported or unavailable requested instrument(s): " + ", ".join(unresolved) + ".")
+        elif objective.requested_symbols and not resolution:
+            errors.append("Requested instruments could not be broker-resolved; objective confirmation is blocked.")
         if objective.target_multiple is not None and objective.target_multiple >= 10:
             warnings.append(f"Growth objective is {objective.target_multiple:.1f}× starting capital. It is a target, not a guaranteed return.")
         if objective.minimum_rr == 0:
             info.append("Minimum RR request is 0: actual RR remains calculated and displayed, but RR alone will not reject a setup.")
         info.append(f"Objective inherits the existing {objective.account_mode.upper()} account mode and cannot switch it.")
-        info.append("Objective preferences are research context only. Existing broker, margin, portfolio, emergency-stop, and execution validation remain mandatory.")
+        if objective.full_auto:
+            info.append("FULL AUTO was requested. After confirmation, the existing DEMO scanner will immediately evaluate only the resolved operational universe.")
+        info.append("After confirmation, objective preferences become an operational scope for the existing scanner and auto-execution pipeline. Existing broker, margin, portfolio, emergency-stop, and execution validation remain mandatory.")
         return ObjectiveValidation(valid=not errors, errors=tuple(errors), warnings=tuple(warnings), info=tuple(info))
 
 
 __all__ = [
     "ObjectiveInterpreter", "ObjectivePreview", "ObjectiveValidation", "ObjectiveValidator",
-    "TradingObjective", "phase_for_equity",
+    "TradingObjective", "phase_for_equity", "resolve_requested_symbols",
 ]

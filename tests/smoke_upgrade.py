@@ -33,7 +33,7 @@ from data.provider import DataProvider
 from analysis.optimizer import SelfOptimizer
 from analysis.research_governance import ResearchGovernance
 from analysis.adaptive_management import observation_from_broker_trade, observations_from_backtest, summarize_management
-from analysis.objectives import ObjectiveInterpreter, ObjectiveValidator, TradingObjective, phase_for_equity
+from analysis.objectives import ObjectiveInterpreter, ObjectiveValidator, TradingObjective, phase_for_equity, resolve_requested_symbols
 from backtest.engine import BacktestEngine, BacktestResult, BacktestTrade
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 from analysis.account_monitor import summarize_history, exposure_summary
@@ -802,9 +802,23 @@ async def test_objective_console_safety() -> None:
     assert_true(not below_validation.valid and below_validation.errors, "target below starting capital remained confirmable")
 
     unsupported = interpreter.parse("Start with $50 and aim for $100 with XAUEUR", account_mode="demo")
-    unsupported_validation = ObjectiveValidator.validate(unsupported, account_snapshot=account, account_state="ACCOUNT_VERIFIED", broker_usable_symbols=usable)
+    _, unsupported_resolution = resolve_requested_symbols(unsupported.requested_symbols, usable)
+    unsupported_validation = ObjectiveValidator.validate(unsupported, account_snapshot=account, account_state="ACCOUNT_VERIFIED", broker_usable_symbols=usable, resolved_symbols=unsupported_resolution)
     assert_true(not unsupported_validation.valid and any("XAUEUR" in error for error in unsupported_validation.errors), "unsupported broker symbol was not blocked")
     assert_true(not hasattr(interpreter, "executor") and not hasattr(interpreter, "mt5"), "objective parser was given an execution boundary")
+
+    requested = interpreter.parse(
+        "Start with $50, aim for $10,000 aggressively while protecting capital aggressively. "
+        "Trade only Boom 100 Index, Boom 500 Index, Volatility 75 Index and XAUUSDmicro. "
+        "Use layering, adaptive sizing, adaptive TP/SL and learning. Fully automate everything.",
+        account_mode="demo",
+    )
+    requested_usable = ("Boom 100 Index", "Boom 500 Index", "Volatility 75 Index", "XAUUSDmicro", "Crash 500 Index")
+    resolved, resolution = resolve_requested_symbols(requested.requested_symbols, requested_usable)
+    requested_validation = ObjectiveValidator.validate(requested, account_snapshot=account, account_state="ACCOUNT_VERIFIED", broker_usable_symbols=requested_usable, resolved_symbols=resolution)
+    assert_true(requested.full_auto and requested_validation.valid, "fully automated DEMO objective was not parsed as confirmable")
+    assert_true(resolved == ("Boom 100 Index", "Boom 500 Index", "Volatility 75 Index", "XAUUSDmicro"), "explicit objective instruments were not resolved exactly against broker symbols")
+    assert_true("Crash 500 Index" not in resolved and all(row["status"] == "BROKER_VERIFIED" for row in resolution), "objective universe silently expanded or unresolved a requested instrument")
 
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "objectives.db")
@@ -830,6 +844,28 @@ async def test_objective_console_safety() -> None:
         assert_true(await db.set_objective_paused("demo", True, db_path=path), "active objective context did not accept a pause request")
         paused = await db.get_active_objective("demo", db_path=path)
         assert_true(paused and paused["is_paused"], "objective pause state was not persisted")
+
+    # The scheduler must honor a confirmed explicit objective instead of the
+    # normal evidence-governed top-ten cohort. This fixture has no MT5/executor.
+    engine = object.__new__(scheduler.MarketScheduler)
+    engine.settings = TradeSettings.defaults()
+    engine.settings.trading_mode = "demo"
+    engine._operational_objective = {}
+    active_fixture = {
+        "id": 7, "version": 3, "is_paused": False,
+        "context": {"operational": {"explicit_symbol_universe": True, "allowed_symbols": list(resolved), "minimum_rr": 0.0, "layering_preference": "enabled", "full_auto": True}},
+    }
+    original_get_active = db.get_active_objective
+    async def _fixture_active_objective(_mode: str):
+        return active_fixture
+    db.get_active_objective = _fixture_active_objective
+    try:
+        snapshot = {"market_selection": {"state": "ranked", "selected_symbols": ["Crash 500 Index"], "disabled_symbols": [], "universe_size": len(requested_usable)}}
+        scoped = await engine._apply_operational_objective(requested_usable, snapshot)
+    finally:
+        db.get_active_objective = original_get_active
+    assert_true(scoped == list(resolved) and snapshot["market_selection"]["state"] == "objective_explicit_universe", "confirmed objective did not override research cohort with its explicit broker-verified allowlist")
+    assert_true(engine._objective_min_rr() == 0.0 and "Crash 500 Index" not in scoped, "objective RR or strict instrument operational settings were not applied")
 
 
 def test_causal_replay_safety() -> None:
