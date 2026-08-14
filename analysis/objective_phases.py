@@ -8,7 +8,7 @@ components.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import ceil, log
+from math import ceil, isfinite, log
 from typing import Any, Mapping
 
 
@@ -31,10 +31,12 @@ class ObjectivePhasePlan:
 
 
 def _num(value: Any, fallback: float = 0.0) -> float:
+    """Return a finite numeric value; legacy telemetry may contain NaN/Infinity."""
     try:
-        return float(value)
+        numeric = float(value)
     except (TypeError, ValueError):
         return fallback
+    return numeric if isfinite(numeric) else fallback
 
 
 def plan_objective_phases(

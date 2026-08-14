@@ -1015,6 +1015,11 @@ async def test_objective_phase_lifecycle() -> None:
     )
     assert_true(plan.phase_targets[-1] == 10_000.0 and len(plan.phase_targets) >= 2, "adaptive phase plan did not preserve the exact final objective target")
     assert_true(all(right > left for left, right in zip((10.0, *plan.phase_targets[:-1]), plan.phase_targets)), "adaptive phase plan produced a non-increasing milestone")
+    legacy_evidence_plan = plan_objective_phases(
+        starting_equity=48.61, target_equity=10_000.0, minimum_operating_capital=float("nan"),
+        historical_evidence={"sample_size": float("nan"), "expectancy_r": float("inf"), "max_drawdown_r": float("-inf")},
+    )
+    assert_true(legacy_evidence_plan.phase_targets[-1] == 10_000.0 and len(legacy_evidence_plan.phase_targets) >= 2, "non-finite legacy learning evidence prevented adaptive objective phase planning")
 
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "phases.db")
