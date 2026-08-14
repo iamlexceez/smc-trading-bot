@@ -1006,7 +1006,7 @@ class MarketScheduler:
 
         await self._chart_activity(
             "setup_validated", symbol,
-            f"✅ **EXPERIMENT CANDIDATE ACCEPTED — {symbol}**\nPolicy: `{policy_version or self.settings.active_model_version}` | Direction: `{direction}` | Timeframe: `{primary_tf}`\nFeature rank: `{quality.score:.1f}/100` | Entry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}` | TP: `{validation.take_profit:.5f}` | RR: `1:{validation.rr_ratio:.2f}`",
+            f"✅ **EXPERIMENT CANDIDATE ACCEPTED — {symbol}**\nPolicy: `{policy_version or self.settings.active_model_version}` | Direction: `{direction}` | Timeframe: `{primary_tf}`\nTP source: `{validation.target_source or 'none'}` | TP price: `{validation.take_profit:.5f}`\nEntry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}`\nRisk distance: `{abs(validation.entry_price - validation.stop_loss):.5f}` | Reward distance: `{abs(validation.take_profit - validation.entry_price):.5f}`\nActual RR: `1:{validation.rr_ratio:.8f}` | Configured minimum RR: `1:{required_rr:.8f}`\nFinal decision: `ACCEPTED` | Feature rank: `{quality.score:.1f}/100`\nTP detail: {validation.target_reason or 'No target detail recorded'}",
             fingerprint=f"{bar_time}:{direction}:{policy.fingerprint}:{validation.entry_price}:{validation.stop_loss}:{validation.take_profit}",
         )
 
