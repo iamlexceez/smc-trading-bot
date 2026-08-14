@@ -109,6 +109,56 @@ class CapitalReductionEngine:
         ratio = max(0.0, min(1.0, active_remaining / reference))
         return ratio, ratio * ratio
 
+    async def _protective_levels_for_plan(self, plan: ReductionPlan) -> tuple[Optional[dict], str]:
+        """Build positive, broker-normalized emergency protection for one reduction order.
+
+        The reduction order is closed immediately after fill, but it must still
+        be technically protected during that brief interval. This method does
+        not bypass MT5 validation; it supplies valid inputs to it.
+        """
+        try:
+            info = await self.executor.get_symbol_info(plan.symbol)
+        except Exception as exc:
+            return None, f"broker symbol specification unavailable for protective levels: {type(exc).__name__}"
+        tick_size = self._number((info or {}).get("tick_size") or (info or {}).get("pip_size"))
+        if plan.entry_price <= 0 or tick_size <= 0:
+            return None, "positive broker entry price and tick size are required for protective levels"
+        # The MT5 preflight then expands this conservative seed to the actual
+        # broker stop/freeze distance and tick grid.
+        distance = max(tick_size * 2.0, plan.entry_price * 1e-6)
+        if str(plan.direction).upper() == "SELL":
+            raw_sl = plan.entry_price + distance
+            raw_tp = plan.entry_price - distance
+            if raw_tp <= 0:
+                raw_tp = plan.entry_price * 0.5
+        else:
+            raw_sl = plan.entry_price - distance
+            if raw_sl <= 0:
+                raw_sl = plan.entry_price * 0.5
+            raw_tp = plan.entry_price + distance
+        if raw_sl <= 0 or raw_tp <= 0:
+            return None, "could not derive positive protective SL/TP from current broker price"
+        validate = getattr(self.executor, "validate_market_order_stops", None)
+        if not callable(validate):
+            return {"sl": raw_sl, "tp": raw_tp, "source": "positive_seed_no_preflight"}, ""
+        try:
+            checked = await validate(plan.symbol, plan.direction, raw_sl, raw_tp)
+        except Exception as exc:
+            return None, f"broker stop preflight raised {type(exc).__name__}"
+        if not checked or not checked.get("available"):
+            # The normal executor remains the final authority where a test or
+            # non-MT5 backend does not expose a read-only stop preflight.
+            return {"sl": raw_sl, "tp": raw_tp, "source": "positive_seed_preflight_unavailable"}, ""
+        if not checked.get("valid"):
+            return None, "broker stop preflight rejected reduction protection: " + str(checked.get("reason") or "unknown reason")
+        sl, tp = self._number(checked.get("sl")), self._number(checked.get("tp"))
+        if sl <= 0 or tp <= 0:
+            return None, "broker stop preflight returned non-positive protective levels"
+        return {
+            "sl": sl, "tp": tp, "source": "broker_normalized",
+            "entry_price": checked.get("entry_price"), "minimum_distance": checked.get("minimum_distance"),
+        }, ""
+
     async def _plan_round_trip(self, account: dict, remaining: float, tolerance: float, overshoot_tolerance: float = 0.0, initial_required_reduction: Optional[float] = None) -> tuple[Optional[ReductionPlan], str, dict]:
         """Choose the largest practical broker-valid DEMO reduction action.
 
@@ -313,6 +363,11 @@ class CapitalReductionEngine:
             equity = self._number(account.get("equity"))
             balance = self._number(account.get("balance"))
             target = self._number(session.get("target_equity"))
+            if target <= 0:
+                reason = "Persisted capital-reduction target is non-positive; no broker order was attempted"
+                await db.update_capital_reduction_session(session["id"], status="failed", current_equity=equity, current_balance=balance, error_reason=reason)
+                await db.record_capital_reduction_action(session_id=session["id"], action="invalid_session_target", status="failed", equity_before=equity, details={"reason": reason, "stored_target": session.get("target_equity")})
+                return {"state": "failed", "reason": reason, "session_id": session["id"], "target": target, "current_equity": equity}
             tolerance = self._effective_tolerance(target, self._number(session.get("tolerance")), self._number((session.get("metadata") or {}).get("tolerance_percent")))
             overshoot_tolerance = self._effective_tolerance(
                 target,
@@ -348,10 +403,23 @@ class CapitalReductionEngine:
             await db.update_capital_reduction_session(session["id"], error_reason="", metadata=metadata)
             await db.record_capital_reduction_action(session_id=session["id"], action="planning_selected", status="executing", symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=plan.entry_price, equity_before=equity, details={"mode": "AGGRESSIVE_TAPERED", "remaining": remaining, "effective_tolerance": tolerance, "configured_overshoot_tolerance": overshoot_tolerance, "tapered_overshoot_tolerance": diagnostic.get("tapered_overshoot_tolerance"), "proximity_ratio": diagnostic.get("proximity_ratio"), "aggression_factor": diagnostic.get("aggression_factor"), "valid_candidate_count": diagnostic.get("valid_candidate_count", 0), "reason": "Largest valid reduction candidate under target-proximity taper", "expected_loss": plan.expected_loss, "required_margin": plan.required_margin, "minimum_loss": plan.minimum_loss, "maximum_reduction": plan.maximum_reduction})
 
+            protection, protection_reason = await self._protective_levels_for_plan(plan)
+            if not protection:
+                metadata["runtime_state"] = "BLOCKED"
+                metadata["protective_level_error"] = protection_reason
+                await db.update_capital_reduction_session(session["id"], status="blocked", error_reason=protection_reason, metadata=metadata)
+                await db.record_capital_reduction_action(
+                    session_id=session["id"], action="protective_level_blocked", status="blocked",
+                    symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=plan.entry_price,
+                    equity_before=equity, details={"reason": protection_reason},
+                )
+                return {"state": "blocked", "reason": protection_reason, "session_id": session["id"]}
+            metadata["protective_levels"] = protection
+            await db.update_capital_reduction_session(session["id"], metadata=metadata)
             comment = f"{self.COMMENT_PREFIX}:{session['id']}"
             result = await self.executor.execute_trade(
                 symbol=plan.symbol, direction=plan.direction, lot_size=plan.volume,
-                sl=0.0, tp=0.0, magic=int(self.settings.magic_number) + 91_000,
+                sl=float(protection["sl"]), tp=float(protection["tp"]), magic=int(self.settings.magic_number) + 91_000,
                 comment=comment,
             )
             if not result.success or result.ticket is None:
@@ -364,7 +432,7 @@ class CapitalReductionEngine:
                 return {"state": status, "reason": reason, "session_id": session["id"]}
 
             self._consecutive_failures = 0
-            await db.record_capital_reduction_action(session_id=session["id"], action="order_filled", status="open", symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=result.entry_price, ticket=result.ticket, equity_before=equity, details={"expected_spread_cost": plan.expected_loss, "required_margin": plan.required_margin, "comment": comment})
+            await db.record_capital_reduction_action(session_id=session["id"], action="order_filled", status="open", symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=result.entry_price, ticket=result.ticket, equity_before=equity, details={"expected_spread_cost": plan.expected_loss, "required_margin": plan.required_margin, "comment": comment, "protective_levels": protection})
             closed = await self.executor.close_position(int(result.ticket))
             if not closed:
                 reason = "Reduction position was opened but could not be closed; engine hard-stopped to avoid an unmanaged loop"

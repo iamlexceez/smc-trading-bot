@@ -596,12 +596,16 @@ async def test_sequential_capital_reduction_planning() -> None:
                 {"broker_account_mode": "demo", "equity": 88.0, "balance": 88.0, "free_margin": 1_000.0, "leverage": 10.0},
             ])
             self.submissions = 0
+            self.orders: list[dict] = []
 
         async def get_account_info(self):
             return next(self.accounts)
 
         async def execute_trade(self, **kwargs):
             self.submissions += 1
+            self.orders.append(dict(kwargs))
+            if float(kwargs.get("sl") or 0.0) <= 0 or float(kwargs.get("tp") or 0.0) <= 0:
+                return SimpleNamespace(success=False, message="fixture rejected non-positive protection")
             return SimpleNamespace(success=True, ticket=self.submissions, entry_price=101.0, message="")
 
         async def close_position(self, ticket):
@@ -629,6 +633,15 @@ async def test_sequential_capital_reduction_planning() -> None:
     closed = [row for row in actions if row.get("action") == "round_trip_closed"]
     assert_true([row.get("equity_after") for row in closed] == [94.0, 88.0], "sequential reduction did not record actual broker equity after each close")
     assert_true(first["expected_loss"] != first["equity_before"] - first["equity_after"], "test fixture did not prove realized account movement is distinct from the estimate")
+    assert_true(all(float(order["sl"]) > 0 and float(order["tp"]) > 0 for order in executor.orders), "capital reduction submitted a non-positive SL/TP instead of broker-valid emergency protection")
+
+    invalid_target_session = {"id": 99, "status": "active", "target_equity": 0.0, "tolerance": 0.0, "metadata": {}}
+    invalid_executor = SequentialExecutor()
+    with patch.object(capital_reduction_module.db, "get_active_capital_reduction_session", new=AsyncMock(return_value=invalid_target_session)), \
+         patch.object(capital_reduction_module.db, "update_capital_reduction_session", new=AsyncMock()), \
+         patch.object(capital_reduction_module.db, "record_capital_reduction_action", new=AsyncMock()):
+        invalid_target = await CapitalReductionEngine(settings, invalid_executor).run_once()
+    assert_true(invalid_target["state"] == "failed" and invalid_executor.submissions == 0 and "non-positive" in invalid_target["reason"], "zero persisted target reached order planning or broker submission")
 
     tolerance_session = {"id": 2, "status": "active", "target_equity": 80.0, "tolerance": 1.0, "metadata": {"tolerance_percent": 0.0}}
     class ToleranceExecutor(SequentialExecutor):
