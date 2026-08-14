@@ -45,7 +45,7 @@ from analysis.capital_state import AccountCapitalState, CapitalStateService
 from analysis.runtime_telemetry import RuntimeTelemetry
 from strategy.setup_validator import calculate_rr, rr_filter_passes
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
-from bot.handlers import BotHandlers  # noqa: F401 — validates Telegram control imports.
+from bot.handlers import BotHandlers, admin_only  # noqa: F401 — validates Telegram control imports.
 
 
 def assert_true(condition: bool, message: str) -> None:
@@ -849,6 +849,31 @@ async def test_sizing_rejection_diagnostic_persistence() -> None:
         assert_true(latest["details"]["sizing_inputs"]["risk_pct"] == 1.0, "latest sizing rejection lost sizing inputs")
 
 
+async def test_admin_command_error_reply() -> None:
+    class Reply:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+            self.text = "/objective"
+
+        async def reply_text(self, text: str, **kwargs) -> None:
+            self.messages.append(text)
+
+    class UpdateFixture:
+        def __init__(self) -> None:
+            self.effective_user = SimpleNamespace(id=1)
+            self.message = Reply()
+            self.callback_query = None
+
+    @admin_only
+    async def _broken_command(_self, _update, _context):
+        raise RuntimeError("fixture failure")
+
+    update = UpdateFixture()
+    with patch("bot.handlers.is_admin", return_value=True):
+        await _broken_command(object(), update, SimpleNamespace())
+    assert_true(update.message.messages and "COMMAND ERROR" in update.message.messages[0] and "RuntimeError" in update.message.messages[0], "admin command exceptions still failed silently in Telegram")
+
+
 async def test_objective_console_safety() -> None:
     interpreter = ObjectiveInterpreter()
     account = {"equity": 152.60, "free_margin": 152.60, "currency": "USD"}
@@ -1249,6 +1274,7 @@ def run() -> None:
     asyncio.run(test_sequential_capital_reduction_planning())
     asyncio.run(test_broker_authoritative_capital_state())
     asyncio.run(test_sizing_rejection_diagnostic_persistence())
+    asyncio.run(test_admin_command_error_reply())
     asyncio.run(test_objective_console_safety())
     asyncio.run(test_objective_phase_lifecycle())
     asyncio.run(test_legacy_objective_phase_migration())

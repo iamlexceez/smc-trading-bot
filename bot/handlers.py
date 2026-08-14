@@ -66,7 +66,23 @@ def admin_only(func):
                     "Add your Telegram ID to TELEGRAM_ADMIN_IDS in .env"
                 )
             return
-        return await func(self, update, context, *args, **kwargs)
+        try:
+            return await func(self, update, context, *args, **kwargs)
+        except Exception as exc:
+            command = getattr(getattr(update, "message", None), "text", None) or getattr(getattr(update, "callback_query", None), "data", None) or "command"
+            logger.exception("Telegram command failed: %s", command)
+            reply = update.callback_query.message if update.callback_query else update.message
+            if reply:
+                try:
+                    await reply.reply_text(
+                        "❌ **COMMAND ERROR**\n"
+                        f"`{str(command)[:80]}` could not complete: `{type(exc).__name__}`.\n"
+                        "The bot remains running. Use `/engine` for read-only diagnostics; the detailed traceback is in the VPS bot log."
+                        , parse_mode="Markdown"
+                    )
+                except Exception:
+                    logger.exception("Could not send Telegram command error reply")
+            return None
     return wrapper
 
 
