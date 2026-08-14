@@ -66,6 +66,17 @@ class BaseExecutor(ABC):
         """Place a market order with SL and TP."""
         ...
 
+    async def execute_immediate_close_order(
+        self, symbol: str, direction: str, lot_size: float, magic: int, comment: str = ""
+    ) -> Optional[ExecutionResult]:
+        """Submit a broker-preflighted market order deliberately intended for immediate close.
+
+        This optional path omits SL/TP rather than supplying invalid placeholders.
+        Callers must close a successful order immediately and fail closed if the
+        backend does not implement it.
+        """
+        return None
+
     @abstractmethod
     async def close_position(self, ticket: int) -> bool:
         """Close an open position by ticket."""

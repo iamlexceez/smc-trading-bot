@@ -638,6 +638,34 @@ async def test_sequential_capital_reduction_planning() -> None:
     assert_true(first["expected_loss"] != first["equity_before"] - first["equity_after"], "test fixture did not prove realized account movement is distinct from the estimate")
     assert_true(all(float(order["sl"]) > 0 and float(order["tp"]) > 0 for order in executor.orders), "capital reduction submitted a non-positive SL/TP instead of broker-valid emergency protection")
 
+    class ImmediateCloseExecutor(SequentialExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.immediate_submissions = 0
+            self.protected_submissions = 0
+
+        async def execute_immediate_close_order(self, **kwargs):
+            self.immediate_submissions += 1
+            return SimpleNamespace(success=True, ticket=700 + self.immediate_submissions, entry_price=101.0, message="")
+
+        async def execute_trade(self, **kwargs):
+            self.protected_submissions += 1
+            return SimpleNamespace(success=False, message="protected fallback should not be used")
+
+    immediate_executor = ImmediateCloseExecutor()
+    immediate_session = {"id": 77, "status": "active", "target_equity": 80.0, "tolerance": 0.0, "metadata": {"tolerance_percent": 0.0}}
+    immediate_actions: list[dict] = []
+    async def record_immediate_action(**kwargs):
+        immediate_actions.append(kwargs)
+        return len(immediate_actions)
+    with patch.object(capital_reduction_module.db, "get_active_capital_reduction_session", new=AsyncMock(return_value=immediate_session)), \
+         patch.object(capital_reduction_module.db, "update_capital_reduction_session", new=AsyncMock()), \
+         patch.object(capital_reduction_module.db, "record_capital_reduction_action", new=record_immediate_action):
+        immediate_result = await CapitalReductionEngine(settings, immediate_executor).run_once()
+    filled = next(row for row in immediate_actions if row.get("action") == "order_filled")
+    assert_true(immediate_result["state"] == "waiting" and immediate_executor.immediate_submissions == 1 and immediate_executor.protected_submissions == 0, "capital reduction did not use the dedicated immediate-close route")
+    assert_true(filled["details"]["submission"]["route"] == "broker_preflighted_immediate_close", "capital reduction did not retain immediate-close submission evidence")
+
     invalid_target_session = {"id": 99, "status": "active", "target_equity": 0.0, "tolerance": 0.0, "metadata": {}}
     invalid_executor = SequentialExecutor()
     with patch.object(capital_reduction_module.db, "get_active_capital_reduction_session", new=AsyncMock(return_value=invalid_target_session)), \

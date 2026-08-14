@@ -706,6 +706,62 @@ class MT5Executor(BaseExecutor):
             cls._round_to_tick(float(tp) + distance, tick_size, digits, upward=True),
         )
 
+    async def execute_immediate_close_order(
+        self, symbol: str, direction: str, lot_size: float, magic: int, comment: str = ""
+    ) -> ExecutionResult:
+        """Submit one broker-preflighted market order with no SL/TP for immediate close.
+
+        This route exists solely for the isolated DEMO capital-reduction engine.
+        It never substitutes zero levels into the protected strategy-order path.
+        MT5 ``order_check`` validates the exact no-SL/TP request before send.
+        """
+        if not MT5_AVAILABLE:
+            return ExecutionResult(success=False, message="MT5 package not available")
+        if not await self._ensure_connected():
+            return ExecutionResult(success=False, message="MT5 not connected")
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            return ExecutionResult(success=False, message=f"Symbol {symbol} not found in MT5")
+        if not info.visible and not mt5.symbol_select(symbol, True):
+            return ExecutionResult(success=False, message=f"Failed to select {symbol}")
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return ExecutionResult(success=False, message=f"No tick for {symbol}")
+        is_buy = str(direction).upper() == "BUY"
+        price = float(getattr(tick, "ask" if is_buy else "bid", 0.0) or 0.0)
+        if price <= 0 or float(lot_size) <= 0:
+            return ExecutionResult(success=False, message="Immediate-close order requires positive broker price and volume")
+        order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+        filling_mode = mt5.ORDER_FILLING_IOC
+        sym_filling = getattr(info, "filling_mode", 0)
+        if sym_filling & 1:
+            filling_mode = mt5.ORDER_FILLING_FOK
+        elif sym_filling & 2:
+            filling_mode = mt5.ORDER_FILLING_IOC
+        else:
+            filling_mode = mt5.ORDER_FILLING_RETURN
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lot_size),
+            "type": order_type, "price": price, "sl": 0.0, "tp": 0.0,
+            "deviation": 20, "magic": magic, "comment": comment or "CAPITAL_REDUCTION",
+            "type_time": mt5.ORDER_TIME_GTC, "type_filling": filling_mode,
+        }
+        check = mt5.order_check(request)
+        if check is None:
+            return ExecutionResult(success=False, message=f"Immediate-close MT5 order_check returned None: {mt5.last_error()}", entry_price=price, lot_size=float(lot_size))
+        if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
+            return ExecutionResult(success=False, message=(
+                f"Immediate-close MT5 order_check failed: retcode={check.retcode}, comment={check.comment}; "
+                f"price={price:.10g}, stops_level={getattr(info, 'trade_stops_level', 0)}, "
+                f"freeze_level={getattr(info, 'trade_freeze_level', 0)}"
+            ), entry_price=price, lot_size=float(lot_size))
+        result = mt5.order_send(request)
+        if result is None:
+            return ExecutionResult(success=False, message=f"Immediate-close order_send returned None: {mt5.last_error()}", entry_price=price, lot_size=float(lot_size))
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            return ExecutionResult(success=False, message=f"Immediate-close MT5 order failed: retcode={result.retcode}, comment={result.comment}", entry_price=price, lot_size=float(lot_size))
+        return ExecutionResult(success=True, ticket=result.order, message=f"MT5 immediate-close {direction} {lot_size} lots {symbol} @ {price:.5f}", entry_price=price, lot_size=float(lot_size))
+
     async def execute_trade(
         self, symbol: str, direction: str, lot_size: float,
         sl: float, tp: float, magic: int, comment: str = ""

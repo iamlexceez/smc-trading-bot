@@ -403,25 +403,40 @@ class CapitalReductionEngine:
             await db.update_capital_reduction_session(session["id"], error_reason="", metadata=metadata)
             await db.record_capital_reduction_action(session_id=session["id"], action="planning_selected", status="executing", symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=plan.entry_price, equity_before=equity, details={"mode": "AGGRESSIVE_TAPERED", "remaining": remaining, "effective_tolerance": tolerance, "configured_overshoot_tolerance": overshoot_tolerance, "tapered_overshoot_tolerance": diagnostic.get("tapered_overshoot_tolerance"), "proximity_ratio": diagnostic.get("proximity_ratio"), "aggression_factor": diagnostic.get("aggression_factor"), "valid_candidate_count": diagnostic.get("valid_candidate_count", 0), "reason": "Largest valid reduction candidate under target-proximity taper", "expected_loss": plan.expected_loss, "required_margin": plan.required_margin, "minimum_loss": plan.minimum_loss, "maximum_reduction": plan.maximum_reduction})
 
-            protection, protection_reason = await self._protective_levels_for_plan(plan)
-            if not protection:
-                metadata["runtime_state"] = "BLOCKED"
-                metadata["protective_level_error"] = protection_reason
-                await db.update_capital_reduction_session(session["id"], status="blocked", error_reason=protection_reason, metadata=metadata)
-                await db.record_capital_reduction_action(
-                    session_id=session["id"], action="protective_level_blocked", status="blocked",
-                    symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=plan.entry_price,
-                    equity_before=equity, details={"reason": protection_reason},
-                )
-                return {"state": "blocked", "reason": protection_reason, "session_id": session["id"]}
-            metadata["protective_levels"] = protection
-            await db.update_capital_reduction_session(session["id"], metadata=metadata)
             comment = f"{self.COMMENT_PREFIX}:{session['id']}"
-            result = await self.executor.execute_trade(
-                symbol=plan.symbol, direction=plan.direction, lot_size=plan.volume,
-                sl=float(protection["sl"]), tp=float(protection["tp"]), magic=int(self.settings.magic_number) + 91_000,
-                comment=comment,
-            )
+            result = None
+            submission = {"route": "protected_market_order_fallback"}
+            immediate_submit = getattr(self.executor, "execute_immediate_close_order", None)
+            if callable(immediate_submit):
+                try:
+                    result = await immediate_submit(
+                        symbol=plan.symbol, direction=plan.direction, lot_size=plan.volume,
+                        magic=int(self.settings.magic_number) + 91_000, comment=comment,
+                    )
+                    if result is not None:
+                        submission = {"route": "broker_preflighted_immediate_close", "sl": 0.0, "tp": 0.0}
+                except Exception as exc:
+                    return {"state": "blocked", "reason": f"immediate-close broker preflight raised {type(exc).__name__}", "session_id": session["id"]}
+            if result is None:
+                protection, protection_reason = await self._protective_levels_for_plan(plan)
+                if not protection:
+                    metadata["runtime_state"] = "BLOCKED"
+                    metadata["protective_level_error"] = protection_reason
+                    await db.update_capital_reduction_session(session["id"], status="blocked", error_reason=protection_reason, metadata=metadata)
+                    await db.record_capital_reduction_action(
+                        session_id=session["id"], action="protective_level_blocked", status="blocked",
+                        symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=plan.entry_price,
+                        equity_before=equity, details={"reason": protection_reason},
+                    )
+                    return {"state": "blocked", "reason": protection_reason, "session_id": session["id"]}
+                submission.update({"sl": float(protection["sl"]), "tp": float(protection["tp"]), "source": protection.get("source")})
+                metadata["protective_levels"] = protection
+                await db.update_capital_reduction_session(session["id"], metadata=metadata)
+                result = await self.executor.execute_trade(
+                    symbol=plan.symbol, direction=plan.direction, lot_size=plan.volume,
+                    sl=float(protection["sl"]), tp=float(protection["tp"]), magic=int(self.settings.magic_number) + 91_000,
+                    comment=comment,
+                )
             if not result.success or result.ticket is None:
                 self._consecutive_failures += 1
                 reason = result.message or "Broker rejected capital-reduction order"
@@ -432,7 +447,7 @@ class CapitalReductionEngine:
                 return {"state": status, "reason": reason, "session_id": session["id"]}
 
             self._consecutive_failures = 0
-            await db.record_capital_reduction_action(session_id=session["id"], action="order_filled", status="open", symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=result.entry_price, ticket=result.ticket, equity_before=equity, details={"expected_spread_cost": plan.expected_loss, "required_margin": plan.required_margin, "comment": comment, "protective_levels": protection})
+            await db.record_capital_reduction_action(session_id=session["id"], action="order_filled", status="open", symbol=plan.symbol, direction=plan.direction, volume=plan.volume, entry_price=result.entry_price, ticket=result.ticket, equity_before=equity, details={"expected_spread_cost": plan.expected_loss, "required_margin": plan.required_margin, "comment": comment, "submission": submission})
             closed = await self.executor.close_position(int(result.ticket))
             if not closed:
                 reason = "Reduction position was opened but could not be closed; engine hard-stopped to avoid an unmanaged loop"
