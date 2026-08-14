@@ -610,6 +610,7 @@ class BotHandlers:
         lifetime = (runtime.get("lifetime") or {}).get("counters") or {}
         components = runtime.get("components") or {}
         tasks = self.scheduler.scheduled_task_status()
+        scan_gate = dict(getattr(self.scheduler, "last_scan_gate", {}) or {})
         def status(name: str) -> str:
             component = components.get(name) or {}
             return f"{component.get('state', 'NOT_STARTED')} | last success: {component.get('last_success') or 'never'} | last failure: {component.get('last_failure') or 'none'}"
@@ -635,7 +636,6 @@ class BotHandlers:
             if task.get("last_error"):
                 lines.append(f"  error: {task['last_error']}")
         ranking = list(getattr(self.scheduler, "last_opportunity_ranking", []) or [])
-        scan_gate = dict(getattr(self.scheduler, "last_scan_gate", {}) or {})
         top_opportunity = ranking[0] if ranking else {}
         top_details = dict(top_opportunity.get("details") or {})
         lines.extend([

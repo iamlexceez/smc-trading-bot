@@ -150,6 +150,32 @@ async def test_strategy_evidence_persistence() -> None:
         assert_true(lookup["confidence"] == "UNKNOWN" and lookup["average_mae_r"] == -0.3 and lookup["average_mfe_r"] == 1.6, "strategy evidence lost MAE/MFE or documented confidence")
 
 
+async def test_engine_scanner_gate_rendering() -> None:
+    handler = object.__new__(BotHandlers)
+    telemetry = RuntimeTelemetry()
+    handler.scheduler = SimpleNamespace(
+        telemetry=telemetry,
+        scheduled_task_status=lambda: [],
+        last_scan_gate={
+            "state": "BROKER_UNIVERSE_EMPTY", "reason": "No broker-valid symbols.",
+            "updated_at": "2026-08-14T00:00:00", "analysis_symbols": 0,
+        },
+        last_opportunity_ranking=[],
+    )
+    captured: dict[str, str] = {}
+    async def render(_update, text: str):
+        captured["text"] = text
+    handler._render_plain_menu = render
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1),
+        message=SimpleNamespace(text="/engine"), callback_query=None,
+    )
+    with patch("bot.handlers.is_admin", return_value=True):
+        await handler.cmd_engine(update, SimpleNamespace())
+    assert_true("LATEST SCANNER GATE" in captured.get("text", ""), "engine report omitted the scanner-gate section")
+    assert_true("BROKER_UNIVERSE_EMPTY" in captured.get("text", ""), "engine report did not render the latest scanner gate")
+
+
 def test_scanner_gate_telemetry() -> None:
     probe = object.__new__(scheduler.MarketScheduler)
     probe.last_scan_gate = {}
@@ -1500,6 +1526,7 @@ async def test_strategy_transition_evidence_persistence() -> None:
 
 def run() -> None:
     test_broker_stop_normalization()
+    asyncio.run(test_engine_scanner_gate_rendering())
     test_scanner_gate_telemetry()
     test_runtime_telemetry()
     test_opportunity_context_and_ranking()
