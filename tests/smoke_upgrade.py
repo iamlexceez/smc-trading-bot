@@ -514,7 +514,7 @@ async def test_sequential_capital_reduction_planning() -> None:
     overshoot_plan, overshoot_reason, overshoot_diagnostic = await planner._plan_round_trip(
         {"free_margin": 1_000.0, "leverage": 10.0}, remaining=0.5, tolerance=0.1,
     )
-    assert_true(overshoot_plan is None and "target/tolerance" in overshoot_reason, "minimum-loss action that crosses target tolerance was not blocked")
+    assert_true(overshoot_plan is None and "No executable broker-valid" in overshoot_reason, "minimum-loss action outside a zero overshoot envelope was not blocked")
 
     settings.enabled_symbols = []
     none_engine = CapitalReductionEngine(settings, BrokerFixture())
@@ -530,6 +530,26 @@ async def test_sequential_capital_reduction_planning() -> None:
     )
     assert_true(invalid_plan is None and "incomplete broker" in invalid_diagnostic["best_candidate"]["reason"], "broker specification failure was not retained in diagnostics")
     assert_true(CapitalReductionEngine._effective_tolerance(500.0, 10.0, 3.0) == 15.0, "effective tolerance did not use the greater target-relative amount")
+
+    class AggressiveBroker(BrokerFixture):
+        async def get_symbol_price(self, symbol):
+            return (100.0, 105.0) if symbol == "Fast Index" else (100.0, 101.0)
+
+    # The isolated reduction engine uses the scheduler-provided fresh usable
+    # handoff rather than normal scan selection, and chooses the largest valid
+    # estimated reduction across that complete broker-valid set.
+    settings.enabled_symbols = ["Sequential Index"]
+    aggressive = CapitalReductionEngine(settings, AggressiveBroker())
+    aggressive.broker_usable_symbols = ("Slow Index", "Fast Index")
+    fastest, fastest_reason, fastest_diagnostic = await aggressive._plan_round_trip(
+        {"free_margin": 1_000.0, "leverage": 10.0}, remaining=25.0, tolerance=0.0, overshoot_tolerance=0.0,
+    )
+    assert_true(fastest is not None and fastest.symbol == "Fast Index" and fastest.expected_loss == 25.0, "aggressive planner did not choose the largest valid reduction candidate")
+    assert_true(fastest_diagnostic["valid_candidate_count"] == 2 and fastest_diagnostic["best_candidate"]["reason"] == "Largest valid reduction candidate", "aggressive diagnostics did not retain candidate ranking evidence")
+    overshoot_allowed, _, overshoot_allowed_diagnostic = await aggressive._plan_round_trip(
+        {"free_margin": 1_000.0, "leverage": 10.0}, remaining=8.0, tolerance=0.0, overshoot_tolerance=2.0,
+    )
+    assert_true(overshoot_allowed is not None and overshoot_allowed.symbol == "Fast Index" and overshoot_allowed.expected_loss == 10.0, "bounded overshoot did not permit the strongest valid final reduction")
 
     class SequentialExecutor(BrokerFixture):
         def __init__(self) -> None:

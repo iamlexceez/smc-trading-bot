@@ -520,12 +520,31 @@ class MarketScheduler:
         """Advance the isolated DEMO reduction engine; it never feeds the optimizer."""
         self.capital_reduction.settings = self.settings
         self.capital_reduction.executor = self.executor
+        # Capital reduction is an explicitly isolated DEMO operation. It may
+        # inspect every freshly broker-usable target; normal strategy scans keep
+        # their separate evidence-selected execution cohort.
+        self.capital_reduction.broker_usable_symbols = tuple(self._analysis_eligible_symbols)
         result = await self.capital_reduction.run_once()
         if result.get("state") in {"completed", "blocked", "failed", "paused"}:
             session_id = result.get("session_id", "?")
+            candidate = result.get("best_candidate") or {}
+            candidate_text = (
+                f"Selected / closest: `{candidate.get('symbol')}` | volume: `{candidate.get('volume', 'n/a')}` | "
+                f"expected reduction: `${float(candidate.get('expected_loss') or 0.0):.2f}`\n"
+                f"Candidate detail: {candidate.get('reason', '')}"
+                if candidate else "Selected / closest: `none`"
+            )
+            state_text = str(result.get("state", "unknown")).upper()
             await self._chart_activity(
                 "capital_reduction_state", "SYSTEM",
-                f"🔥 **CAPITAL REDUCTION UPDATE**\nSession: `#{session_id}` | State: `{result.get('state', 'unknown').upper()}`\n{result.get('reason', '')}",
+                "\n".join([
+                    "🔥 **CAPITAL REDUCTION**",
+                    f"Session: `#{session_id}` | State: `{state_text}` | Mode: `{result.get('mode', 'AGGRESSIVE')}`",
+                    f"Target: `${float(result.get('target') or 0.0):.2f}` | Current: `${float(result.get('current_equity', result.get('equity')) or 0.0):.2f}` | Remaining: `${float(result.get('remaining') or 0.0):.2f}`",
+                    f"Valid candidates: `{result.get('valid_candidate_count', 0)}`",
+                    candidate_text,
+                    f"Reason: {result.get('reason') or 'Target/tolerance state reached'}",
+                ]),
                 fingerprint=f"capital:{session_id}:{result.get('state')}:{result.get('reason', '')}",
                 essential=True,
             )

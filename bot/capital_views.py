@@ -19,23 +19,22 @@ def capital_test_view(*, account: Optional[dict], session: Optional[dict], targe
         runtime_status = str(session.get("runtime_state") or stored_status).upper()
         title = "🎯 CAPITAL TEST READY" if session.get("capital_test_active") else "🔥 CAPITAL REDUCTION"
         effective_tolerance = session.get("effective_tolerance", session.get("tolerance"))
+        planning = session.get("last_planning") or {}
+        selected = planning.get("best_candidate") or {}
         lines = [
             title,
             f"Session: #{session.get('id')} | State: {runtime_status}",
             "Purpose: deliberately reduce actual DEMO equity through broker-valid sequential actions; this activity is excluded from strategy learning.",
             "",
-            f"Target capital: {money(session.get('target_equity'), currency)} ± {money(effective_tolerance, currency)} effective tolerance",
-            f"Current equity: {money(session.get('current_equity'), currency)}",
-            f"Remaining reduction: {money(session.get('remaining'), currency)} | Progress: {float(session.get('progress_pct') or 0.0):.2f}%",
-            f"Session status: {stored_status} | Capital-test mode: {'ACTIVE' if session.get('capital_test_active') else 'PENDING'}",
+            f"Target: {money(session.get('target_equity'), currency)} | Current: {money(session.get('current_equity'), currency)}",
+            f"Remaining: {money(session.get('remaining'), currency)} | Finish tolerance: {money(effective_tolerance, currency)}",
+            f"Mode: {str((session.get('metadata') or {}).get('mode') or 'AGGRESSIVE').upper()} | Valid candidates: {planning.get('valid_candidate_count', 0)}",
+            f"Selected: {selected.get('symbol') or 'none'} | Volume: {selected.get('volume') if selected.get('volume') is not None else 'n/a'} | Expected reduction: {money(selected.get('expected_loss'), currency) if selected.get('expected_loss') is not None else 'n/a'}",
+            f"Reason: {selected.get('reason') or session.get('error_reason') or 'Searching current broker-valid candidates'}",
+            f"Next action: {runtime_status} | Session status: {stored_status} | Progress: {float(session.get('progress_pct') or 0.0):.2f}%",
         ]
-        if session.get("error_reason"):
-            lines.extend(["", f"Reason: {session['error_reason']}"])
-        best = (session.get("last_planning") or {}).get("best_candidate")
-        if best:
-            lines.append("Best available candidate: " + "; ".join(
-                f"{key.replace('_', ' ')}={value}" for key, value in best.items() if value is not None
-            ))
+        if session.get("error_reason") and not selected:
+            lines.extend(["", f"Detail: {session['error_reason']}"])
         if session.get("broker_error"):
             lines.append(f"Broker state: unavailable — {session['broker_error']}")
         return "\n".join(lines)

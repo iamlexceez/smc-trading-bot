@@ -96,6 +96,10 @@ class TradeSettings:
     # Optional target-relative component; effective DEMO reduction tolerance is
     # max(absolute tolerance, target equity × this percentage).
     capital_reduction_tolerance_pct: float = 0.0
+    # Aggressive DEMO reduction may cross below target only inside this separate
+    # lower-bound tolerance; it is never used by normal strategy execution.
+    capital_reduction_overshoot_tolerance: float = 0.0
+    capital_reduction_overshoot_tolerance_pct: float = 100.0
 
     # Position/layer controls
     max_layers: int = 4
@@ -300,6 +304,8 @@ class TradeSettings:
             capital_reduction_target=float(d["capital_reduction_target"]) if d.get("capital_reduction_target") else None,
             capital_reduction_tolerance=max(0.0, float(d.get("capital_reduction_tolerance", 10.0))),
             capital_reduction_tolerance_pct=max(0.0, float(d.get("capital_reduction_tolerance_pct", 0.0))),
+            capital_reduction_overshoot_tolerance=max(0.0, float(d.get("capital_reduction_overshoot_tolerance", 0.0))),
+            capital_reduction_overshoot_tolerance_pct=max(0.0, float(d.get("capital_reduction_overshoot_tolerance_pct", 100.0))),
             max_layers=int(d.get("max_layers", 4)),
             layer_allocation=[float(value) for value in parse_list(d.get("layer_allocation"), ["0.40", "0.30", "0.20", "0.10"])],
             entry_mode=d.get("entry_mode", "aggressive"),

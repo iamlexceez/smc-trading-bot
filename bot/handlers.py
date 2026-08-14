@@ -995,24 +995,29 @@ class BotHandlers:
     async def cmd_capital_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Persist an operational DEMO target; no broker action is taken here."""
         if not context.args:
-            await self._render_plain_menu(update, "Usage: /capital_target <target_equity> [absolute_tolerance] [target_tolerance_pct]\nExample: /capital_target 500 10 0")
+            await self._render_plain_menu(update, "Usage: /capital_target <target> [finish_abs] [finish_pct] [overshoot_abs] [overshoot_pct]\nExample: /capital_target 500 10 0 0 100")
             return
         try:
             target = float(context.args[0])
             tolerance = float(context.args[1]) if len(context.args) > 1 else float(self.settings.capital_reduction_tolerance)
             tolerance_pct = float(context.args[2]) if len(context.args) > 2 else float(self.settings.capital_reduction_tolerance_pct)
+            overshoot = float(context.args[3]) if len(context.args) > 3 else float(self.settings.capital_reduction_overshoot_tolerance)
+            overshoot_pct = float(context.args[4]) if len(context.args) > 4 else float(self.settings.capital_reduction_overshoot_tolerance_pct)
         except ValueError:
-            await self._render_plain_menu(update, "Target and tolerance values must be numeric. Example: /capital_target 500 10 0")
+            await self._render_plain_menu(update, "Capital target values must be numeric. Example: /capital_target 500 10 0 0 100")
             return
-        if target <= 0 or tolerance < 0 or tolerance_pct < 0:
+        if target <= 0 or tolerance < 0 or tolerance_pct < 0 or overshoot < 0 or overshoot_pct < 0:
             await self._render_plain_menu(update, "Target must be positive and tolerance values cannot be negative.")
             return
         self.settings.capital_reduction_target = target
         self.settings.capital_reduction_tolerance = tolerance
         self.settings.capital_reduction_tolerance_pct = tolerance_pct
+        self.settings.capital_reduction_overshoot_tolerance = overshoot
+        self.settings.capital_reduction_overshoot_tolerance_pct = overshoot_pct
         await db.save_settings(self.settings)
         effective = max(tolerance, target * tolerance_pct / 100.0)
-        await self._render_plain_menu(update, f"Capital-reduction target saved: {target:,.2f} ± {effective:,.2f} effective tolerance (absolute {tolerance:,.2f}; target-relative {tolerance_pct:.2f}%). No broker trade was placed. Use /capital_start to request the DEMO-only confirmation prompt.", keyboards.capital_test_menu())
+        effective_overshoot = max(overshoot, target * overshoot_pct / 100.0)
+        await self._render_plain_menu(update, f"Aggressive DEMO reduction target saved: {target:,.2f}; finish tolerance ± {effective:,.2f}; overshoot envelope {effective_overshoot:,.2f} below target. No broker trade was placed. Use /capital_start to request the DEMO-only confirmation prompt.", keyboards.capital_test_menu())
 
     @admin_only
     async def cmd_capital_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1023,7 +1028,7 @@ class BotHandlers:
             return
         target = self.settings.capital_reduction_target
         if target is None:
-            await self._render_plain_menu(update, "Set a target first: /capital_target <target_equity> [absolute_tolerance] [target_tolerance_pct]")
+            await self._render_plain_menu(update, "Set a target first: /capital_target <target> [finish_abs] [finish_pct] [overshoot_abs] [overshoot_pct]")
             return
         account = await self.executor.get_account_info()
         broker_mode = str((account or {}).get("broker_account_mode") or "unknown").lower()
@@ -1035,9 +1040,10 @@ class BotHandlers:
             await self._render_plain_menu(update, f"CAPITAL REDUCTION BLOCKED\nTarget must be below current actual DEMO equity. Current equity: {equity:,.2f}; target: {target:,.2f}.")
             return
         effective_tolerance = max(float(self.settings.capital_reduction_tolerance), float(target) * float(self.settings.capital_reduction_tolerance_pct) / 100.0)
+        effective_overshoot = max(float(self.settings.capital_reduction_overshoot_tolerance), float(target) * float(self.settings.capital_reduction_overshoot_tolerance_pct) / 100.0)
         text = "\n".join([
             "⚠️ DELIBERATE DEMO DRAWDOWN",
-            f"You are requesting deliberate reduction of the actual DEMO account toward {target:,.2f} ± {effective_tolerance:,.2f} effective tolerance.",
+            f"You are requesting aggressive deliberate reduction of the actual DEMO account toward {target:,.2f} ± {effective_tolerance:,.2f} finish tolerance, with up to {effective_overshoot:,.2f} permitted lower-bound overshoot.",
             f"Current actual MT5 equity: {equity:,.2f}",
             f"Maximum intended reduction before tolerance: approximately {equity - target:,.2f}",
             "This is DEMO-only. LIVE activation is blocked by both local mode and direct MT5 broker-mode verification.",
@@ -1055,7 +1061,7 @@ class BotHandlers:
         if not engine or self.settings.capital_reduction_target is None:
             await self._render_plain_menu(update, "Capital reduction cannot start: scheduler or target is unavailable.")
             return
-        result = await engine.start(self.settings.capital_reduction_target, self.settings.capital_reduction_tolerance, self.settings.capital_reduction_tolerance_pct)
+        result = await engine.start(self.settings.capital_reduction_target, self.settings.capital_reduction_tolerance, self.settings.capital_reduction_tolerance_pct, self.settings.capital_reduction_overshoot_tolerance, self.settings.capital_reduction_overshoot_tolerance_pct)
         if not result.get("ok"):
             await self._render_plain_menu(update, f"CAPITAL REDUCTION NOT STARTED\n{result.get('reason', 'Unknown error')}", keyboards.capital_test_menu())
             return
