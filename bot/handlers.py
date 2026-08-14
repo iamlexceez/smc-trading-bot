@@ -40,6 +40,7 @@ from analysis.scoring import format_signal_report
 from analysis.profiler import profiler
 from analysis.order_flow import order_flow
 from analysis.objectives import ObjectiveInterpreter, ObjectivePreview, ObjectiveValidation, ObjectiveValidator, TradingObjective, phase_for_equity, objective_operational_readiness, resolve_requested_symbols
+from analysis.objective_phases import plan_objective_phases
 from bot.account_views import LiveAccountViews
 from bot.capital_views import capital_actions_view, capital_test_view, demo_session_report_view
 from risk.manager import RiskManager
@@ -201,7 +202,7 @@ class BotHandlers:
         return account, state, ()
 
     @staticmethod
-    def _operational_objective_config(objective: TradingObjective, *, resolved_symbols: tuple[str, ...], broker_usable_symbols: tuple[str, ...], account: dict, phase: str) -> dict:
+    def _operational_objective_config(objective: TradingObjective, *, resolved_symbols: tuple[str, ...], broker_usable_symbols: tuple[str, ...], account: dict, phase: str, phase_plan: Optional[dict] = None) -> dict:
         explicit = bool(objective.requested_symbols)
         allowed = list(resolved_symbols) if explicit else list(broker_usable_symbols)
         return {
@@ -216,7 +217,7 @@ class BotHandlers:
             "adaptive_sizing": objective.adaptive_sizing,
             "adaptive_management": objective.adaptive_management,
             "adaptive_learning": objective.adaptive_learning,
-            "full_auto": True, "phase": phase,
+            "full_auto": True, "phase": phase, "phase_plan": dict(phase_plan or {}),
         }
 
     @staticmethod
@@ -295,9 +296,39 @@ class BotHandlers:
             if not validation.valid:
                 await reply.reply_text(self._format_objective_preview(preview) + "\n\n❌ Objective was not activated.", parse_mode="Markdown")
                 return
+            # Phase boundaries measure progress. They never alter the user’s
+            # final target, instrument allowlist, or policy variables.
+            management_evidence = await db.get_management_learning_summary(account_mode=mode, days=self.settings.market_ranking_lookback_days)
+            minimum_operating_capital = float((self.scheduler.last_capital_state if self.scheduler else {}).get("minimum_operating_capital") or 0.0)
+            phase_plan = plan_objective_phases(
+                starting_equity=float(objective.starting_capital or account.get("equity") or 0.0),
+                target_equity=float(objective.target_capital or 0.0),
+                minimum_operating_capital=minimum_operating_capital,
+                historical_evidence=management_evidence,
+            )
+            operational = self._operational_objective_config(
+                objective, resolved_symbols=resolved, broker_usable_symbols=usable, account=account,
+                phase=phase, phase_plan=phase_plan.to_dict(),
+            )
             active = await db.confirm_objective_draft(
                 mode, objective=objective.to_dict(), account_snapshot={**account, "state": state}, broker_universe=list(usable), context={**preview.to_dict(), "operational": operational},
             )
+            phase_policy = {"model_version": self.settings.active_model_version, "adaptive_learning": objective.adaptive_learning}
+            phase_rows = await db.create_objective_phase_plan(
+                objective_id=int(active["id"]),
+                demo_session_id=((self.scheduler.last_capital_state if self.scheduler else {}).get("demo_session_id")),
+                starting_equity=float(objective.starting_capital or account.get("equity") or 0.0),
+                phase_targets=list(phase_plan.phase_targets), policy_snapshot=phase_policy,
+                instruments=list(operational.get("allowed_symbols") or []),
+            )
+            active_phase = phase_rows[0]
+            operational.update({
+                "phase_id": active_phase["id"], "phase_number": active_phase["phase_number"],
+                "phase_target_equity": active_phase["target_equity"], "phase_status": active_phase["status"],
+            })
+            active = await db.update_active_objective_context(
+                int(active["id"]), {**preview.to_dict(), "operational": operational}
+            ) or active
             # Explicit confirmation activates DEMO full auto through the existing
             # scheduler; the parser never owns MT5 submission itself.
             if mode == "demo":
@@ -316,10 +347,14 @@ class BotHandlers:
                         self.scheduler._start_background_task("objective_activation_scan", self.scheduler.activate_and_scan_now())
             active_text = self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active['version']} ACTIVE**")
             readiness, readiness_detail = objective_operational_readiness(account, state, is_paused=bool(self.settings.is_paused))
+            phase_text = (
+                f"\n\n🎯 **PHASE 1 ACTIVE**\nMilestone: `${float(active_phase['starting_equity']):.2f}` → `${float(active_phase['target_equity']):.2f}`\n"
+                f"Adaptive plan: `{len(phase_rows)}` broker-aware milestones; each completed phase freezes its evidence and hands it to the next phase."
+            )
             if readiness == "READY":
-                active_text += "\n\n🟢 **FULL AUTO DEMO READY**\nThe existing scanner is now evaluating only the resolved objective universe. Valid setups continue through existing SMC, sizing, broker, TP/SL, position-management, and MT5 execution gates. Learning runs in the background."
+                active_text += "\n\n🟢 **FULL AUTO DEMO READY**\nThe existing scanner is now evaluating only the resolved objective universe. Valid setups continue through existing SMC, sizing, broker, TP/SL, position-management, and MT5 execution gates. Learning runs in the background." + phase_text
             else:
-                active_text += f"\n\n⛔ **FULL AUTO DEMO STANDBY — {readiness}**\n{readiness_detail}\nNo new objective-scoped order will be opened until the existing broker-authoritative state becomes ready."
+                active_text += f"\n\n⛔ **FULL AUTO DEMO STANDBY — {readiness}**\n{readiness_detail}\nNo new objective-scoped order will be opened until the existing broker-authoritative state becomes ready." + phase_text
             await reply.reply_text(active_text, parse_mode="Markdown")
             return
         if action == "resume":

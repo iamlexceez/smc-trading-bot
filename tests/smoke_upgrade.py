@@ -35,6 +35,7 @@ from analysis.optimizer import SelfOptimizer
 from analysis.research_governance import ResearchGovernance
 from analysis.adaptive_management import observation_from_broker_trade, observations_from_backtest, summarize_management
 from analysis.objectives import ObjectiveInterpreter, ObjectiveValidator, TradingObjective, phase_for_equity, objective_operational_readiness, resolve_requested_symbols
+from analysis.objective_phases import plan_objective_phases
 from backtest.engine import BacktestEngine, BacktestResult, BacktestTrade
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 from analysis.account_monitor import summarize_history, exposure_summary
@@ -917,6 +918,59 @@ async def test_objective_console_safety() -> None:
     assert_true(engine._objective_min_rr() == 0.0 and "Crash 500 Index" not in scoped, "objective RR or strict instrument operational settings were not applied")
 
 
+async def test_objective_phase_lifecycle() -> None:
+    plan = plan_objective_phases(
+        starting_equity=10.0, target_equity=10_000.0, minimum_operating_capital=2.0,
+        historical_evidence={"sample_size": 20, "expectancy_r": 0.4, "max_drawdown_r": 1.0},
+    )
+    assert_true(plan.phase_targets[-1] == 10_000.0 and len(plan.phase_targets) >= 2, "adaptive phase plan did not preserve the exact final objective target")
+    assert_true(all(right > left for left, right in zip((10.0, *plan.phase_targets[:-1]), plan.phase_targets)), "adaptive phase plan produced a non-increasing milestone")
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "phases.db")
+        await db.init_db(path)
+        account = {"equity": 10.0, "free_margin": 10.0, "currency": "USD"}
+        objective = TradingObjective(raw_instruction="fixture", account_mode="demo", starting_capital=10.0, target_capital=100.0)
+        await db.create_objective_draft(
+            account_mode="demo", raw_instruction="fixture", objective=objective.to_dict(), account_snapshot=account,
+            broker_universe=["Boom 100 Index"], context={"operational": {}}, db_path=path,
+        )
+        active = await db.confirm_objective_draft("demo", db_path=path)
+        session_id = await db.create_demo_session(broker_login="fixture", start_balance=10.0, start_equity=10.0, db_path=path)
+        phases = await db.create_objective_phase_plan(
+            objective_id=active["id"], demo_session_id=session_id, starting_equity=10.0,
+            phase_targets=[25.0, 50.0, 100.0], policy_snapshot={"model_version": "fixture"},
+            instruments=["Boom 100 Index"], db_path=path,
+        )
+        first = phases[0]
+        assert_true(first["status"] == "active" and first["target_equity"] == 25.0, "first objective phase was not activated")
+        setup_id = await db.record_setup(
+            account_mode="demo", symbol="Boom 100 Index", timeframe="M5", direction="BUY", setup_type="fixture",
+            status="executed", objective_phase_id=first["id"], db_path=path,
+        )
+        trade_id = await db.record_trade(
+            symbol="Boom 100 Index", direction="BUY", entry_price=100.0, sl_price=99.0, tp_price=102.0,
+            lot_size=0.2, score=80.0, rr_ratio=2.0, executor="fixture", raw_signal="{}", ticket=7,
+            setup_id=setup_id, initial_risk=1.0, policy_version="fixture", demo_session_id=session_id,
+            objective_phase_id=first["id"], db_path=path,
+        )
+        await db.close_trade(trade_id, pnl=2.0, pnl_r=2.0, exit_price=102.0, max_favorable_r=2.2, max_adverse_r=-0.2, db_path=path)
+        metrics = await db.objective_phase_summary(first["id"], db_path=path)
+        assert_true(metrics["setups_traded"] == 1 and metrics["trades_taken"] == 1 and metrics["best_instrument"] == "Boom 100 Index", "phase review did not use phase-attributed trade and setup evidence")
+        completed, successor = await db.complete_objective_phase(
+            first["id"], ending_equity=25.5, reason="fixture broker target reached", metrics=metrics,
+            next_policy_snapshot={"model_version": "fixture_next"}, next_instruments=["Boom 100 Index"], db_path=path,
+        )
+        assert_true(completed and completed["status"] == "completed" and successor and successor["status"] == "active", "phase completion did not freeze evidence and activate the next milestone")
+        assert_true(successor["starting_equity"] == 25.5 and successor["target_equity"] == 50.0, "next phase did not inherit the completed phase ending equity")
+        unchanged, duplicate_successor = await db.complete_objective_phase(
+            first["id"], ending_equity=30.0, reason="duplicate", metrics={}, db_path=path,
+        )
+        assert_true(unchanged and unchanged["status"] == "completed" and duplicate_successor is None, "phase completion was not idempotent")
+        failed = await db.fail_objective_phase(successor["id"], ending_equity=3.0, reason="CAPITAL_EXHAUSTED", metrics=metrics, db_path=path)
+        assert_true(failed and failed["status"] == "failed" and failed["completion_reason"] == "CAPITAL_EXHAUSTED", "verified phase failure was not preserved")
+
+
 def test_causal_replay_safety() -> None:
     def make_engine(policy: ExperimentalPolicy | None = None) -> BacktestEngine:
         return BacktestEngine(settings=TradeSettings.defaults(), policy=policy or ExperimentalPolicy(
@@ -1109,6 +1163,7 @@ def run() -> None:
     asyncio.run(test_broker_authoritative_capital_state())
     asyncio.run(test_sizing_rejection_diagnostic_persistence())
     asyncio.run(test_objective_console_safety())
+    asyncio.run(test_objective_phase_lifecycle())
     test_causal_replay_safety()
     asyncio.run(test_adaptive_management_learning_evidence())
     test_research_governance_rankings()

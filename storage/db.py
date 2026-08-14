@@ -249,6 +249,28 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS objective_phases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                objective_id INTEGER NOT NULL,
+                demo_session_id INTEGER,
+                phase_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'planned',
+                planned_start_equity REAL NOT NULL,
+                starting_equity REAL,
+                target_equity REAL NOT NULL,
+                ending_equity REAL,
+                started_at TEXT,
+                completed_at TEXT,
+                completion_reason TEXT,
+                policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                instruments_json TEXT NOT NULL DEFAULT '[]',
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(objective_id, phase_number),
+                FOREIGN KEY(objective_id) REFERENCES trading_objectives(id),
+                FOREIGN KEY(demo_session_id) REFERENCES demo_sessions(id)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS account_state (
                 account_mode TEXT PRIMARY KEY,
                 broker_login TEXT,
@@ -392,6 +414,9 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await _ensure_column(db, "trades", "policy_version", "TEXT")
         await _ensure_column(db, "trades", "experiment_id", "INTEGER")
         await _ensure_column(db, "trades", "demo_session_id", "INTEGER")
+        await _ensure_column(db, "trades", "objective_phase_id", "INTEGER")
+        await _ensure_column(db, "setup_records", "objective_phase_id", "INTEGER")
+        await _ensure_column(db, "trade_baskets", "objective_phase_id", "INTEGER")
         await _ensure_column(db, "setup_records", "policy_version", "TEXT")
         await _ensure_column(db, "setup_records", "experiment_id", "INTEGER")
         await _ensure_column(db, "trade_baskets", "policy_version", "TEXT")
@@ -399,6 +424,9 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await _ensure_column(db, "trade_baskets", "account_mode", "TEXT NOT NULL DEFAULT 'demo'")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode_status ON trades(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_demo_session ON trades(demo_session_id, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_objective_phase ON trades(objective_phase_id, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_setups_objective_phase ON setup_records(objective_phase_id, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_objective_phases_objective_status ON objective_phases(objective_id, status, phase_number)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_setups_mode_status ON setup_records(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_trade ON execution_events(trade_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_model_versions_mode_role ON model_versions(account_mode, role, status)")
@@ -441,18 +469,18 @@ async def record_trade(
     executor: str, raw_signal: str, account_mode: str = "demo", ticket: Optional[int] = None,
     setup_id: Optional[int] = None, initial_risk: float = 0.0,
     policy_version: Optional[str] = None, experiment_id: Optional[int] = None,
-    demo_session_id: Optional[int] = None, db_path: str = DB_PATH
+    demo_session_id: Optional[int] = None, objective_phase_id: Optional[int] = None, db_path: str = DB_PATH
 ) -> int:
     async with aiosqlite.connect(db_path) as db:
         now = datetime.utcnow().isoformat()
         cursor = await db.execute(
             """INSERT INTO trades (timestamp, symbol, direction, entry_price, sl_price, tp_price,
                lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk,
-               raw_signal, policy_version, experiment_id, demo_session_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               raw_signal, policy_version, experiment_id, demo_session_id, objective_phase_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (now, symbol, direction, entry_price, sl_price, tp_price,
              lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk,
-             raw_signal, policy_version, experiment_id, demo_session_id)
+             raw_signal, policy_version, experiment_id, demo_session_id, objective_phase_id)
         )
         await db.commit()
         return cursor.lastrowid
@@ -529,6 +557,7 @@ async def record_setup(
     features: Optional[dict] = None,
     policy_version: Optional[str] = None,
     experiment_id: Optional[int] = None,
+    objective_phase_id: Optional[int] = None,
     db_path: str = DB_PATH,
 ) -> int:
     """Store every qualifying, rejected, and executed setup hypothesis."""
@@ -538,13 +567,13 @@ async def record_setup(
             """INSERT INTO setup_records
                (detected_at, updated_at, account_mode, symbol, timeframe, direction, setup_type,
                 status, rejection_reason, entry_price, stop_loss, take_profit, rr_ratio,
-                quality_score, validation_json, features_json, policy_version, experiment_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                quality_score, validation_json, features_json, policy_version, experiment_id, objective_phase_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 now, now, account_mode, symbol, timeframe, direction, setup_type, status,
                 rejection_reason, entry_price, stop_loss, take_profit, rr_ratio, quality_score,
                 json.dumps(validation or {}, sort_keys=True), json.dumps(features or {}, sort_keys=True),
-                policy_version, experiment_id,
+                policy_version, experiment_id, objective_phase_id,
             ),
         )
         await conn.commit()
@@ -1396,6 +1425,205 @@ async def list_objective_history(account_mode: str = "demo", limit: int = 10, db
         return [row for item in await cursor.fetchall() if (row := await _objective_row(item)) is not None]
 
 
+async def _objective_phase_row(row) -> Optional[dict]:
+    if row is None:
+        return None
+    result = dict(row)
+    result["policy_snapshot"] = json.loads(result.pop("policy_snapshot_json") or "{}")
+    result["instruments"] = json.loads(result.pop("instruments_json") or "[]")
+    result["metrics"] = json.loads(result.pop("metrics_json") or "{}")
+    return result
+
+
+async def create_objective_phase_plan(
+    *, objective_id: int, demo_session_id: Optional[int], starting_equity: float,
+    phase_targets: list[float], policy_snapshot: Optional[dict], instruments: list[str],
+    db_path: str = DB_PATH,
+) -> list[dict]:
+    """Persist one immutable milestone plan and activate its first phase."""
+    if not phase_targets:
+        raise ValueError("Objective phase plan requires at least one target")
+    now = datetime.utcnow().isoformat()
+    prior = float(starting_equity)
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        for number, target in enumerate(phase_targets, start=1):
+            active = number == 1
+            await conn.execute(
+                """INSERT INTO objective_phases
+                   (objective_id, demo_session_id, phase_number, status, planned_start_equity,
+                    starting_equity, target_equity, started_at, policy_snapshot_json, instruments_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    int(objective_id), demo_session_id, number, "active" if active else "planned",
+                    prior, float(starting_equity) if active else None, float(target), now if active else None,
+                    json.dumps(policy_snapshot or {}, sort_keys=True), json.dumps(instruments, sort_keys=True),
+                ),
+            )
+            prior = float(target)
+        await conn.commit()
+        cursor = await conn.execute(
+            "SELECT * FROM objective_phases WHERE objective_id = ? ORDER BY phase_number ASC", (int(objective_id),)
+        )
+        return [item for row in await cursor.fetchall() if (item := await _objective_phase_row(row)) is not None]
+
+
+async def get_active_objective_phase(objective_id: int, db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM objective_phases WHERE objective_id = ? AND status = 'active' ORDER BY phase_number ASC LIMIT 1",
+            (int(objective_id),),
+        )
+        return await _objective_phase_row(await cursor.fetchone())
+
+
+async def get_objective_phase(phase_id: int, db_path: str = DB_PATH) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM objective_phases WHERE id = ?", (int(phase_id),))
+        return await _objective_phase_row(await cursor.fetchone())
+
+
+async def list_objective_phases(objective_id: int, db_path: str = DB_PATH) -> list[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM objective_phases WHERE objective_id = ? ORDER BY phase_number ASC", (int(objective_id),)
+        )
+        return [item for row in await cursor.fetchall() if (item := await _objective_phase_row(row)) is not None]
+
+
+async def update_active_objective_context(objective_id: int, context: dict, db_path: str = DB_PATH) -> Optional[dict]:
+    """Replace active objective context after a durable phase lifecycle change."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(
+            "UPDATE trading_objectives SET context_json = ? WHERE id = ? AND status = 'active'",
+            (json.dumps(context, sort_keys=True), int(objective_id)),
+        )
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM trading_objectives WHERE id = ?", (int(objective_id),))
+        return await _objective_row(await cursor.fetchone())
+
+
+async def objective_phase_summary(phase_id: int, db_path: str = DB_PATH) -> dict:
+    """Return phase-attributed evidence from recorded setups, closed trades, and management logs."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT trade.timestamp, trade.closed_at, trade.symbol, setup.setup_type, trade.pnl, trade.pnl_r,
+                      trade.max_favorable_r, trade.max_adverse_r, trade.policy_version
+               FROM trades trade LEFT JOIN setup_records setup ON setup.id = trade.setup_id
+               WHERE trade.objective_phase_id = ? AND trade.status = 'closed'
+               ORDER BY trade.timestamp ASC, trade.id ASC""",
+            (int(phase_id),),
+        )
+        trades = [dict(row) for row in await cursor.fetchall()]
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM setup_records WHERE objective_phase_id = ?", (int(phase_id),)
+        )
+        setup_count = int((await cursor.fetchone())[0] or 0)
+        cursor = await conn.execute(
+            """SELECT action, COUNT(*) AS count
+               FROM trade_logs log JOIN trade_baskets basket
+                    ON basket.objective_phase_id = ?
+               JOIN trade_layers layer ON layer.basket_id = basket.id AND layer.ticket = log.ticket
+               GROUP BY action ORDER BY count DESC, action ASC""",
+            (int(phase_id),),
+        )
+        actions = {str(row["action"]): int(row["count"]) for row in await cursor.fetchall()}
+
+    pnls = [float(row.get("pnl") or 0.0) for row in trades]
+    r_values = [float(row["pnl_r"]) for row in trades if row.get("pnl_r") is not None]
+    wins = [value for value in pnls if value > 0]
+    losses = [value for value in pnls if value < 0]
+    gross_profit, gross_loss = sum(wins), abs(sum(losses))
+    running, peak, max_drawdown = 0.0, 0.0, 0.0
+    curve = []
+    for row, pnl in zip(trades, pnls):
+        running += pnl
+        peak = max(peak, running)
+        max_drawdown = max(max_drawdown, peak - running)
+        curve.append({"timestamp": row.get("closed_at") or row.get("timestamp"), "cumulative_pnl": running})
+    per_symbol: dict[str, float] = {}
+    per_setup: dict[str, float] = {}
+    for row in trades:
+        per_symbol[str(row.get("symbol") or "")] = per_symbol.get(str(row.get("symbol") or ""), 0.0) + float(row.get("pnl") or 0.0)
+        per_setup[str(row.get("setup_type") or "unknown")] = per_setup.get(str(row.get("setup_type") or "unknown"), 0.0) + float(row.get("pnl") or 0.0)
+    return {
+        "setups_traded": setup_count, "trades_taken": len(trades), "wins": len(wins), "losses": len(losses),
+        "win_rate": (len(wins) / len(trades) * 100) if trades else 0.0,
+        "average_r": (sum(r_values) / len(r_values)) if r_values else None,
+        "expectancy_r": (sum(r_values) / len(r_values)) if r_values else None,
+        "profit_factor": (gross_profit / gross_loss) if gross_loss else (float("inf") if gross_profit else None),
+        "maximum_drawdown": max_drawdown,
+        "average_mae_r": (sum(float(row.get("max_adverse_r") or 0.0) for row in trades) / len(trades)) if trades else 0.0,
+        "average_mfe_r": (sum(float(row.get("max_favorable_r") or 0.0) for row in trades) / len(trades)) if trades else 0.0,
+        "management_actions": actions, "best_instrument": max(per_symbol, key=per_symbol.get) if per_symbol else None,
+        "best_setup": max(per_setup, key=per_setup.get) if per_setup else None,
+        "policy_versions": sorted({str(row["policy_version"]) for row in trades if row.get("policy_version")}),
+        "equity_curve": curve,
+    }
+
+
+async def complete_objective_phase(
+    phase_id: int, *, ending_equity: float, reason: str, metrics: dict,
+    next_policy_snapshot: Optional[dict] = None, next_instruments: Optional[list[str]] = None,
+    db_path: str = DB_PATH,
+) -> tuple[Optional[dict], Optional[dict]]:
+    """Freeze an active phase and atomically begin its preplanned successor, if any."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM objective_phases WHERE id = ?", (int(phase_id),))
+        current = await cursor.fetchone()
+        if current is None or current["status"] != "active":
+            return await _objective_phase_row(current), None
+        await conn.execute(
+            """UPDATE objective_phases SET status = 'completed', ending_equity = ?, completed_at = ?,
+               completion_reason = ?, metrics_json = ? WHERE id = ?""",
+            (float(ending_equity), now, str(reason), json.dumps(metrics, sort_keys=True), int(phase_id)),
+        )
+        cursor = await conn.execute(
+            "SELECT * FROM objective_phases WHERE objective_id = ? AND phase_number = ?",
+            (int(current["objective_id"]), int(current["phase_number"]) + 1),
+        )
+        successor = await cursor.fetchone()
+        if successor is not None:
+            await conn.execute(
+                """UPDATE objective_phases SET status = 'active', starting_equity = ?, started_at = ?,
+                   policy_snapshot_json = ?, instruments_json = ? WHERE id = ?""",
+                (float(ending_equity), now, json.dumps(next_policy_snapshot or {}, sort_keys=True),
+                 json.dumps(next_instruments or [], sort_keys=True), int(successor["id"])),
+            )
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM objective_phases WHERE id = ?", (int(phase_id),))
+        completed = await _objective_phase_row(await cursor.fetchone())
+        next_phase = None
+        if successor is not None:
+            cursor = await conn.execute("SELECT * FROM objective_phases WHERE id = ?", (int(successor["id"]),))
+            next_phase = await _objective_phase_row(await cursor.fetchone())
+        return completed, next_phase
+
+
+async def fail_objective_phase(
+    phase_id: int, *, ending_equity: float, reason: str, metrics: dict,
+    db_path: str = DB_PATH,
+) -> Optional[dict]:
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(
+            """UPDATE objective_phases SET status = 'failed', ending_equity = ?, completed_at = ?,
+               completion_reason = ?, metrics_json = ? WHERE id = ? AND status = 'active'""",
+            (float(ending_equity), now, str(reason), json.dumps(metrics, sort_keys=True), int(phase_id)),
+        )
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM objective_phases WHERE id = ?", (int(phase_id),))
+        return await _objective_phase_row(await cursor.fetchone())
+
+
 async def get_performance_summary(account_mode: str, days: Optional[int] = None, db_path: str = DB_PATH) -> dict:
     """Compute closed-trade performance for exactly one account mode."""
     clauses = [
@@ -1480,6 +1708,7 @@ async def create_trade_basket(
     account_mode: str = "demo",
     policy_version: Optional[str] = None,
     experiment_id: Optional[int] = None,
+    objective_phase_id: Optional[int] = None,
     db_path: str = DB_PATH,
 ) -> int:
     """Persist one setup-level risk budget and its future layer plan."""
@@ -1489,8 +1718,8 @@ async def create_trade_basket(
             """INSERT INTO trade_baskets
                (created_at, updated_at, symbol, direction, entry_price, initial_stop,
                 initial_target, max_risk, reserved_risk, account_mode, planned_layers, metadata,
-                policy_version, experiment_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                policy_version, experiment_id, objective_phase_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 now,
                 now,
@@ -1506,6 +1735,7 @@ async def create_trade_basket(
                 json.dumps(metadata or {}),
                 policy_version,
                 experiment_id,
+                objective_phase_id,
             ),
         )
         await conn.commit()

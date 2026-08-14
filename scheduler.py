@@ -107,6 +107,9 @@ class MarketScheduler:
         # Management can be triggered by scans, a scheduled protection pass, or
         # a manual review. One guard prevents competing MT5 modifications.
         self._position_management_lock = asyncio.Lock()
+        # Phase lifecycle can be observed by both a scan and reconciliation;
+        # one guard preserves exactly-once broker-confirmed transitions.
+        self._objective_phase_lock = asyncio.Lock()
 
     def _set_analysis_eligible_symbols(self, audit: Optional[dict]) -> tuple[str, ...]:
         audit = audit or {}
@@ -165,9 +168,26 @@ class MarketScheduler:
             return []
         selected = resolved if explicit else list(snapshot["market_selection"]["selected_symbols"])
         current_equity = ((getattr(self, "last_capital_state", {}) or {}).get("account") or {}).get("equity")
+        active_phase = await db.get_active_objective_phase(int(active["id"])) if operational.get("phase_plan") else None
+        if operational.get("phase_plan") and not active_phase:
+            self._operational_objective = {
+                **operational, "id": active.get("id"), "version": active.get("version"),
+                "status": "PHASE_RESOLUTION_BLOCKED", "allowed_symbols": [],
+            }
+            snapshot["market_selection"] = {
+                **snapshot["market_selection"], "state": "objective_phase_resolution_blocked",
+                "selected_symbols": [], "disabled_symbols": sorted(usable),
+            }
+            return []
         operational_phase = phase_for_equity(operational.get("starting_capital"), current_equity)
+        phase_context = {
+            "phase_id": active_phase.get("id") if active_phase else operational.get("phase_id"),
+            "phase_number": active_phase.get("phase_number") if active_phase else operational.get("phase_number"),
+            "phase_target_equity": active_phase.get("target_equity") if active_phase else operational.get("phase_target_equity"),
+            "phase_status": active_phase.get("status") if active_phase else operational.get("phase_status"),
+        }
         self._operational_objective = {
-            **operational, "id": active.get("id"), "version": active.get("version"),
+            **operational, **phase_context, "id": active.get("id"), "version": active.get("version"),
             "status": "ACTIVE", "allowed_symbols": selected,
             "phase": operational_phase if operational_phase != "UNAVAILABLE" else operational.get("phase", "UNAVAILABLE"),
             "current_equity": current_equity,
@@ -375,6 +395,7 @@ class MarketScheduler:
         self.capital_state_service.executor = self.executor
         capital = await self.capital_state_service.evaluate()
         self.last_capital_state = capital
+        await self._advance_objective_phase_if_due(capital)
         await self._finalize_objective_session_if_terminal(capital)
         audit = capital.get("broker_metadata") or {}
         self._set_analysis_eligible_symbols(audit)
@@ -1110,6 +1131,7 @@ class MarketScheduler:
                 features=self._feature_snapshot(df, structure, htf_structures, float(atr_val), validation),
                 policy_version=policy_version or self.settings.active_model_version,
                 experiment_id=experiment_id,
+                objective_phase_id=self._operational_objective.get("phase_id"),
             )
         if not validation.valid:
             # Full-precision RR is checked before a candidate can reach policy,
@@ -1562,6 +1584,7 @@ class MarketScheduler:
                     policy_version=signal.policy_version,
                     experiment_id=signal.experiment_id,
                     demo_session_id=(self.last_capital_state.get("demo_session_id") if self.settings.trading_mode == "demo" else None),
+                    objective_phase_id=self._operational_objective.get("phase_id"),
                 )
                 if signal.setup_id is not None:
                     await db.update_setup_record(signal.setup_id, status="executed", trade_id=trade_id)
@@ -1600,6 +1623,7 @@ class MarketScheduler:
                     account_mode=self.settings.trading_mode,
                     policy_version=signal.policy_version,
                     experiment_id=signal.experiment_id,
+                    objective_phase_id=self._operational_objective.get("phase_id"),
                 )
                 await db.record_trade_layer(
                     basket_id=basket_id,
@@ -1704,6 +1728,7 @@ class MarketScheduler:
         self.capital_state_service.executor = self.executor
         capital = await self.capital_state_service.evaluate()
         self.last_capital_state = capital
+        await self._advance_objective_phase_if_due(capital)
         await self._finalize_objective_session_if_terminal(capital)
         self._set_analysis_eligible_symbols(capital.get("broker_metadata") or {})
         if capital.get("changed"):
@@ -1786,6 +1811,90 @@ class MarketScheduler:
                 self.telemetry.record_error(f"symbol {symbol}: {type(e).__name__}: {e}")
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
+    async def _advance_objective_phase_if_due(self, capital: dict) -> Optional[dict]:
+        """Advance or fail one active phase from fresh broker equity only.
+
+        Phase progress is a measurement and learning lifecycle. It does not
+        rewrite the confirmed objective, bypass broker validation, or select a
+        fixed trading method. Ordinary losing trades do not fail a phase.
+        """
+        if self.settings.trading_mode != "demo":
+            return None
+        account = dict(capital.get("account") or {})
+        active = await db.get_active_objective("demo")
+        if not active or active.get("is_paused") or account.get("equity") is None:
+            return None
+        operational = dict((active.get("context") or {}).get("operational") or {})
+        if not operational.get("phase_plan") or operational.get("terminal"):
+            return None
+        async with self._objective_phase_lock:
+            phase = await db.get_active_objective_phase(int(active["id"]))
+            if not phase:
+                return None
+            equity = float(account.get("equity"))
+            state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
+            metrics = await db.objective_phase_summary(int(phase["id"]))
+            if state == AccountCapitalState.CAPITAL_EXHAUSTED:
+                failed = await db.fail_objective_phase(
+                    int(phase["id"]), ending_equity=equity,
+                    reason=str(capital.get("reason") or "Broker-authoritative capital exhaustion"), metrics=metrics,
+                )
+                if not failed or failed.get("status") != "failed":
+                    return None
+                context = dict(active.get("context") or {})
+                operational["phase_status"] = "failed"
+                operational["phase_review"] = {"phase_id": phase["id"], "outcome": "failed", "metrics": metrics}
+                context["operational"] = operational
+                await db.update_active_objective_context(int(active["id"]), context)
+                await self._notify(
+                    "❌ **PHASE FAILED**\n"
+                    f"Objective v{active.get('version')} | Phase `{phase['phase_number']}`: `${float(phase.get('starting_equity') or phase['planned_start_equity']):.2f}` → `${float(phase['target_equity']):.2f}`\n"
+                    f"Ending equity: `${equity:.2f}` | Reason: `{state}`\n"
+                    f"Trades: `{metrics['trades_taken']}` | Expectancy: `{metrics['expectancy_r'] if metrics['expectancy_r'] is not None else 'N/A'}` R\n"
+                    "New exposure is being stopped by the terminal objective flow; existing positions remain under broker-confirmed protection."
+                )
+                return {"outcome": "phase_failed", "phase": failed, "metrics": metrics}
+            if equity < float(phase["target_equity"]):
+                return None
+
+            learning = await self.run_self_optimization()
+            next_policy, next_experiment, next_version = await self.optimizer.active_policy("demo")
+            next_snapshot = {
+                "model_version": next_version, "experiment_id": next_experiment,
+                "policy": next_policy.to_dict(), "phase_transition_learning": learning,
+            }
+            allowed = list(operational.get("allowed_symbols") or self._execution_selected_symbols)
+            completed, successor = await db.complete_objective_phase(
+                int(phase["id"]), ending_equity=equity,
+                reason="Fresh broker equity reached phase target", metrics=metrics,
+                next_policy_snapshot=next_snapshot, next_instruments=allowed,
+            )
+            if not completed or completed.get("status") != "completed":
+                return None
+            context = dict(active.get("context") or {})
+            operational["phase_review"] = {"phase_id": completed["id"], "outcome": "completed", "metrics": metrics, "learning": learning}
+            if successor:
+                operational.update({
+                    "phase_id": successor["id"], "phase_number": successor["phase_number"],
+                    "phase_target_equity": successor["target_equity"], "phase_status": successor["status"],
+                })
+            else:
+                operational.update({"phase_status": "completed", "phase_id": completed["id"]})
+            context["operational"] = operational
+            await db.update_active_objective_context(int(active["id"]), context)
+            status_line = (
+                f"🟢 Continuing automatically into Phase `{successor['phase_number']}`: `${float(successor['starting_equity']):.2f}` → `${float(successor['target_equity']):.2f}`."
+                if successor else "🏆 Final phase reached; the objective completion flow is now verifying the overall target."
+            )
+            await self._notify(
+                "🎯 **PHASE COMPLETE**\n"
+                f"Objective v{active.get('version')} | Phase `{completed['phase_number']}`: `${float(completed.get('starting_equity') or completed['planned_start_equity']):.2f}` → `${float(completed['target_equity']):.2f}`\n"
+                f"Ending equity: `${equity:.2f}` | Trades: `{metrics['trades_taken']}` | Win rate: `{metrics['win_rate']:.1f}%`\n"
+                f"Expectancy: `{metrics['expectancy_r'] if metrics['expectancy_r'] is not None else 'N/A'}` R | Best instrument: `{metrics.get('best_instrument') or 'insufficient evidence'}`\n"
+                f"Learning decision: `{learning.get('decision', 'recorded')}`\n{status_line}"
+            )
+            return {"outcome": "phase_completed", "phase": completed, "next_phase": successor, "metrics": metrics, "learning": learning}
+
     async def _finalize_objective_session_if_terminal(self, capital: dict) -> Optional[dict]:
         """Run exactly one evidence review after broker-confirmed DEMO success or failure.
 
@@ -1837,10 +1946,13 @@ class MarketScheduler:
         await db.save_settings(self.settings)
 
         session = await db.get_demo_session_report(int(session_id)) or {}
+        phases = await db.list_objective_phases(int(terminal["id"]))
+        completed_phases = sum(1 for item in phases if item.get("status") == "completed")
+        failed_phases = sum(1 for item in phases if item.get("status") == "failed")
         symbol_summary = await db.get_demo_session_symbol_summary(int(session_id))
         management = await db.get_management_learning_summary(account_mode="demo", days=self.settings.market_ranking_lookback_days)
         summary = {
-            "session": session, "symbol_summary": symbol_summary,
+            "session": session, "phases": phases, "symbol_summary": symbol_summary,
             "management": management, "reason": reason,
         }
         claimed = await db.claim_objective_session_review(
@@ -1852,14 +1964,19 @@ class MarketScheduler:
 
         optimization = await self.run_self_optimization()
         await db.complete_objective_session_review(int(session_id), summary=summary, optimization=optimization)
+        terminal_title = "🏆 **OBJECTIVE COMPLETE**" if outcome == "target_reached" else "❌ **OBJECTIVE FAILED**"
+        await self._notify(
+            f"{terminal_title}\n"
+            f"Objective v{terminal.get('version')} | Session: `#{session_id}`\n"
+            f"Final equity: `${equity:.2f}` | Phases: `{len(phases)}` planned / `{completed_phases}` completed / `{failed_phases}` failed\n"
+            f"Closed strategy trades: `{session.get('strategy_trades', 0)}` | Expectancy: `{session.get('expectancy_r') if session.get('expectancy_r') is not None else 'N/A'}` R\n"
+            "The objective is terminal. New exposure is paused; existing positions remain under broker-confirmed protection."
+        )
         await self._notify(
             "🧠 **OBJECTIVE SESSION REVIEW COMPLETED**\n"
             f"Outcome: `{outcome.upper()}` | Session: `#{session_id}`\n"
-            f"Terminal equity: `${equity:.2f}` | Closed strategy trades: `{session.get('strategy_trades', 0)}`\n"
-            f"Expectancy: `{session.get('expectancy_r') if session.get('expectancy_r') is not None else 'N/A'}` R | "
-            f"Management observations: `{management.get('sample_size', 0)}`\n"
-            f"Research decision: `{optimization.get('decision', 'recorded')}`\n"
-            "The objective is terminal and new exposure is paused. Existing positions remain under broker-confirmed protection; a new objective must be confirmed for another research cycle."
+            f"Management observations: `{management.get('sample_size', 0)}` | Research decision: `{optimization.get('decision', 'recorded')}`\n"
+            "Broker-confirmed phase, instrument, setup, policy, sizing, and management evidence has been preserved for future DEMO evaluation. A new objective must be confirmed for another research cycle."
         )
         return {"outcome": outcome, "review": "completed", "demo_session_id": int(session_id), "optimization": optimization}
 
