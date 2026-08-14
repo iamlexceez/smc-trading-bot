@@ -76,6 +76,16 @@ class BacktestTrade:
     experimental_policy: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ReplayAuditEvent:
+    """One causal replay step; records only information visible at that step."""
+
+    bar_index: int
+    timestamp: str
+    visible_bars: int
+    withheld_future_bars: int
+
+
 @dataclass
 class BacktestResult:
     # Summary
@@ -111,6 +121,9 @@ class BacktestResult:
     trades: list[BacktestTrade] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
     monthly_returns: dict = field(default_factory=dict)
+    # Read-only causality evidence. It is populated by BacktestEngine and never
+    # sent to a broker or used by execution code.
+    replay_audit: list[ReplayAuditEvent] = field(default_factory=list)
 
     def summary(self) -> str:
         """Format summary for display."""
@@ -174,6 +187,7 @@ class BacktestEngine:
         self.daily_pnl: float = 0.0
         self.daily_trades: int = 0
         self.current_day: Optional[str] = None
+        self.replay_audit: list[ReplayAuditEvent] = []
 
     def reset(self):
         """Reset engine state for a new backtest."""
@@ -184,6 +198,7 @@ class BacktestEngine:
         self.daily_pnl = 0.0
         self.daily_trades = 0
         self.current_day = None
+        self.replay_audit = []
 
     def run(
         self,
@@ -241,8 +256,16 @@ class BacktestEngine:
                 self.equity_curve.append(self.balance)
                 continue
 
-            # Slice data up to current bar
+            # Slice data up to the current closed bar. This is the sole
+            # analysis input at this replay step; all future bars remain
+            # withheld and are recorded only as an audit count.
             slice_df = df.iloc[:i+1]
+            self.replay_audit.append(ReplayAuditEvent(
+                bar_index=i,
+                timestamp=str(current_time),
+                visible_bars=len(slice_df),
+                withheld_future_bars=len(df) - len(slice_df),
+            ))
             if len(slice_df) < min_bars:
                 self.equity_curve.append(self.balance)
                 continue
@@ -360,7 +383,18 @@ class BacktestEngine:
                 exit_time=last_bar.get("time", df.index[-1]),
             )
 
-        return self._compute_results(df, symbol, timeframe)
+        result = self._compute_results(df, symbol, timeframe)
+        result.replay_audit = list(self.replay_audit)
+        return result
+
+    def replay_management_bar(self, df: pd.DataFrame, bar_idx: int, pip: float) -> None:
+        """Replay one management bar through the existing conservative logic.
+
+        This test/research seam delegates to the same replay manager used by
+        ``run``. It never accesses an MT5 executor, network client, or live
+        position.
+        """
+        self._manage_trade(df, bar_idx, pip)
 
     def _unrealized_pnl(self, bar):
         """Calculate unrealized P&L for equity curve."""

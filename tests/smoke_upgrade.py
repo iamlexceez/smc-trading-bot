@@ -30,7 +30,7 @@ from data.provider import DataProvider
 from analysis.optimizer import SelfOptimizer
 from analysis.research_governance import ResearchGovernance
 from analysis.adaptive_management import observation_from_broker_trade, observations_from_backtest, summarize_management
-from backtest.engine import BacktestResult, BacktestTrade
+from backtest.engine import BacktestEngine, BacktestResult, BacktestTrade
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 from analysis.account_monitor import summarize_history, exposure_summary
 from execution.capital_reduction import CapitalReductionEngine
@@ -628,6 +628,70 @@ async def test_sizing_rejection_diagnostic_persistence() -> None:
         assert_true(latest["details"]["sizing_inputs"]["risk_pct"] == 1.0, "latest sizing rejection lost sizing inputs")
 
 
+def test_causal_replay_safety() -> None:
+    def make_engine(policy: ExperimentalPolicy | None = None) -> BacktestEngine:
+        return BacktestEngine(settings=TradeSettings.defaults(), policy=policy or ExperimentalPolicy(
+            breakeven_model="none", trailing_model="none", partial_exit_model="none", exit_on_opposing_structure=False,
+        ))
+
+    def replay_trade(direction: str, sl: float, tp: float) -> BacktestTrade:
+        return BacktestTrade(
+            entry_time=pd.Timestamp("2026-01-01T00:00:00Z"), symbol="TEST", direction=direction,
+            entry_price=100.0, stop_loss=sl, initial_stop=sl, take_profit=tp, initial_target=tp,
+        )
+
+    one_bar = lambda high, low, close=100.0: pd.DataFrame([{
+        "time": pd.Timestamp("2026-01-01T00:01:00Z"), "open": 100.0,
+        "high": high, "low": low, "close": close, "volume": 1.0,
+    }])
+
+    buy_stop = make_engine(); buy_stop.open_trade = replay_trade("BUY", 98.0, 102.0)
+    buy_stop.replay_management_bar(one_bar(101.0, 97.5), 0, 0.01)
+    assert_true(buy_stop.trades[-1].exit_reason == "stop_loss", "BUY stop-loss replay did not close at the protective stop")
+
+    buy_target = make_engine(); buy_target.open_trade = replay_trade("BUY", 98.0, 102.0)
+    buy_target.replay_management_bar(one_bar(102.5, 99.0), 0, 0.01)
+    assert_true(buy_target.trades[-1].exit_reason == "take_profit", "BUY take-profit replay did not close at target")
+
+    sell_stop = make_engine(); sell_stop.open_trade = replay_trade("SELL", 102.0, 98.0)
+    sell_stop.replay_management_bar(one_bar(102.5, 99.0), 0, 0.01)
+    assert_true(sell_stop.trades[-1].exit_reason == "stop_loss", "SELL stop-loss replay did not close at the protective stop")
+
+    sell_target = make_engine(); sell_target.open_trade = replay_trade("SELL", 102.0, 98.0)
+    sell_target.replay_management_bar(one_bar(101.0, 97.5), 0, 0.01)
+    assert_true(sell_target.trades[-1].exit_reason == "take_profit", "SELL take-profit replay did not close at target")
+
+    ambiguous = make_engine(); ambiguous.open_trade = replay_trade("BUY", 98.0, 102.0)
+    ambiguous.replay_management_bar(one_bar(102.5, 97.5), 0, 0.01)
+    assert_true(ambiguous.trades[-1].exit_reason == "stop_loss", "same-candle SL/TP ambiguity was not resolved conservatively as stop first")
+
+    excursions = make_engine(); excursions.open_trade = replay_trade("BUY", 95.0, 105.0)
+    excursions.replay_management_bar(one_bar(102.0, 99.0, 100.5), 0, 0.01)
+    assert_true(abs(excursions.open_trade.max_favorable_r - 0.4) < 1e-9 and abs(excursions.open_trade.max_adverse_r + 0.2) < 1e-9, "replay MAE/MFE did not use the current candle only")
+
+    management_policy = ExperimentalPolicy(
+        breakeven_model="rr", breakeven_trigger_r=0.5, trailing_model="none", partial_exit_model="none", exit_on_opposing_structure=False,
+    )
+    management = make_engine(management_policy)
+    management.open_trade = replay_trade("BUY", 98.0, 110.0)
+    management.open_trade.experimental_policy = management_policy.to_dict()
+    history = pd.DataFrame([
+        {"time": pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(minutes=index), "open": 100.0, "high": 100.1, "low": 99.9, "close": 100.0, "volume": 1.0}
+        for index in range(29)
+    ] + [{"time": pd.Timestamp("2026-01-01T00:29:00Z"), "open": 100.0, "high": 101.1, "low": 99.2, "close": 101.0, "volume": 1.0}])
+    management.replay_management_bar(history, len(history) - 1, 0.01)
+    assert_true(management.open_trade.sl_modifications == 1 and management.open_trade.breakeven_activated, "replay management action was not recorded from the existing TradeManager")
+
+    bars = pd.DataFrame([
+        {"time": pd.Timestamp("2026-01-02T00:00:00Z") + pd.Timedelta(minutes=index), "open": 100.0 + index * 0.01, "high": 100.1 + index * 0.01, "low": 99.9 + index * 0.01, "close": 100.0 + index * 0.01, "volume": 1.0}
+        for index in range(55)
+    ])
+    causal = make_engine(); result = causal.run(bars, [], "TEST", "M5")
+    assert_true(result.replay_audit, "causal replay did not record any visible-candle audit events")
+    assert_true(all(event.visible_bars == event.bar_index + 1 and event.withheld_future_bars == len(bars) - event.visible_bars for event in result.replay_audit), "causal replay audit shows future candles entering an analysis decision")
+    assert_true(not any(hasattr(causal, name) for name in ("executor", "data_provider", "broker")), "historical replay unexpectedly owns a network or execution dependency")
+
+
 async def test_adaptive_management_learning_evidence() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "management_learning.db")
@@ -752,6 +816,7 @@ def run() -> None:
     asyncio.run(test_capital_reduction_isolation())
     asyncio.run(test_broker_authoritative_capital_state())
     asyncio.run(test_sizing_rejection_diagnostic_persistence())
+    test_causal_replay_safety()
     asyncio.run(test_adaptive_management_learning_evidence())
     test_research_governance_rankings()
     asyncio.run(test_same_day_governance_deferral())
