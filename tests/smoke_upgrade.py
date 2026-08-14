@@ -43,6 +43,7 @@ from execution.capital_reduction import CapitalReductionEngine
 from execution import capital_reduction as capital_reduction_module
 from analysis.capital_state import AccountCapitalState, CapitalStateService
 from analysis.capital_protection import calculate_capital_protection
+from analysis.opportunity import market_context, rank_opportunities
 from analysis.runtime_telemetry import RuntimeTelemetry
 from strategy.setup_validator import calculate_rr, rr_filter_passes
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
@@ -79,6 +80,23 @@ def test_broker_stop_normalization() -> None:
     buffered_buy = MT5Executor._expand_protective_levels(direction="BUY", sl=100.00, tp=100.20, tick_size=0.01, digits=2, extra_ticks=4)
     buffered_sell = MT5Executor._expand_protective_levels(direction="SELL", sl=100.20, tp=99.80, tick_size=0.01, digits=2, extra_ticks=4)
     assert_true(buffered_buy[0] <= 99.96 and buffered_buy[1] >= 100.24 and buffered_sell[0] >= 100.24 and buffered_sell[1] <= 99.76, "broker order-check stop buffer did not expand protection away from entry")
+
+
+def test_opportunity_context_and_ranking() -> None:
+    closes = [100.0 + index * 0.35 for index in range(80)]
+    frame = pd.DataFrame({
+        "open": [value - 0.1 for value in closes], "high": [value + 0.25 for value in closes],
+        "low": [value - 0.25 for value in closes], "close": closes,
+    })
+    context = market_context(frame)
+    assert_true(context["regime"] in {"COMPRESSION", "EXPANSION", "TRENDING", "RANGING", "EXHAUSTION", "TRANSITION"}, "closed-candle regime classification returned an invalid label")
+    candidates = [SimpleNamespace(symbol="Boom 100 Index", score=80.0), SimpleNamespace(symbol="Boom 500 Index", score=90.0)]
+    contexts = {item.symbol: {"regime": "TRENDING", "adx": 30.0, "atr_ratio": 1.0, "momentum": 0.4} for item in candidates}
+    profiles = {item.symbol: SimpleNamespace(expectancy_r=0.2) for item in candidates}
+    historical = {item.symbol: {"sample_size": 20, "expectancy_r": 0.2} for item in candidates}
+    ranked = rank_opportunities(candidates, profiles=profiles, contexts=contexts, historical=historical, open_symbols=["Boom 500 Index"])
+    assert_true(ranked[0].symbol == "Boom 100 Index" and ranked[0].classification == "BEST_OPPORTUNITY", "portfolio-aware ranking did not penalize duplicate same-instrument exposure")
+    assert_true("existing same-instrument exposure" in ranked[-1].rationale, "portfolio conflict was not retained in the opportunity thesis rationale")
 
 
 def test_runtime_telemetry() -> None:
@@ -1365,6 +1383,7 @@ async def test_demo_live_partitioning() -> None:
 def run() -> None:
     test_broker_stop_normalization()
     test_runtime_telemetry()
+    test_opportunity_context_and_ranking()
     test_full_precision_rr_validation()
     asyncio.run(test_single_flight_scan_guard())
     test_scanner_eligibility_handoff()

@@ -872,6 +872,14 @@ class BotHandlers:
                 lines.append(f"OBSERVED: `{weak.get('symbol')}` has the weakest current-session realized result: `${float(weak.get('pnl') or 0.0):.2f}` across `{int(weak.get('trades') or 0)}` trades.")
         else:
             lines.append("UNKNOWN: no instrument has enough closed session outcomes yet to be favored or avoided.")
+        ranking = list(getattr(self.scheduler, "last_opportunity_ranking", []) or []) if self.scheduler else []
+        if ranking:
+            best = ranking[0]
+            lines.extend(["", "BEST CURRENT OPPORTUNITY"])
+            lines.append(f"{best.get('symbol')} — {best.get('context', {}).get('regime', 'UNKNOWN')} | opportunity score {float(best.get('score') or 0.0):.1f}.")
+            lines.append("Why: " + "; ".join(best.get("rationale") or ["current closed-candle and stored-evidence context is available"]) + ".")
+        else:
+            lines.append("CURRENT OPPORTUNITY — UNKNOWN. No current closed-candle ranking has produced a thesis-qualified candidate yet.")
         completed = [row for row in sessions if row.get("status") != "active"]
         lines.extend(["", "CURRENT PLAN"])
         lines.append("Doing: pursuing the saved objective through the current broker-validated instrument scope and the active experimental policy.")

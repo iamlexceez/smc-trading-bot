@@ -44,6 +44,7 @@ from analysis.capital_protection import calculate_capital_protection
 from analysis.runtime_telemetry import RuntimeTelemetry
 from analysis.objectives import phase_for_equity
 from analysis.objective_phases import plan_objective_phases
+from analysis.opportunity import market_context, rank_opportunities
 from data.provider import DataProvider
 from data.universe import DerivMarketUniverse
 
@@ -84,6 +85,7 @@ class MarketScheduler:
         self.optimizer = SelfOptimizer(self.settings)
         self.research_governance = ResearchGovernance(self.settings)
         self.last_research_governance: dict = {}
+        self.last_opportunity_ranking: list[dict] = []
         self.account_reconciliation = AccountReconciliationEngine(self.executor, self.settings.trading_mode)
         self.last_account_reconciliation: dict = {}
         self.capital_state_service = CapitalStateService(self.settings, self.executor)
@@ -307,7 +309,11 @@ class MarketScheduler:
                 "selected_symbols": [], "disabled_symbols": sorted(usable),
             }
             return []
-        selected = resolved if explicit else list(snapshot["market_selection"]["selected_symbols"])
+        # Every broker-valid symbol in the confirmed objective scope is studied.
+        # Historical rankings remain evidence context, but they must not suppress
+        # analysis before current regime and current opportunity quality are known.
+        historically_preferred = list(snapshot["market_selection"]["selected_symbols"])
+        selected = resolved if explicit else sorted(usable)
         current_equity = ((getattr(self, "last_capital_state", {}) or {}).get("account") or {}).get("equity")
         active_phase = await db.get_active_objective_phase(int(active["id"])) if operational.get("phase_plan") else None
         if operational.get("phase_plan") and not active_phase:
@@ -335,9 +341,12 @@ class MarketScheduler:
         }
         snapshot["market_selection"] = {
             **snapshot["market_selection"],
-            "state": "objective_explicit_universe" if explicit else snapshot["market_selection"]["state"],
+            "state": "objective_explicit_universe" if explicit else "broad_analysis_universe",
+            "historically_preferred_symbols": historically_preferred,
+            "analysis_symbols": selected,
             "selected_symbols": selected,
             "disabled_symbols": sorted(usable - set(selected)),
+            "selection_explanation": "All objective-allowed broker-valid symbols are analyzed. Historical rankings inform evidence context; only the strongest current thesis-qualified opportunities are eligible for execution.",
         }
         return selected
 
@@ -346,12 +355,12 @@ class MarketScheduler:
         return 0.0
 
     async def refresh_research_governance(self, broker_usable_symbols: list[str] | tuple[str, ...]) -> dict:
-        """Select the bounded execution cohort from fresh broker facts and DEMO evidence.
+        """Build historical evidence rankings and the full objective analysis scope.
 
-        Broker eligibility stays broader than execution selection: a broker-valid
-        but currently unselected symbol is not invalid or unsafe; it is simply
-        disabled for new strategy scans until research evidence ranks it into
-        the top cohort.  Existing positions are still managed independently.
+        Broker-valid markets are all analyzed when permitted by the confirmed
+        objective. Historical rankings are descriptive context; a later
+        cross-symbol opportunity ranking chooses whether any current candidate
+        deserves execution. Existing positions remain managed independently.
         """
         self.research_governance.settings = self.settings
         outcomes = await db.get_policy_trade_outcomes(
@@ -1194,8 +1203,7 @@ class MarketScheduler:
             timeframe=primary_tf,
             account_mode=self.settings.trading_mode,
         )
-        
-        
+        regime_context = market_context(df)
 
         # Fetch HTF structures for confluence
         htf_structures = []
@@ -1381,6 +1389,10 @@ class MarketScheduler:
         signal.policy_version = policy_version or self.settings.active_model_version
         signal.experiment_id = experiment_id
         signal.experimental_policy = policy.to_dict()
+        # A descriptive, closed-candle context for cross-symbol ranking. It is
+        # not an independent entry trigger and is retained with the final thesis.
+        signal.market_context = regime_context
+        signal.symbol_profile = profile
         return signal
 
     async def scan_markets(self) -> list[TradeSignal]:
@@ -1928,16 +1940,17 @@ class MarketScheduler:
             logger.warning("No broker-validated usable Deriv targets are active; skipping scan")
             return
         research = await self.refresh_research_governance(broker_usable_symbols)
-        scan_symbols = list(research["market_selection"]["selected_symbols"])
+        scan_symbols = list(research["market_selection"].get("analysis_symbols") or research["market_selection"]["selected_symbols"])
         if not scan_symbols:
-            logger.warning("Research governance selected no executable market from the broker-verified universe; skipping scan")
+            logger.warning("No broker-valid objective analysis symbols are available; skipping scan")
             return
 
         logger.info(
-            "[SCANNER TARGETS] universe=%s broker_usable=%s selected=%s state=%s",
+            "[SCANNER TARGETS] universe=%s broker_usable=%s analysis=%s state=%s",
             audit.get("target_count", 0), audit.get("usable_count", 0), len(scan_symbols),
             research["market_selection"]["state"],
         )
+        candidates: list[TradeSignal] = []
         for symbol in scan_symbols:
             self.telemetry.increment("symbols_attempted")
             logger.info("[SYMBOL LOOP START] %s", symbol)
@@ -1965,16 +1978,55 @@ class MarketScheduler:
                     fingerprint=f"{signal.setup_id}:{signal.direction}:{signal.entry_price}",
                 )
 
-                # Fetch data for the chart if signal passed
-                primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"
-                df = await self.fetch_candles(symbol, primary_tf, 500)
-                
-                # Execute
-                await self.execute_signal(signal, df)
+                candidates.append(signal)
 
             except Exception as e:
                 self.telemetry.record_error(f"symbol {symbol}: {type(e).__name__}: {e}")
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
+
+        if not candidates:
+            logger.info("[OPPORTUNITY RANKING] no thesis-qualified candidates across %s analyzed symbols", len(scan_symbols))
+            return
+        positions = await self.executor.get_positions() if self.executor else []
+        open_symbols = [str(getattr(position, "symbol", "")) for position in positions]
+        historical = {str(row.get("symbol")): row for row in research["market_selection"].get("rankings", [])}
+        profiles = {signal.symbol: getattr(signal, "symbol_profile", None) for signal in candidates}
+        contexts = {signal.symbol: dict(getattr(signal, "market_context", {}) or {}) for signal in candidates}
+        ranked = rank_opportunities(candidates, profiles=profiles, contexts=contexts, historical=historical, open_symbols=open_symbols)
+        by_symbol = {signal.symbol: signal for signal in candidates}
+        for rank, opportunity in enumerate(ranked, start=1):
+            signal = by_symbol[opportunity.symbol]
+            thesis = {
+                "rank": rank, "classification": opportunity.classification, "opportunity_score": opportunity.score,
+                "instrument": signal.symbol, "regime": opportunity.context.get("regime", "UNKNOWN"),
+                "strategy": signal.setup_type, "direction": signal.direction, "entry": signal.entry_price,
+                "invalidation": signal.stop_loss, "target": signal.take_profit, "expected_rr": signal.rr_ratio,
+                "historical_evidence": historical.get(signal.symbol, {}), "current_confirmation": list(opportunity.rationale),
+                "portfolio_conflict": opportunity.portfolio_conflict,
+            }
+            signal.opportunity_thesis = thesis
+            if signal.setup_id is not None:
+                await db.record_execution_event(
+                    account_mode=self.settings.trading_mode, symbol=signal.symbol, setup_id=signal.setup_id,
+                    requested_price=signal.entry_price, status="opportunity_ranked",
+                    reason=opportunity.classification, details=thesis,
+                )
+        self.last_opportunity_ranking = [
+            {"symbol": item.symbol, "score": item.score, "classification": item.classification,
+             "rationale": list(item.rationale), "context": dict(item.context), "portfolio_conflict": item.portfolio_conflict}
+            for item in ranked
+        ]
+        best = ranked[0]
+        selected = by_symbol[best.symbol]
+        logger.info("[OPPORTUNITY RANKING] candidates=%s selected=%s score=%.2f regime=%s", len(ranked), best.symbol, best.score, best.context.get("regime"))
+        await self._chart_activity(
+            "best_opportunity", selected.symbol,
+            f"🎯 **BEST CURRENT OPPORTUNITY — {selected.symbol}**\nRank: `1/{len(ranked)}` | Opportunity score: `{best.score:.1f}`\nRegime: `{best.context.get('regime', 'UNKNOWN')}` | Direction: `{selected.direction}`\nThesis: {'; '.join(best.rationale)}\nOnly this strongest current thesis proceeds to final broker and portfolio validation.",
+            fingerprint=f"{selected.setup_id}:opportunity:{best.score:.4f}",
+        )
+        primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"
+        df = await self.fetch_candles(selected.symbol, primary_tf, 500)
+        await self.execute_signal(selected, df)
 
     async def _advance_objective_phase_if_due(self, capital: dict) -> Optional[dict]:
         """Advance or fail one active phase from fresh broker equity only.

@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from storage import db
+from analysis.opportunity import market_context
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,11 @@ class SymbolProfile:
     last_updated: pd.Timestamp
     sample_size: int = 0
     expectancy_r: float = 0.0
+    regime: str = "UNKNOWN"
+    atr_ratio: float = 1.0
+    adx: float = 0.0
+    rsi: float = 50.0
+    momentum: float = 0.0
 
 
 class AdaptiveProfiler:
@@ -70,6 +76,7 @@ class AdaptiveProfiler:
             return self._default_profile(symbol, timeframe)
 
         frame = df.copy().tail(500).reset_index(drop=True)
+        context = market_context(frame)
         atr_series = self._atr(frame)
         atr_values = atr_series.dropna()
         if atr_values.empty or float(frame["close"].iloc[-1]) == 0:
@@ -106,6 +113,11 @@ class AdaptiveProfiler:
             last_updated=pd.Timestamp.now(tz="UTC"),
             sample_size=int(all_outcomes["sample_size"]),
             expectancy_r=round(float(all_outcomes["expectancy_r"]), 4),
+            regime=str(context.get("regime") or "UNKNOWN"),
+            atr_ratio=round(float(context.get("atr_ratio") or 1.0), 4),
+            adx=round(float(context.get("adx") or 0.0), 4),
+            rsi=round(float(context.get("rsi") or 50.0), 4),
+            momentum=round(float(context.get("momentum") or 0.0), 4),
         )
         self.profiles[symbol] = profile
         await db.upsert_symbol_profile(
@@ -122,6 +134,11 @@ class AdaptiveProfiler:
                 "expectancy_r": profile.expectancy_r,
                 "order_block": ob_outcomes,
                 "fvg": fvg_outcomes,
+                "regime": profile.regime,
+                "atr_ratio": profile.atr_ratio,
+                "adx": profile.adx,
+                "rsi": profile.rsi,
+                "momentum": profile.momentum,
             },
         )
         logger.info(
@@ -148,6 +165,11 @@ class AdaptiveProfiler:
             last_updated=pd.Timestamp.now(tz="UTC"),
             sample_size=0,
             expectancy_r=0.0,
+            regime="UNKNOWN",
+            atr_ratio=1.0,
+            adx=0.0,
+            rsi=50.0,
+            momentum=0.0,
         )
 
 
