@@ -163,6 +163,14 @@ class TradeSettings:
     preferred_risk_pct: float = 0.75
     preferred_max_trades_per_day: int = 10
     active_model_version: str = ""
+    # Research governance. A maximum of ten broker-verified names may be in
+    # the active execution cohort; all other broker-valid markets remain
+    # visible in the audit but are disabled for new strategy scans.
+    research_market_limit: int = 10
+    market_ranking_min_sample_size: int = 10
+    market_ranking_lookback_days: int = 365
+    strategy_ranking_limit: int = 3
+    strategy_ranking_min_sample_size: int = 10
     daily_report_hour_utc: int = 7
     daily_report_minute_utc: int = 0
     last_optimization_date: Optional[str] = None
@@ -359,6 +367,11 @@ class TradeSettings:
             preferred_risk_pct=float(d.get("preferred_risk_pct", d.get("risk_per_trade", 0.75))),
             preferred_max_trades_per_day=max(1, int(d.get("preferred_max_trades_per_day", d.get("max_trades_per_day", 10)))),
             active_model_version=d.get("active_model_version", ""),
+            research_market_limit=max(1, int(d.get("research_market_limit", 10))),
+            market_ranking_min_sample_size=max(1, int(d.get("market_ranking_min_sample_size", 10))),
+            market_ranking_lookback_days=max(1, int(d.get("market_ranking_lookback_days", 365))),
+            strategy_ranking_limit=max(1, min(3, int(d.get("strategy_ranking_limit", 3)))),
+            strategy_ranking_min_sample_size=max(1, int(d.get("strategy_ranking_min_sample_size", 10))),
             daily_report_hour_utc=max(0, min(23, int(d.get("daily_report_hour_utc", 7)))),
             daily_report_minute_utc=max(0, min(59, int(d.get("daily_report_minute_utc", 0)))),
             last_optimization_date=d.get("last_optimization_date"),
@@ -416,6 +429,11 @@ class TradeSettings:
             market_universe_updated_at=None,
             timeframes=[s.strip() for s in os.getenv("TIMEFRAMES", "M15,H1,H4").split(",")],
             htf_timeframes=[s.strip() for s in os.getenv("HTF_TIMEFRAMES", "H1,H4,D1").split(",")],
+            research_market_limit=max(1, int(os.getenv("RESEARCH_MARKET_LIMIT", "10"))),
+            market_ranking_min_sample_size=max(1, int(os.getenv("MARKET_RANKING_MIN_SAMPLE_SIZE", "10"))),
+            market_ranking_lookback_days=max(1, int(os.getenv("MARKET_RANKING_LOOKBACK_DAYS", "365"))),
+            strategy_ranking_limit=max(1, min(3, int(os.getenv("STRATEGY_RANKING_LIMIT", "3")))),
+            strategy_ranking_min_sample_size=max(1, int(os.getenv("STRATEGY_RANKING_MIN_SAMPLE_SIZE", "10"))),
             trading_mode="demo",
             magic_number=20260807,
             require_zone_retest=os.getenv("REQUIRE_ZONE_RETEST", "true").lower() == "true",

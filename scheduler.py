@@ -37,6 +37,7 @@ from analysis.profiler import profiler
 from risk.manager import RiskManager
 from executors.base import BaseExecutor, ExecutionResult
 from analysis.optimizer import SelfOptimizer
+from analysis.research_governance import ResearchGovernance
 from analysis.account_monitor import AccountReconciliationEngine
 from analysis.capital_state import AccountCapitalState, CapitalStateService
 from analysis.runtime_telemetry import RuntimeTelemetry
@@ -78,6 +79,8 @@ class MarketScheduler:
         self._chart_activity_ledger: dict[str, tuple[str, float]] = {}
         # Initialize Self-Optimizer
         self.optimizer = SelfOptimizer(self.settings)
+        self.research_governance = ResearchGovernance(self.settings)
+        self.last_research_governance: dict = {}
         self.account_reconciliation = AccountReconciliationEngine(self.executor, self.settings.trading_mode)
         self.last_account_reconciliation: dict = {}
         self.capital_state_service = CapitalStateService(self.settings, self.executor)
@@ -90,6 +93,9 @@ class MarketScheduler:
         # It is intentionally separate from settings because settings reloads
         # discard broker symbol lists to prevent stale post-restart execution.
         self._analysis_eligible_symbols: tuple[str, ...] = ()
+        # Separate from broker eligibility: this is the current bounded,
+        # evidence-governed cohort permitted to open new strategy exposure.
+        self._execution_selected_symbols: tuple[str, ...] = ()
         # One full scan can be lengthy across a broker-verified universe. All
         # triggers share this guard, preventing duplicate analysis or execution.
         self._scan_lock = asyncio.Lock()
@@ -103,6 +109,44 @@ class MarketScheduler:
 
     def _analysis_symbol_is_eligible(self, symbol: str) -> bool:
         return str(symbol) in self._analysis_eligible_symbols
+
+    def _set_execution_selected_symbols(self, symbols: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+        selected = tuple(sorted({str(symbol).strip() for symbol in symbols if str(symbol).strip()}))
+        self._execution_selected_symbols = selected
+        return selected
+
+    def _execution_symbol_is_selected(self, symbol: str) -> bool:
+        return str(symbol) in self._execution_selected_symbols
+
+    async def refresh_research_governance(self, broker_usable_symbols: list[str] | tuple[str, ...]) -> dict:
+        """Select the bounded execution cohort from fresh broker facts and DEMO evidence.
+
+        Broker eligibility stays broader than execution selection: a broker-valid
+        but currently unselected symbol is not invalid or unsafe; it is simply
+        disabled for new strategy scans until research evidence ranks it into
+        the top cohort.  Existing positions are still managed independently.
+        """
+        self.research_governance.settings = self.settings
+        outcomes = await db.get_policy_trade_outcomes(
+            account_mode="demo", days=self.settings.market_ranking_lookback_days
+        )
+        models = await db.list_model_versions("demo", limit=50)
+        snapshot = self.research_governance.governance_snapshot(
+            broker_usable_symbols, outcomes, models
+        )
+        selected = list(snapshot["market_selection"]["selected_symbols"])
+        self._set_execution_selected_symbols(selected)
+        self.settings.enabled_symbols = selected
+        self.last_research_governance = snapshot
+        logger.info(
+            "[RESEARCH GOVERNANCE] state=%s broker_usable=%s selected=%s disabled=%s top_strategies=%s",
+            snapshot["market_selection"]["state"],
+            snapshot["market_selection"]["universe_size"],
+            len(selected),
+            len(snapshot["market_selection"]["disabled_symbols"]),
+            [row["version"] for row in snapshot["top_strategies"]],
+        )
+        return snapshot
 
     async def _run_scheduled_task(self, name: str, interval: str, callback):
         """Record real scheduled-task entry/outcome and never discard exceptions."""
@@ -560,7 +604,9 @@ class MarketScheduler:
         # prior universe even when MT5 returned records that were all rejected.
         self.settings.symbols = [record.symbol for record in self.market_universe.accepted_records]
         self.settings.available_symbols = list(active)
-        self.settings.enabled_symbols = list(active)
+        research = await self.refresh_research_governance(active)
+        selected_symbols = list(research["market_selection"]["selected_symbols"])
+        self.settings.enabled_symbols = selected_symbols
         self.settings.unsupported_symbols = self.market_universe.unsupported_symbols
         self.settings.symbol_status = {
             record.symbol: f"{record.status}: {record.decision_reason}" for record in records
@@ -569,9 +615,26 @@ class MarketScheduler:
         await db.save_settings(self.settings)
         # Give the validator the completed broker universe directly instead of
         # making it depend on settings persistence or subsequent reload timing.
-        pipeline.update({"stage": "enabled_targets_populated", "enabled_targets": len(self.settings.enabled_symbols), "enabled_target_symbols": list(self.settings.enabled_symbols)})
+        pipeline.update({
+            "stage": "enabled_targets_populated",
+            "enabled_targets": len(self.settings.enabled_symbols),
+            "enabled_target_symbols": list(self.settings.enabled_symbols),
+            "research_market_selection": {
+                "state": research["market_selection"]["state"],
+                "selection_limit": research["market_selection"]["selection_limit"],
+                "minimum_completed_outcomes": research["market_selection"]["minimum_completed_outcomes"],
+                "selected_symbols": selected_symbols,
+                "disabled_symbols": research["market_selection"]["disabled_symbols"],
+            },
+        })
         self.capital_state_service.set_verified_target_universe(active, pipeline)
-        logger.info("[ENABLED] Enabled targets: %s | %s", len(self.settings.enabled_symbols), self.settings.enabled_symbols)
+        logger.info(
+            "[ENABLED] Research cohort state=%s enabled=%s disabled=%s | %s",
+            research["market_selection"]["state"],
+            len(self.settings.enabled_symbols),
+            len(research["market_selection"]["disabled_symbols"]),
+            self.settings.enabled_symbols,
+        )
 
         eligible_count = sum(1 for record in records if record.category in {"synthetic_index", "gold"})
         logger.info(
@@ -1065,6 +1128,20 @@ class MarketScheduler:
         """Run risk checks and submit a broker order only if the candidate remains valid."""
         symbol = signal.symbol
         try:
+            # A broker-valid market outside the current top-ten research cohort
+            # remains observable but cannot create new strategy exposure.
+            if not self._execution_symbol_is_selected(symbol):
+                signal.passed = False
+                signal.rejection_reason = "Symbol is disabled outside the current evidence-governed execution cohort"
+                self.telemetry.record_rejection(signal.rejection_reason)
+                if signal.setup_id is not None:
+                    await db.update_setup_record(signal.setup_id, status="research_cohort_rejected", rejection_reason=signal.rejection_reason)
+                await self._chart_activity(
+                    "execution_rejected", symbol,
+                    f"⛔ **RESEARCH COHORT BLOCK — {symbol}**\nReason: {signal.rejection_reason}\nNo order was submitted.",
+                    fingerprint=f"{signal.setup_id}:research-cohort", essential=True,
+                )
+                return False
             # Defensive assertion: an RR-invalid signal must never reach final
             # revalidation, broker sizing, margin validation, or execution.
             signal_rr_floor = max(0.0, float(self.settings.min_rr_ratio))
@@ -1539,12 +1616,21 @@ class MarketScheduler:
             return
             
         audit = capital.get("broker_metadata") or {}
-        scan_symbols = list(audit.get("usable_symbols") or [])
-        if not scan_symbols:
+        broker_usable_symbols = list(audit.get("usable_symbols") or [])
+        if not broker_usable_symbols:
             logger.warning("No broker-validated usable Deriv targets are active; skipping scan")
             return
+        research = await self.refresh_research_governance(broker_usable_symbols)
+        scan_symbols = list(research["market_selection"]["selected_symbols"])
+        if not scan_symbols:
+            logger.warning("Research governance selected no executable market from the broker-verified universe; skipping scan")
+            return
 
-        logger.info("[SCANNER TARGETS] universe=%s usable=%s scanner_received=%s", audit.get("target_count", 0), audit.get("usable_count", 0), len(scan_symbols))
+        logger.info(
+            "[SCANNER TARGETS] universe=%s broker_usable=%s selected=%s state=%s",
+            audit.get("target_count", 0), audit.get("usable_count", 0), len(scan_symbols),
+            research["market_selection"]["state"],
+        )
         for symbol in scan_symbols:
             self.telemetry.increment("symbols_attempted")
             logger.info("[SYMBOL LOOP START] %s", symbol)
@@ -1584,13 +1670,30 @@ class MarketScheduler:
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
     async def run_self_optimization(self):
-        """Run one bounded champion/challenger cycle and retain an audit trail."""
+        """Run one daily, evidence-based champion/challenger governance cycle.
+
+        A same-day manual request is reported transparently but cannot turn one
+        recent loss into an immediate policy replacement, larger risk, more
+        layers, or a higher trading frequency.
+        """
         self.telemetry.component_started("learning_engine")
-        logger.info("Running bounded walk-forward optimization...")
+        today = datetime.utcnow().date().isoformat()
+        if self.settings.trading_mode == "demo" and self.settings.last_optimization_date == today:
+            result = {
+                "decision": "deferred_daily_governance",
+                "reason": "A DEMO governance cycle already ran today; recent losses cannot trigger an intraday policy change.",
+                "next_eligible_date": (datetime.utcnow().date() + timedelta(days=1)).isoformat(),
+            }
+            self.telemetry.component_succeeded("learning_engine", waiting=True)
+            return result
+        logger.info("Running daily bounded walk-forward optimization...")
         try:
             self.optimizer.settings = self.settings
             rollback = await self.optimizer.evaluate_rollback(self.settings.trading_mode)
             result = rollback or await self.optimizer.run_optimization(self.settings.trading_mode)
+            if self.settings.trading_mode == "demo":
+                self.settings.last_optimization_date = today
+                await db.save_settings(self.settings)
         except Exception as exc:
             self.telemetry.component_failed("learning_engine", exc)
             raise
@@ -1603,6 +1706,7 @@ class MarketScheduler:
                 f"Decision: `{result['decision']}`\n"
                 f"Reason: {result.get('reason', 'Measured post-promotion performance required a rollback.')}"
             )
+        return result
 
     async def send_daily_journal(self):
         """Generate and send the readable, factual morning learning report."""
@@ -1610,7 +1714,9 @@ class MarketScheduler:
         logger.info("Generating daily learning report...")
         try:
             self.optimizer.settings = self.settings
-            journal = await self.optimizer.generate_daily_journal(self.settings.trading_mode)
+            journal = await self.optimizer.generate_daily_journal(
+                self.settings.trading_mode, broker_usable_symbols=self._analysis_eligible_symbols
+            )
             await self._notify(journal)
         except Exception as exc:
             self.telemetry.component_failed("learning_engine", exc)
@@ -1899,6 +2005,10 @@ class MarketScheduler:
         the original setup budget, and free margin supports the reduced volume.
         """
         if not self.settings.auto_trade or self.settings.is_paused:
+            return False
+        # Existing positions continue to receive protective management, but a
+        # market removed from the research cohort cannot add fresh exposure.
+        if not self._execution_symbol_is_selected(position.symbol):
             return False
         layers = await db.get_basket_layers(basket["id"])
         next_layer = next((layer for layer in layers if layer["status"] == "planned"), None)

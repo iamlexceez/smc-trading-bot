@@ -491,6 +491,15 @@ class BotHandlers:
             profile_lines.append(f"• `{symbol}` — completed outcomes `{profile.sample_size}`, expectancy `{profile.expectancy_r:.2f}R`")
         model_text = model["version"] if model else "baseline pending"
         decision = recent[0]["decision"] if recent else "no optimization run yet"
+        governance = getattr(self.scheduler, "last_research_governance", {}) if self.scheduler else {}
+        market_selection = governance.get("market_selection") or {}
+        strategy_rows = governance.get("top_strategies") or []
+        cohort_text = ", ".join(market_selection.get("selected_symbols") or []) or "Awaiting fresh broker-universe ranking"
+        disabled_count = len(market_selection.get("disabled_symbols") or [])
+        strategy_text = " | ".join(
+            f"#{row.get('rank')} {row.get('version')} ({row.get('evidence_stage')}, n={row.get('sample_size')}, E={float(row.get('expectancy_r') or 0):.2f}R)"
+            for row in strategy_rows
+        ) or "No ranked versioned policy evidence yet"
         text = [
             "🧠 **LEARNING STATUS**",
             f"Mode: `{mode.upper()}` | Active model: `{model_text}` | Latest governance decision: `{decision}`",
@@ -498,6 +507,11 @@ class BotHandlers:
             "",
             "**Current symbol evidence**",
             *(profile_lines or ["No in-memory profile yet. The next broker-candle scan will build observable profiles; completed outcomes are required before outcome statistics affect settings."]),
+            "",
+            "**Research Governance**",
+            f"Execution cohort (max `{self.settings.research_market_limit}`): `{cohort_text}` | other broker-valid markets disabled for new strategy scans: `{disabled_count}`.",
+            f"Top strategies (up to `{self.settings.strategy_ranking_limit}`): {strategy_text}.",
+            "No-revenge rule: losses are evidence only. They cannot trigger immediate larger risk, additional trades/layers, or an intraday policy replacement.",
             "",
             "**Next objective**",
             f"Collect at least `{self.settings.optimization_min_sample_size}` completed DEMO R-recorded outcomes, then compare independently specified policies through train, validation, out-of-sample, and forward-DEMO evidence. Broker and software integrity remain mandatory; risk, RR, features, layering, and management are experimental.",
@@ -1496,11 +1510,15 @@ class BotHandlers:
 
     @admin_only
     async def cmd_optimize(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Manually trigger self-optimization."""
-        await update.message.reply_text("🧠 **Initiating Self-Optimization AI...**\nAnalyzing recent trade history...")
+        """Request the evidence-governed daily research cycle."""
+        await update.message.reply_text("🧠 **REQUESTING DAILY RESEARCH GOVERNANCE**\nReviewing chronological DEMO evidence; no loss-driven tuning will occur.")
         if self.scheduler:
-            await self.scheduler.run_self_optimization()
-            await update.message.reply_text("✅ Optimization complete. Scoring weights have been tuned.")
+            result = await self.scheduler.run_self_optimization()
+            await update.message.reply_text(
+                "🧠 **RESEARCH GOVERNANCE RESULT**\n"
+                f"Decision: `{result.get('decision', 'unknown')}`\n"
+                f"Reason: {result.get('reason', 'No additional detail recorded.')}"
+            )
         else:
             await update.message.reply_text("❌ Scheduler not initialized.")
 
@@ -1508,7 +1526,9 @@ class BotHandlers:
     async def cmd_journal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show the daily AI journal."""
         if self.scheduler and self.scheduler.optimizer:
-            journal = await self.scheduler.optimizer.generate_daily_journal()
+            journal = await self.scheduler.optimizer.generate_daily_journal(
+                broker_usable_symbols=self.scheduler._analysis_eligible_symbols
+            )
             await update.message.reply_text(journal, parse_mode="Markdown")
         else:
             await update.message.reply_text("❌ Optimizer not initialized.")

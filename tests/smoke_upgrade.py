@@ -28,6 +28,7 @@ from storage import db
 from data.universe import DerivMarketUniverse
 from data.provider import DataProvider
 from analysis.optimizer import SelfOptimizer
+from analysis.research_governance import ResearchGovernance
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 from analysis.account_monitor import summarize_history, exposure_summary
 from execution.capital_reduction import CapitalReductionEngine
@@ -625,6 +626,49 @@ async def test_sizing_rejection_diagnostic_persistence() -> None:
         assert_true(latest["details"]["sizing_inputs"]["risk_pct"] == 1.0, "latest sizing rejection lost sizing inputs")
 
 
+def test_research_governance_rankings() -> None:
+    settings = TradeSettings.defaults()
+    settings.research_market_limit = 10
+    settings.market_ranking_min_sample_size = 2
+    settings.strategy_ranking_limit = 3
+    settings.strategy_ranking_min_sample_size = 2
+    governance = ResearchGovernance(settings)
+    universe = [f"Synthetic {index:02d}" for index in range(1, 13)]
+    outcomes = [
+        {"symbol": "Synthetic 01", "pnl_r": 1.2}, {"symbol": "Synthetic 01", "pnl_r": 0.8},
+        {"symbol": "Synthetic 02", "pnl_r": 0.9}, {"symbol": "Synthetic 02", "pnl_r": 0.5},
+        {"symbol": "Synthetic 03", "pnl_r": -1.0}, {"symbol": "Synthetic 03", "pnl_r": -0.4},
+    ]
+    strong = PolicyEvaluator.evaluate([{"pnl_r": 1.2}, {"pnl_r": 0.8}]).to_dict()
+    weaker = PolicyEvaluator.evaluate([{"pnl_r": 0.9}, {"pnl_r": 0.5}]).to_dict()
+    negative = PolicyEvaluator.evaluate([{"pnl_r": -1.0}, {"pnl_r": -0.4}]).to_dict()
+    models = [
+        {"version": "model_v001", "role": "champion", "status": "active", "parameters": {}, "performance": {"forward_demo": strong}},
+        {"version": "model_v002", "role": "challenger", "status": "evaluated", "parameters": {}, "performance": {"out_of_sample": weaker}},
+        {"version": "model_v003", "role": "challenger", "status": "rejected", "parameters": {}, "performance": {"out_of_sample": negative}},
+    ]
+    snapshot = governance.governance_snapshot(universe, outcomes, models)
+    markets = snapshot["market_selection"]
+    assert_true(len(markets["selected_symbols"]) == 10, "research governance did not bound the execution cohort to ten broker-valid markets")
+    assert_true("Synthetic 01" in markets["selected_symbols"] and "Synthetic 02" in markets["selected_symbols"], "positive evidence markets were not prioritized")
+    assert_true(len(markets["disabled_symbols"]) == 2 and set(markets["disabled_symbols"]).isdisjoint(markets["selected_symbols"]), "non-selected broker markets were not explicitly disabled")
+    strategies = snapshot["top_strategies"]
+    assert_true([row["version"] for row in strategies][:2] == ["model_v001", "model_v002"], "forward-DEMO evidence did not outrank out-of-sample evidence")
+    assert_true(snapshot["anti_revenge"]["loss_streak_is_not_a_sizing_input"], "loss streak was permitted to influence position sizing")
+    assert_true(snapshot["anti_revenge"]["loss_streak_is_not_a_policy_selection_input"], "loss streak was permitted to select a policy")
+
+
+async def test_same_day_governance_deferral() -> None:
+    engine = object.__new__(scheduler.MarketScheduler)
+    engine.settings = TradeSettings.defaults()
+    engine.settings.trading_mode = "demo"
+    engine.settings.last_optimization_date = __import__("datetime").date.today().isoformat()
+    engine.telemetry = RuntimeTelemetry()
+    result = await engine.run_self_optimization()
+    assert_true(result["decision"] == "deferred_daily_governance", "same-day governance was not deferred")
+    assert_true("cannot trigger" in result["reason"], "anti-revenge deferral reason was not explicit")
+
+
 async def test_demo_live_partitioning() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "modes.db")
@@ -663,6 +707,8 @@ def run() -> None:
     asyncio.run(test_capital_reduction_isolation())
     asyncio.run(test_broker_authoritative_capital_state())
     asyncio.run(test_sizing_rejection_diagnostic_persistence())
+    test_research_governance_rankings()
+    asyncio.run(test_same_day_governance_deferral())
     asyncio.run(test_demo_live_partitioning())
     print("PASS: upgrade smoke tests")
 

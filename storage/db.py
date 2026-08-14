@@ -734,6 +734,22 @@ async def get_model_version(version: str, account_mode: str = "demo", db_path: s
     return item
 
 
+async def list_model_versions(account_mode: str = "demo", limit: int = 50, db_path: str = DB_PATH) -> list[dict]:
+    """Return immutable model versions with their stored evaluation evidence."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT * FROM model_versions WHERE account_mode = ?
+               ORDER BY COALESCE(promoted_at, created_at) DESC, id DESC LIMIT ?""",
+            (account_mode, max(1, int(limit))),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    for item in rows:
+        item["parameters"] = json.loads(item.pop("parameters_json") or "{}")
+        item["performance"] = json.loads(item.pop("performance_json") or "{}")
+    return rows
+
+
 async def get_active_model(account_mode: str = "demo", db_path: str = DB_PATH) -> Optional[dict]:
     """Return the active champion for exactly one account mode."""
     async with aiosqlite.connect(db_path) as conn:

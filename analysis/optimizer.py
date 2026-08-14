@@ -16,6 +16,7 @@ from datetime import datetime
 from statistics import mean
 from typing import Any, Optional
 
+from analysis.research_governance import ResearchGovernance
 from analysis.policies import (
     ExperimentalPolicy,
     Hypothesis,
@@ -377,11 +378,20 @@ class SelfOptimizer:
         )
         return result
 
-    async def generate_daily_journal(self, account_mode: Optional[str] = None) -> str:
+    async def generate_daily_journal(
+        self, account_mode: Optional[str] = None, broker_usable_symbols: tuple[str, ...] | list[str] = ()
+    ) -> str:
         """Generate a factual, plain-English daily research report from stored evidence."""
         account_mode = account_mode or self.settings.trading_mode
         performance = await db.get_performance_summary(account_mode, days=1)
         recent = await db.get_policy_trade_outcomes(account_mode=account_mode, days=1)
+        ranking_outcomes = await db.get_policy_trade_outcomes(
+            account_mode=account_mode, days=self.settings.market_ranking_lookback_days
+        )
+        model_versions = await db.list_model_versions(account_mode, limit=50)
+        governance = ResearchGovernance(self.settings).governance_snapshot(
+            broker_usable_symbols, ranking_outcomes, model_versions
+        )
         champion = await self._ensure_champion(account_mode)
         challenger = await db.get_active_forward_experiment(account_mode)
         decisions = await db.get_recent_optimization_runs(account_mode, limit=1)
@@ -406,6 +416,14 @@ class SelfOptimizer:
         policy = ExperimentalPolicy.from_dict(champion["parameters"])
         challenger_text = challenger.get("model_version", "No forward challenger") if challenger else "No forward challenger"
         next_hypothesis = hypotheses[0]["statement"] if hypotheses else "Generate additional evidence from completed DEMO trades."
+        market_selection = governance["market_selection"]
+        selected_markets = ", ".join(market_selection["selected_symbols"]) or "No broker-verified execution cohort"
+        market_state = str(market_selection["state"]).replace("_", " ")
+        strategy_rows = governance["top_strategies"]
+        strategy_text = " | ".join(
+            f"#{row['rank']} {row['version']} ({row['evidence_stage']}, n={row['sample_size']}, E={row['expectancy_r']:.2f}R)"
+            for row in strategy_rows
+        ) or "No versioned policies yet"
         capital_state = await db.get_account_state("demo") if account_mode == "demo" else None
         if capital_state:
             capital_text = (
@@ -428,7 +446,15 @@ class SelfOptimizer:
             "**Policy Research State**",
             f"Current Champion: `{champion['version']}`. Forward challenger: `{challenger_text}`.",
             f"Champion policy: entry `{policy.entry_model}`, risk `{policy.risk_model}` at `{policy.risk_pct}%`, RR `{policy.rr_target or 'market-derived'}`, layers `{policy.max_layers}`, management `{policy.trailing_model}`.",
+            f"Top strategy evidence (up to {self.settings.strategy_ranking_limit}): {strategy_text}.",
             f"Latest research decision: `{decision}`.",
+            "",
+            "**Market Selection**",
+            f"Execution cohort ({market_state}; max {market_selection['selection_limit']}): `{selected_markets}`.",
+            f"Disabled for new strategy scans: `{len(market_selection['disabled_symbols'])}` broker-valid market(s). {market_selection['selection_explanation']}",
+            "",
+            "**No-Revenge Governance**",
+            "Losses are recorded as evidence but cannot trigger immediate risk escalation, extra trades, extra layers, or an intraday policy replacement. Policy governance runs no more than once per UTC day.",
             "",
             "**Capital Status**",
             capital_text,
