@@ -144,6 +144,8 @@ def test_risk_sizing_and_layers() -> None:
     settings = TradeSettings.defaults()
     settings.risk_per_trade = 0.75
     settings.max_setup_risk_pct = 1.0
+    settings.auto_trade = True
+    settings.enabled_symbols = ["TEST"]
     manager = RiskManager(settings)
     symbol_info = {
         "trade_tick_size": 0.01,
@@ -169,13 +171,36 @@ def test_risk_sizing_and_layers() -> None:
         symbol_info=symbol_info, leverage=100, risk_model="fixed_volume", fixed_volume=2.5,
     )
     assert_true(fixed_volume.valid and fixed_volume.final_volume == 2.5 and fixed_volume.required_lot == 2.5, "fixed-volume policy was not broker-normalized correctly")
-    below_minimum = manager.calculate_position_sizing(
-        account_equity=100.0, free_margin=100.0, entry_price=100.0, stop_loss=98.0,
-        symbol_info={**symbol_info, "margin_required_min_volume": 1.0, "normalized_volume": 0.01},
-        leverage=100, risk_pct=0.01,
+    broker_minimum = manager.calculate_position_sizing(
+        account_equity=152.60, free_margin=152.60, entry_price=100.0, stop_loss=89.15,
+        symbol_info={
+            "trade_tick_size": 0.01, "trade_tick_value": 0.01,
+            "volume_min": 0.2, "volume_max": 100.0, "volume_step": 0.01,
+            "margin_per_lot": 11.2,
+        },
+        leverage=100, risk_pct=0.75,
     )
-    assert_true(not below_minimum.valid and below_minimum.sizing_code == "MINIMUM_LOT_EXCEEDS_POLICY_RISK", "minimum-lot risk no-fit was not identified")
-    assert_true(below_minimum.policy_required_lot < below_minimum.broker_min_lot and below_minimum.minimum_lot_loss > below_minimum.risk_amount, "minimum-lot evidence is incomplete")
+    assert_true(broker_minimum.valid and broker_minimum.final_volume == 0.2, "broker-minimum adaptive sizing did not select the executable lot")
+    assert_true(broker_minimum.risk_adapted_to_broker_minimum and broker_minimum.policy_required_lot < broker_minimum.broker_min_lot, "adaptive broker-minimum evidence is missing")
+    assert_true(abs(broker_minimum.minimum_required_risk_pct - (broker_minimum.minimum_lot_loss / 152.60 * 100)) < 1e-9, "minimum required risk was not derived from current effective capital")
+    margin_block = manager.calculate_position_sizing(
+        account_equity=152.60, free_margin=1.0, entry_price=100.0, stop_loss=89.15,
+        symbol_info={
+            "trade_tick_size": 0.01, "trade_tick_value": 0.01,
+            "volume_min": 0.2, "volume_max": 100.0, "volume_step": 0.01,
+            "margin_per_lot": 11.2,
+        },
+        leverage=100, risk_pct=0.75,
+    )
+    assert_true(not margin_block.valid and margin_block.sizing_code == "MINIMUM_LOT_MARGIN_UNAFFORDABLE", "genuine minimum-lot margin failure was not retained")
+    adaptive_check = asyncio.run(manager.check_all(
+        symbol="TEST", direction="BUY", score=0.0, rr_ratio=3.0, spread_pips=0.0,
+        account_equity=152.60, free_margin=152.60, required_margin=broker_minimum.required_margin,
+        today_pnl=0.0, today_trade_count=0, open_position_count=0,
+        proposed_setup_risk=broker_minimum.expected_loss, policy={"risk_pct": 0.75, "risk_model": "fixed_pct"},
+        adaptive_minimum_risk=True,
+    ))
+    assert_true(adaptive_check.passed, "adaptive minimum-risk sizing did not preserve broker and margin validation")
     layers = manager.get_layering_plan(sizing.final_volume, 100.0, 98.0, symbol_info)
     assert_true(bool(layers), "layer plan is empty")
     assert_true(sum(layer["lot"] for layer in layers) <= sizing.final_volume + 1e-6, "layers exceed total volume")

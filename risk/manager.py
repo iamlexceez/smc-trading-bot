@@ -1,9 +1,10 @@
 """Institutional risk, sizing, margin, exposure, and basket-layer controls.
 
 Risk is calculated from broker symbol specifications and a structural stop. A
-setup receives one finite risk budget; every layer consumes part of that same
-budget. Scores, recent losses, available margin, and profit targets never
-increase the configured maximum risk.
+setup receives broker-valid sizing from current effective capital and its
+structural stop. When a broker minimum volume exceeds a percentage policy's
+raw lot, the minimum-lot loss becomes the adaptive per-trade risk input only
+if fresh broker margin validation permits that actual volume.
 """
 
 from __future__ import annotations
@@ -47,6 +48,10 @@ class PositionSizingResult:
     minimum_lot_margin: float = 0.0
     minimum_lot_loss: float = 0.0
     sizing_code: str = ""
+    base_risk_pct: float = 0.0
+    effective_risk_pct: float = 0.0
+    minimum_required_risk_pct: float = 0.0
+    risk_adapted_to_broker_minimum: bool = False
 
     @property
     def valid(self) -> bool:
@@ -70,6 +75,10 @@ class PositionSizingResult:
             "available_margin": self.available_margin,
             "loss_per_lot": self.loss_per_lot,
             "sizing_code": self.sizing_code,
+            "base_risk_pct": self.base_risk_pct,
+            "effective_risk_pct": self.effective_risk_pct,
+            "minimum_required_risk_pct": self.minimum_required_risk_pct,
+            "risk_adapted_to_broker_minimum": self.risk_adapted_to_broker_minimum,
             "reason": self.reason,
         }
 
@@ -171,14 +180,16 @@ class RiskManager:
         fixed_volume: Optional[float] = None,
         margin_safety_buffer_pct: float = 0.0,
     ) -> PositionSizingResult:
-        """Derive broker-valid volume from policy-selected risk and free margin.
+        """Derive a broker-valid volume from current effective capital and fresh broker facts.
 
-        The smaller of policy-risk and broker-margin capacity is chosen and
-        rounded down. Broker volume steps and margin are integrity constraints;
-        risk percentage is supplied by the active experiment.
+        A percentage policy supplies the base risk input. If that raw lot is
+        below the broker's executable minimum, the minimum-lot loss determines
+        the adaptive risk percentage for this specific setup. This never bypasses
+        broker volume, direct-margin, stop, or portfolio checks.
         """
         equity = self._risk_equity(account_equity)
         configured_risk_pct = self.settings.risk_per_trade if risk_pct is None else float(risk_pct)
+        base_risk_pct = max(0.0, configured_risk_pct)
         broker_min_lot = self._spec(symbol_info, "volume_min", "min_lot", default=0.0)
         broker_max_lot = self._spec(symbol_info, "volume_max", "max_lot", default=0.0)
         broker_volume_step = self._spec(symbol_info, "volume_step", "step_lot", default=broker_min_lot)
@@ -189,9 +200,7 @@ class RiskManager:
             ideal_volume = max(0.0, float(fixed_volume or 0.0))
             risk_amount = ideal_volume * loss_per_lot
         else:
-            # Experimental policy discovery: risk percentage is supplied by the
-            # active policy rather than a hard predetermined ceiling.
-            risk_amount = equity * max(0.0, configured_risk_pct) / 100
+            risk_amount = equity * base_risk_pct / 100
             ideal_volume = risk_amount / loss_per_lot if risk_amount > 0 else 0.0
         if ideal_volume <= 0:
             return PositionSizingResult(0, 0, 0, risk_amount, 0, 0, free_margin, loss_per_lot, "Policy did not specify a positive executable size", policy_required_lot=ideal_volume, broker_min_lot=broker_min_lot, broker_max_lot=broker_max_lot, broker_volume_step=broker_volume_step, sizing_code="POLICY_NO_POSITIVE_SIZE")
@@ -200,12 +209,23 @@ class RiskManager:
         available_margin = max(0.0, free_margin * (1 - max(0.0, margin_safety_buffer_pct)))
         margin_limited_volume = available_margin / margin_per_lot if margin_per_lot > 0 else ideal_volume
         policy_required_lot = ideal_volume
-        capped_required_lot = min(policy_required_lot, margin_limited_volume)
-        required_lot = self.floor_volume(capped_required_lot, symbol_info)
-        required_margin = required_lot * margin_per_lot
-        expected_loss = required_lot * loss_per_lot
         minimum_lot_margin = broker_min_lot * margin_per_lot if broker_min_lot > 0 else 0.0
         minimum_lot_loss = broker_min_lot * loss_per_lot if broker_min_lot > 0 else 0.0
+        minimum_required_risk_pct = (minimum_lot_loss / equity * 100) if equity > 0 and minimum_lot_loss > 0 else 0.0
+        risk_adapted = False
+
+        if risk_model != "fixed_volume" and policy_required_lot + 1e-12 < broker_min_lot and margin_limited_volume + 1e-12 >= broker_min_lot:
+            # The broker minimum is executable and replaces only this setup's
+            # base percentage input with its actual stop-loss risk percentage.
+            required_lot = self.floor_volume(broker_min_lot, symbol_info)
+            risk_adapted = required_lot > 0
+            risk_amount = minimum_lot_loss if risk_adapted else risk_amount
+        else:
+            capped_required_lot = min(policy_required_lot, margin_limited_volume)
+            required_lot = self.floor_volume(capped_required_lot, symbol_info)
+        required_margin = required_lot * margin_per_lot if required_lot > 0 else 0.0
+        expected_loss = required_lot * loss_per_lot if required_lot > 0 else 0.0
+        effective_risk_pct = (expected_loss / equity * 100) if equity > 0 and expected_loss > 0 else base_risk_pct
 
         sizing_code = ""
         if broker_min_lot <= 0 or broker_volume_step <= 0:
@@ -218,10 +238,9 @@ class RiskManager:
             sizing_code = "MINIMUM_LOT_MARGIN_UNAFFORDABLE"
             reason = (f"Broker minimum lot {broker_min_lot:g} requires margin {minimum_lot_margin:.2f}, "
                       f"above available margin {available_margin:.2f}")
-        elif risk_model != "fixed_volume" and policy_required_lot + 1e-12 < broker_min_lot:
-            sizing_code = "MINIMUM_LOT_EXCEEDS_POLICY_RISK"
-            reason = (f"Policy-required lot {policy_required_lot:.8g} is below broker minimum {broker_min_lot:g}; "
-                      f"minimum lot loss {minimum_lot_loss:.2f} exceeds policy risk budget {risk_amount:.2f}")
+        elif broker_max_lot > 0 and broker_min_lot > broker_max_lot:
+            sizing_code = "BROKER_VOLUME_RANGE_INVALID"
+            reason = "Broker minimum volume exceeds broker maximum volume"
         elif required_lot <= 0:
             sizing_code = "NO_STEP_NORMALIZED_LOT"
             reason = (f"Required lot {capped_required_lot:.8g} cannot be rounded down to broker step "
@@ -229,9 +248,9 @@ class RiskManager:
         elif required_margin > available_margin + 1e-9:
             sizing_code = "FINAL_LOT_MARGIN_EXCEEDS_AVAILABLE"
             reason = "Broker-normalized required lot exceeds available margin after safety buffer"
-        elif risk_model != "fixed_volume" and expected_loss > risk_amount + 1e-6:
-            sizing_code = "FINAL_LOT_EXCEEDS_POLICY_RISK"
-            reason = "Broker-normalized required lot exceeds the selected policy risk budget"
+        elif required_lot > broker_max_lot + 1e-12:
+            sizing_code = "FINAL_LOT_EXCEEDS_BROKER_MAXIMUM"
+            reason = "Broker-normalized required lot exceeds the broker maximum volume"
         else:
             reason = ""
 
@@ -254,6 +273,10 @@ class RiskManager:
             minimum_lot_margin=minimum_lot_margin,
             minimum_lot_loss=minimum_lot_loss,
             sizing_code=sizing_code,
+            base_risk_pct=base_risk_pct,
+            effective_risk_pct=effective_risk_pct,
+            minimum_required_risk_pct=minimum_required_risk_pct,
+            risk_adapted_to_broker_minimum=risk_adapted,
         )
 
     def calculate_position_size(
@@ -348,6 +371,21 @@ class RiskManager:
                     "trigger": triggers.get(index, "Fresh revalidation required"),
                 }
             )
+        if not layers:
+            minimum_volume = self._spec(symbol_info, "volume_min", "min_lot", default=0.0)
+            executable_total = self.floor_volume(total_lot, symbol_info)
+            if minimum_volume > 0 and executable_total >= minimum_volume:
+                # A broker minimum cannot be split into sub-minimum policy layers.
+                # Use one valid initial entry; later additions still require their
+                # own fresh broker-valid sizing and confirmation.
+                layers.append({
+                    "number": 1,
+                    "lot": executable_total,
+                    "allocation": 1.0,
+                    "expected_loss": executable_total * loss_per_lot,
+                    "comment": "EXP L1/1",
+                    "trigger": "Initial broker-valid entry",
+                })
         return layers
 
     async def check_all(
@@ -371,6 +409,7 @@ class RiskManager:
         is_layer: bool = False,
         consecutive_losses: int = 0,
         policy: Optional[dict] = None,
+        adaptive_minimum_risk: bool = False,
     ) -> RiskCheckResult:
         """Run integrity checks plus the *selected* policy—never hidden global caps.
 
@@ -410,7 +449,10 @@ class RiskManager:
         policy_risk_pct = policy.get("risk_pct")
         if policy_risk_pct is not None and policy.get("risk_model") != "fixed_volume":
             policy_risk_amount = equity * max(0.0, float(policy_risk_pct)) / 100
-            checks.append(("Policy setup risk", proposed_setup_risk <= policy_risk_amount + 1e-6, f"proposed=${proposed_setup_risk:.2f}; policy=${policy_risk_amount:.2f}"))
+            if adaptive_minimum_risk:
+                checks.append(("Broker-minimum adaptive risk", True, f"proposed=${proposed_setup_risk:.2f}; base policy=${policy_risk_amount:.2f}; broker-valid minimum lot selected"))
+            else:
+                checks.append(("Policy setup risk", proposed_setup_risk <= policy_risk_amount + 1e-6, f"proposed=${proposed_setup_risk:.2f}; policy=${policy_risk_amount:.2f}"))
 
         all_passed = all(passed for _, passed, _ in checks)
         failed = [name for name, passed, _ in checks if not passed]

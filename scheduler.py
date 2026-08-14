@@ -1162,6 +1162,12 @@ class MarketScheduler:
                 risk_model=str(signal.experimental_policy.get("risk_model", "fixed_pct")),
                 fixed_volume=signal.experimental_policy.get("fixed_volume"),
             )
+            if sizing.risk_adapted_to_broker_minimum:
+                await self._chart_activity(
+                    "adaptive_broker_minimum_sizing", symbol,
+                    f"📐 **BROKER-MINIMUM ADAPTIVE SIZING — {symbol}**\nBase policy risk: `{sizing.base_risk_pct:.8g}%` | Minimum required risk: `{sizing.minimum_required_risk_pct:.8g}%`\nEffective risk for this setup: `{sizing.effective_risk_pct:.8g}%`\nBroker-valid minimum lot: `{sizing.required_lot:.8g}` | Expected SL loss: `${sizing.expected_loss:.2f}`\nRequired margin: `${sizing.required_margin:.2f}` | Free margin: `${sizing.available_margin:.2f}`\nProceeding only to existing portfolio and broker validation.",
+                    fingerprint=f"{setup_id}:adaptive-minimum:{sizing.required_lot}:{sizing.effective_risk_pct:.8f}", essential=True,
+                )
             if not sizing.valid:
                 self.telemetry.increment("sizing_rejected")
                 signal.passed = False
@@ -1200,6 +1206,7 @@ class MarketScheduler:
                     f"⛔ **SIZING REJECTED — {symbol}**\n"
                     f"Code: `{sizing.sizing_code or 'UNSPECIFIED'}`\nReason: {signal.rejection_reason}\n"
                     f"Policy-required lot: `{sizing.policy_required_lot:.8g}` | Broker-normalized required lot: `{sizing.required_lot:.8g}`\n"
+                    f"Base risk: `{sizing.base_risk_pct:.8g}%` | Effective risk: `{sizing.effective_risk_pct:.8g}%` | Minimum required: `{sizing.minimum_required_risk_pct:.8g}%`\n"
                     f"Broker min / step: `{sizing.broker_min_lot:g}` / `{sizing.broker_volume_step:g}`\n"
                     f"Min-lot margin: `${sizing.minimum_lot_margin:.2f}` | Min-lot loss: `${sizing.minimum_lot_loss:.2f}`\n"
                     f"Free margin: `${sizing.available_margin:.2f}` | Required margin: `${sizing.required_margin:.2f}`\nNo order was submitted.",
@@ -1259,6 +1266,7 @@ class MarketScheduler:
                 setup_valid=bool(signal.validation and signal.validation.valid),
                 consecutive_losses=consecutive_losses,
                 policy=signal.experimental_policy,
+                adaptive_minimum_risk=sizing.risk_adapted_to_broker_minimum,
             )
             if not risk_result.passed:
                 logger.info(f"Signal rejected for {symbol}: {risk_result.reason}")
@@ -1287,6 +1295,7 @@ class MarketScheduler:
                 "broker_submission", symbol,
                 f"📤 **BROKER ORDER SUBMITTED — {symbol}**\nDirection: `{signal.direction}` | Required volume: `{initial_layer['lot']}`\n"
                 f"Policy-required lot: `{sizing.policy_required_lot:.8g}` | Broker-normalized lot: `{sizing.required_lot:.8g}`\n"
+                f"Base risk: `{sizing.base_risk_pct:.8g}%` | Effective risk: `{sizing.effective_risk_pct:.8g}%` | Adaptive minimum: `{'YES' if sizing.risk_adapted_to_broker_minimum else 'NO'}`\n"
                 f"Risk reserved: `${sizing.expected_loss:.2f}` | Required margin: `${sizing.required_margin:.2f}` | Free margin: `${sizing.available_margin:.2f}`\n"
                 f"SL: `{signal.stop_loss:.5f}` | TP: `{signal.take_profit:.5f}`\nAwaiting broker response.",
                 fingerprint=f"{setup_id}:submit:{initial_layer['lot']}:{signal.entry_price}", essential=True,
@@ -1352,7 +1361,7 @@ class MarketScheduler:
                     executed_price=result.entry_price,
                     execution_delay_ms=(perf_counter() - execution_started) * 1000,
                     status="filled",
-                    details={"lot_size": result.lot_size, "entry_mode": signal.entry_mode},
+                    details={"lot_size": result.lot_size, "entry_mode": signal.entry_mode, "sizing": sizing.evidence()},
                 )
                 basket_id = await db.create_trade_basket(
                     symbol=symbol,
@@ -1372,6 +1381,7 @@ class MarketScheduler:
                         "policy_version": signal.policy_version,
                         "experiment_id": signal.experiment_id,
                         "experimental_policy": signal.experimental_policy,
+                        "sizing": sizing.evidence(),
                     },
                     account_mode=self.settings.trading_mode,
                     policy_version=signal.policy_version,
