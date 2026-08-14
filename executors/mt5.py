@@ -685,6 +685,27 @@ class MT5Executor(BaseExecutor):
         frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
         return frame
 
+    @classmethod
+    def _expand_protective_levels(
+        cls, *, direction: str, sl: float, tp: float, tick_size: float, digits: int, extra_ticks: int,
+    ) -> tuple[float, float]:
+        """Move protection farther from entry after a broker rejects an exact stop distance.
+
+        This is only used with a fresh ``order_check`` and never turns an
+        invalid order into a forced submission. Both stop and target stay on
+        their required directional sides.
+        """
+        distance = max(1, int(extra_ticks)) * float(tick_size)
+        if str(direction).upper() == "SELL":
+            return (
+                cls._round_to_tick(float(sl) + distance, tick_size, digits, upward=True),
+                cls._round_to_tick(float(tp) - distance, tick_size, digits, upward=False),
+            )
+        return (
+            cls._round_to_tick(float(sl) - distance, tick_size, digits, upward=False),
+            cls._round_to_tick(float(tp) + distance, tick_size, digits, upward=True),
+        )
+
     async def execute_trade(
         self, symbol: str, direction: str, lot_size: float,
         sl: float, tp: float, magic: int, comment: str = ""
@@ -754,11 +775,41 @@ class MT5Executor(BaseExecutor):
         check = mt5.order_check(request)
         if check is None:
             return ExecutionResult(success=False, message=f"Pre-submit MT5 order_check returned None: {mt5.last_error()}", entry_price=float(price or 0.0), sl=sl, tp=tp, lot_size=float(lot_size))
+        invalid_stops_code = getattr(mt5, "TRADE_RETCODE_INVALID_STOPS", 10016)
+        if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)) and int(getattr(check, "retcode", -1)) == invalid_stops_code:
+            # Some MT5 servers reject a stop set exactly at their advertised
+            # distance. Discover an acceptable buffer by checking—not sending—
+            # bounded fresh-quote alternatives.
+            for extra_ticks in (1, 2, 4, 8, 16, 32):
+                fresh_info = mt5.symbol_info(symbol)
+                fresh_tick = mt5.symbol_info_tick(symbol)
+                if fresh_info is None or fresh_tick is None:
+                    break
+                padded_sl, padded_tp = self._expand_protective_levels(
+                    direction=direction, sl=sl, tp=tp,
+                    tick_size=float(getattr(fresh_info, "trade_tick_size", getattr(fresh_info, "point", 0.0)) or 0.0),
+                    digits=int(getattr(fresh_info, "digits", 0) or 0), extra_ticks=extra_ticks,
+                )
+                retry = self._normalise_protective_levels(
+                    direction=direction, bid=float(getattr(fresh_tick, "bid", 0.0) or 0.0), ask=float(getattr(fresh_tick, "ask", 0.0) or 0.0),
+                    sl=padded_sl, tp=padded_tp, point=float(getattr(fresh_info, "point", 0.0) or 0.0),
+                    tick_size=float(getattr(fresh_info, "trade_tick_size", getattr(fresh_info, "point", 0.0)) or 0.0),
+                    digits=int(getattr(fresh_info, "digits", 0) or 0),
+                    stops_level=float(getattr(fresh_info, "trade_stops_level", 0.0) or 0.0),
+                    freeze_level=float(getattr(fresh_info, "trade_freeze_level", 0.0) or 0.0),
+                )
+                if not retry.get("valid"):
+                    continue
+                request.update({"price": float(retry["entry_price"]), "sl": float(retry["sl"]), "tp": float(retry["tp"])})
+                check = mt5.order_check(request)
+                if self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
+                    price, sl, tp = float(request["price"]), float(request["sl"]), float(request["tp"])
+                    logger.info("MT5 order_check accepted stop buffer of %s tick(s) for %s %s", extra_ticks, symbol, direction)
+                    break
         if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
-            return ExecutionResult(success=False, message=f"Pre-submit MT5 order_check failed: retcode={check.retcode}, comment={check.comment}", entry_price=float(price or 0.0), sl=sl, tp=tp, lot_size=float(lot_size))
+            return ExecutionResult(success=False, message=(f"Pre-submit MT5 order_check failed: retcode={check.retcode}, comment={check.comment}; " f"price={float(request['price']):.10g}, sl={float(request['sl']):.10g}, tp={float(request['tp']):.10g}, " f"stops_level={getattr(info, 'trade_stops_level', 0)}, freeze_level={getattr(info, 'trade_freeze_level', 0)}"), entry_price=float(request["price"] or 0.0), sl=float(request["sl"]), tp=float(request["tp"]), lot_size=float(lot_size))
 
         result = mt5.order_send(request)
-        invalid_stops_code = getattr(mt5, "TRADE_RETCODE_INVALID_STOPS", 10016)
         if result is not None and result.retcode == invalid_stops_code:
             # A quote can move after order_check. Re-read the broker quote and
             # retry once with freshly normalized levels; never loop or force it.

@@ -74,6 +74,9 @@ def test_broker_stop_normalization() -> None:
     assert_true(MT5Executor._order_check_succeeded(SimpleNamespace(retcode=0, comment="Done"), 10009), "MT5 order_check retcode 0/comment Done was not treated as successful preflight")
     assert_true(MT5Executor._order_check_succeeded(SimpleNamespace(retcode=10009, comment=""), 10009), "standard MT5 DONE order-check response was not accepted")
     assert_true(not MT5Executor._order_check_succeeded(SimpleNamespace(retcode=0, comment="Invalid stops"), 10009), "non-success zero order-check response was incorrectly accepted")
+    buffered_buy = MT5Executor._expand_protective_levels(direction="BUY", sl=100.00, tp=100.20, tick_size=0.01, digits=2, extra_ticks=4)
+    buffered_sell = MT5Executor._expand_protective_levels(direction="SELL", sl=100.20, tp=99.80, tick_size=0.01, digits=2, extra_ticks=4)
+    assert_true(buffered_buy[0] <= 99.96 and buffered_buy[1] >= 100.24 and buffered_sell[0] >= 100.24 and buffered_sell[1] <= 99.76, "broker order-check stop buffer did not expand protection away from entry")
 
 
 def test_runtime_telemetry() -> None:
