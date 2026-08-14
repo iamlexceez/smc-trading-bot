@@ -98,9 +98,8 @@ def calculate_rr(direction: str, entry_price: float, stop_loss: float, take_prof
 
 
 def rr_filter_passes(actual_rr: float, configured_min_rr: float) -> bool:
-    """Apply the sole configurable RR filter; zero disables rejection by RR."""
-    minimum = max(0.0, float(configured_min_rr))
-    return minimum <= 0.0 or float(actual_rr) >= minimum
+    """RR remains observable evidence and never rejects a valid setup."""
+    return True
 
 
 def _event_matches_direction(event_type: StructureEventType, direction: str) -> bool:
@@ -354,14 +353,10 @@ class SetupValidator:
         # 2) Actual RR calculation: always calculated from the TP and SL chosen above.
         _, _, result.rr_ratio = calculate_rr(requested_direction, entry, stop_loss, take_profit) if target_valid else (0.0, 0.0, 0.0)
 
-        # 3) RR filtering: only the explicitly configured ``min_rr`` controls
-        # rejection. Zero disables filtering without altering TP or actual RR.
-        configured_min_rr = max(0.0, float(self.min_rr))
-        rr_filter_enabled = configured_min_rr > 0.0
-        rr_valid = target_valid and rr_filter_passes(result.rr_ratio, configured_min_rr)
-        filter_text = f"minimum {configured_min_rr:.8f}" if rr_filter_enabled else "filter disabled (configured minimum 0)"
-        result.checks.append(ValidationCheck("Minimum RR", rr_valid, f"Actual RR {result.rr_ratio:.8f}; {filter_text}; {result.target_reason or 'No target source'}"))
-        result.valid = stop_valid and target_valid and rr_valid
+        # 3) RR observation: calculate and retain the actual value without
+        # imposing an execution threshold or manufacturing a TP to satisfy one.
+        result.checks.append(ValidationCheck("Actual RR", target_valid, f"Actual RR {result.rr_ratio:.8f}; recorded without a minimum-RR execution filter; {result.target_reason or 'No target source'}"))
+        result.valid = stop_valid and target_valid
         return result
 
     def validate(
@@ -505,9 +500,9 @@ class SetupValidator:
             result.rr_ratio = reward / risk if risk > 0 else 0.0
             result.checks.append(
                 ValidationCheck(
-                    "Minimum RR",
-                    rr_filter_passes(result.rr_ratio, self.min_rr),
-                    f"RR 1:{result.rr_ratio:.2f}; minimum 1:{self.min_rr:.2f}",
+                    "Actual RR",
+                    True,
+                    f"RR 1:{result.rr_ratio:.2f}; recorded without a minimum-RR execution filter",
                 )
             )
         else:
@@ -515,7 +510,7 @@ class SetupValidator:
                 [
                     ValidationCheck("Structural stop", False, "Cannot derive stop without zone and sweep"),
                     ValidationCheck("Market-derived target", False, "Cannot derive target without valid setup"),
-                    ValidationCheck("Minimum RR", False, "RR unavailable"),
+                    ValidationCheck("Actual RR", False, "RR unavailable because no structurally valid target exists"),
                 ]
             )
 

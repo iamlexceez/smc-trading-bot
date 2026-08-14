@@ -96,13 +96,12 @@ def test_runtime_telemetry() -> None:
 def test_full_precision_rr_validation() -> None:
     risk, reward, rr = calculate_rr("SELL", 4350.274, 4402.92955, 4343.897)
     assert_true(abs(risk - 52.65555) < 1e-6 and abs(reward - 6.377) < 1e-6, "SELL RR distances were calculated incorrectly")
-    assert_true(abs(rr - 0.121107841433619) < 1e-9 and rr < 3.0, "exact low-RR SELL fixture was not rejected by full precision")
-    assert_true(not rr_filter_passes(rr, 3.0), "configured 3R filter did not reject the exact low-RR SELL fixture")
-    assert_true(rr_filter_passes(rr, 0.0), "zero configured RR did not disable RR rejection")
-    assert_true(rr_filter_passes(rr, -1.0), "negative RR configuration was not treated as disabled")
+    assert_true(abs(rr - 0.121107841433619) < 1e-9 and rr < 3.0, "exact low-RR SELL fixture was not calculated at full precision")
+    assert_true(rr_filter_passes(rr, 3.0), "a historical 3R value was still allowed to reject the exact low-RR SELL fixture")
+    assert_true(rr_filter_passes(rr, 0.0) and rr_filter_passes(rr, -1.0), "actual RR observation was incorrectly treated as a rejection filter")
     buy_risk, buy_reward, buy_rr = calculate_rr("BUY", 100.0, 98.0, 106.0)
     assert_true(buy_risk == 2.0 and buy_reward == 6.0 and buy_rr == 3.0, "BUY RR formula is incorrect")
-    assert_true(rr_filter_passes(buy_rr, 3.0) and not rr_filter_passes(buy_rr, 3.1), "positive configured RR filtering is incorrect")
+    assert_true(rr_filter_passes(buy_rr, 3.0) and rr_filter_passes(buy_rr, 3.1), "historical configured RR values still imposed an execution filter")
 
 
 async def test_single_flight_scan_guard() -> None:

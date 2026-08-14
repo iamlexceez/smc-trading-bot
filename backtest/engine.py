@@ -289,9 +289,8 @@ class BacktestEngine:
                     htf_structures.append(analyze_structure(htf_slice, lookback=3))
 
             entry_mode = EntryMode.CONFIRMED if self.policy.entry_model == "confirmation" else EntryMode.AGGRESSIVE
-            required_rr = max(0.0, float(self.settings.min_rr_ratio))
             validator = SetupValidator(
-                min_rr=required_rr,
+                min_rr=0.0,
                 min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
                 displacement_body_ratio=self.settings.displacement_body_ratio_min,
                 displacement_range_ratio=self.settings.displacement_range_ratio_min,

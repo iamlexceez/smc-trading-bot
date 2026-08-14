@@ -178,8 +178,8 @@ class MarketScheduler:
         return selected
 
     def _objective_min_rr(self) -> float:
-        value = self._operational_objective.get("minimum_rr") if self._operational_objective else None
-        return max(0.0, float(self.settings.min_rr_ratio if value is None else value))
+        """Compatibility accessor: RR is observational and has no execution floor."""
+        return 0.0
 
     async def refresh_research_governance(self, broker_usable_symbols: list[str] | tuple[str, ...]) -> dict:
         """Select the bounded execution cohort from fresh broker facts and DEMO evidence.
@@ -1225,24 +1225,8 @@ class MarketScheduler:
                     fingerprint=f"{signal.setup_id}:research-cohort", essential=True,
                 )
                 return False
-            # Defensive assertion: an RR-invalid signal must never reach final
-            # revalidation, broker sizing, margin validation, or execution.
-            signal_rr_floor = max(0.0, float(self.settings.min_rr_ratio))
-            if signal_rr_floor > 0.0 and float(signal.rr_ratio) < signal_rr_floor:
-                signal.passed = False
-                signal.rejection_reason = "RR_VALIDATION_ERROR"
-                self.telemetry.increment("setups_rr_checked")
-                self.telemetry.increment("setups_rr_rejected")
-                self.telemetry.increment("setups_rejected")
-                self.telemetry.record_rejection(signal.rejection_reason)
-                if signal.setup_id is not None:
-                    await db.update_setup_record(signal.setup_id, status="rejected", rejection_reason=signal.rejection_reason)
-                await self._chart_activity(
-                    "execution_rejected", symbol,
-                    f"⛔ **SETUP REJECTED — {symbol}**\nTP source: `{signal.target_source or 'recorded signal'}` | TP price: `{signal.take_profit:.5f}`\nRisk distance: `{abs(signal.entry_price - signal.stop_loss):.5f}` | Reward distance: `{abs(signal.take_profit - signal.entry_price):.5f}`\nActual RR: `1:{signal.rr_ratio:.8f}` | Configured minimum RR: `1:{signal_rr_floor:.8f}`\nFinal decision: `{signal.rejection_reason}`\nNo sizing performed. No order submitted.",
-                    fingerprint=f"{signal.setup_id}:rr-assert:{signal.rr_ratio:.8f}", essential=True,
-                )
-                return False
+            # Actual RR remains recorded for research, alerts, and active
+            # management context. It is not an execution eligibility filter.
             # Final revalidation immediately before any market order. A signal
             # approval or prior scan never freezes market structure or pricing.
             setup_id = signal.setup_id
@@ -1322,19 +1306,6 @@ class MarketScheduler:
                         f"📐 **BROKER STOPS NORMALIZED — {symbol}**\nEntry side price: `{signal.entry_price:.8g}` | SL: `{signal.stop_loss:.8g}` | TP: `{signal.take_profit:.8g}`\nMinimum broker distance: `{float(stop_preflight.get('minimum_distance') or 0.0):.8g}` | Actual RR after normalization: `1:{signal.rr_ratio:.4f}`",
                         fingerprint=f"{setup_id}:broker-stop-normalized:{signal.stop_loss}:{signal.take_profit}", essential=True,
                     )
-                signal_rr_floor = self._objective_min_rr()
-                if signal_rr_floor > 0 and signal.rr_ratio < signal_rr_floor:
-                    signal.passed = False
-                    signal.rejection_reason = "RR fell below the configured minimum after broker stop normalization"
-                    self.telemetry.record_rejection(signal.rejection_reason)
-                    if setup_id is not None:
-                        await db.update_setup_record(setup_id, status="broker_stop_rejected", rejection_reason=signal.rejection_reason)
-                    await self._chart_activity(
-                        "execution_rejected", symbol,
-                        f"⛔ **BROKER STOP / RR BLOCK — {symbol}**\nActual RR after broker-normalized stops: `1:{signal.rr_ratio:.4f}` | Required minimum: `1:{signal_rr_floor:.4f}`\nNo order was submitted.",
-                        fingerprint=f"{setup_id}:broker-stop-rr:{signal.rr_ratio:.8f}", essential=True,
-                    )
-                    return False
             pip = sym_info.get("pip_size", pip_value(symbol))
             spread = sym_info.get("spread", 0) * pip
 

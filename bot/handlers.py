@@ -1743,21 +1743,12 @@ class BotHandlers:
 
     @admin_only
     async def cmd_rr(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Set minimum RR ratio."""
-        if context.args:
-            try:
-                val = float(context.args[0])
-                if val < 0 or val == float("inf") or val != val:
-                    raise ValueError
-                self.settings.min_rr_ratio = val
-                await db.save_settings(self.settings)
-                state = "RR filtering disabled" if val == 0 else f"Min RR set to 1:{val:g}"
-                await update.message.reply_text(f"✅ {state}")
-            except ValueError:
-                await update.message.reply_text("Usage: /rr 0  (disable filtering)  or  /rr 3.0")
-        else:
-            state = "DISABLED (actual RR is still calculated and reported)" if self.settings.min_rr_ratio == 0 else f"1:{self.settings.min_rr_ratio:g}"
-            await update.message.reply_text(f"Current min RR: {state}\nUsage: /rr 0  or  /rr 3.0")
+        """Report the actual-RR policy without exposing an execution threshold."""
+        self.settings.min_rr_ratio = 0.0
+        await db.save_settings(self.settings)
+        await update.message.reply_text(
+            "✅ **RR OBSERVATION MODE**\n\nActual RR is calculated and reported for every setup, including after broker stop normalization. It is not a required minimum and cannot reject an otherwise valid DEMO trade. Structural SL/TP selection and active management remain in control."
+        )
 
     @admin_only
     async def cmd_score(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
