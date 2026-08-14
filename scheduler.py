@@ -1807,6 +1807,7 @@ class MarketScheduler:
                 int(trade["id"]),
                 pnl,
                 exit_price=float(outcome.get("exit_price") or 0.0),
+                exit_reason=str(outcome.get("exit_reason") or outcome.get("reason") or "broker_confirmed_exit"),
                 pnl_r=pnl_r,
                 max_favorable_r=float(trade.get("max_favorable_r") or 0.0),
                 max_adverse_r=float(trade.get("max_adverse_r") or 0.0),

@@ -203,7 +203,7 @@ class BotHandlers:
             "`/capital_activity` — isolated intentional-reduction activity\n"
             "`/demo_session [id]` — reset-separated DEMO session report\n"
             "`/demo_auto_resume on|off` — optional verified-reset auto-resume\n"
-            "`/backtest <symbol> <tf> <days>` — causal policy backtest\n"
+            "`/backtest <symbol> <tf> <days>` — causal policy backtest with TP/SL replay evidence\n"
             "`/activity [detailed|essential|off]` — chart-study notification mode\n"
             "`/settings` — autonomy, alerts, and explicit DEMO/LIVE controls\n"
             "`/emergency` — pause new execution and optionally close positions\n\n"
@@ -1670,6 +1670,17 @@ class BotHandlers:
             from backtest.runner import run_backtest
             result = await run_backtest(symbol, timeframe, days, self.settings, executor=self.executor)
             await update.message.reply_text(result.summary())
+            from analysis.adaptive_management import observations_from_backtest, summarize_management
+            management = summarize_management(observations_from_backtest(result))
+            pf = management.get("profit_factor")
+            pf_text = "N/A" if pf == float("inf") else f"{float(pf):.2f}"
+            await update.message.reply_text(
+                "🧠 **ADAPTIVE TP/SL REPLAY EVIDENCE**\n"
+                f"Observations: `{management['sample_size']}` | expectancy: `{management['expectancy_r']:.2f}R` | PF: `{pf_text}`\n"
+                f"MAE: `{management['average_mae_r']:.2f}R` | MFE: `{management['average_mfe_r']:.2f}R`\n"
+                f"SL changes: `{management['sl_modifications']}` | TP changes: `{management['tp_modifications']}` | partial exits: `{management['partial_exits']}`\n"
+                "This is causal backtest evidence only. It does not independently change the active execution policy."
+            )
         except Exception as e:
             logger.error(f"Backtest error: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Backtest failed: {e}")

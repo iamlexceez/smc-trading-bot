@@ -53,6 +53,7 @@ class BacktestTrade:
     stop_loss: float = 0.0
     initial_stop: float = 0.0
     take_profit: float = 0.0
+    initial_target: float = 0.0
     management_state: str = ManagementState.INITIAL.value
     lot_size: float = 0.01
     score: float = 0.0
@@ -64,6 +65,13 @@ class BacktestTrade:
     partial_closed: bool = False
     partial_percent: float = 0.0
     partial_realized_pnl: float = 0.0
+    max_favorable_r: float = 0.0
+    max_adverse_r: float = 0.0
+    sl_modifications: int = 0
+    tp_modifications: int = 0
+    breakeven_activated: bool = False
+    trailing_activated: bool = False
+    management_events: list[dict] = field(default_factory=list)
     factors: list = field(default_factory=list)
     experimental_policy: dict = field(default_factory=dict)
 
@@ -332,6 +340,7 @@ class BacktestEngine:
                 stop_loss=sl,
                 initial_stop=sl,
                 take_profit=tp,
+                initial_target=tp,
                 lot_size=lot_size,
                 score=quality.score,
                 rr_ratio=validation.rr_ratio,
@@ -346,7 +355,10 @@ class BacktestEngine:
         # Close any remaining open trade
         if self.open_trade and not self.open_trade.exit_time:
             last_bar = df.iloc[-1]
-            self._close_trade(self.open_trade, last_bar["close"], "end_of_data", pip)
+            self._close_trade(
+                self.open_trade, last_bar["close"], "end_of_data", pip,
+                exit_time=last_bar.get("time", df.index[-1]),
+            )
 
         return self._compute_results(df, symbol, timeframe)
 
@@ -368,20 +380,31 @@ class BacktestEngine:
             return
         bar = df.iloc[bar_idx]
         trade.bars_held += 1
+        bar_time = bar.get("time", df.index[bar_idx])
+        initial_risk = abs(trade.entry_price - trade.initial_stop)
+        if initial_risk > 0:
+            if trade.direction == "BUY":
+                favorable_r = (float(bar["high"]) - trade.entry_price) / initial_risk
+                adverse_r = (float(bar["low"]) - trade.entry_price) / initial_risk
+            else:
+                favorable_r = (trade.entry_price - float(bar["low"])) / initial_risk
+                adverse_r = (trade.entry_price - float(bar["high"])) / initial_risk
+            trade.max_favorable_r = max(trade.max_favorable_r, favorable_r)
+            trade.max_adverse_r = min(trade.max_adverse_r, adverse_r)
 
         # Conservative OHLC convention: when both thresholds may occur within a
         # bar, the protective stop is evaluated before the target.
         if trade.direction == "BUY" and bar["low"] <= trade.stop_loss:
-            self._close_trade(trade, trade.stop_loss, "stop_loss", pip)
+            self._close_trade(trade, trade.stop_loss, "stop_loss", pip, exit_time=bar_time)
             return
         if trade.direction == "SELL" and bar["high"] >= trade.stop_loss:
-            self._close_trade(trade, trade.stop_loss, "stop_loss", pip)
+            self._close_trade(trade, trade.stop_loss, "stop_loss", pip, exit_time=bar_time)
             return
         if trade.direction == "BUY" and bar["high"] >= trade.take_profit:
-            self._close_trade(trade, trade.take_profit, "take_profit", pip)
+            self._close_trade(trade, trade.take_profit, "take_profit", pip, exit_time=bar_time)
             return
         if trade.direction == "SELL" and bar["low"] <= trade.take_profit:
-            self._close_trade(trade, trade.take_profit, "take_profit", pip)
+            self._close_trade(trade, trade.take_profit, "take_profit", pip, exit_time=bar_time)
             return
 
         history = df.iloc[: bar_idx + 1]
@@ -415,9 +438,15 @@ class BacktestEngine:
         if action.action == "move_sl" and action.new_sl is not None:
             trade.stop_loss = action.new_sl
             trade.management_state = action.state.value
+            trade.sl_modifications += 1
+            trade.breakeven_activated = trade.breakeven_activated or action.state == ManagementState.BE_ELIGIBLE
+            trade.trailing_activated = trade.trailing_activated or action.state == ManagementState.RUNNER
+            trade.management_events.append({"action": "move_sl", "state": action.state.value, "reason": action.reason, "time": str(bar_time)})
         elif action.action == "move_tp" and action.new_tp is not None:
             trade.take_profit = action.new_tp
             trade.management_state = action.state.value
+            trade.tp_modifications += 1
+            trade.management_events.append({"action": "move_tp", "state": action.state.value, "reason": action.reason, "time": str(bar_time)})
         elif action.action == "close_partial" and action.close_percent and not trade.partial_closed:
             trade.partial_closed = True
             trade.partial_percent = action.close_percent
@@ -425,8 +454,9 @@ class BacktestEngine:
             self.balance += trade.partial_realized_pnl
             self.daily_pnl += trade.partial_realized_pnl
             trade.management_state = action.state.value
+            trade.management_events.append({"action": "close_partial", "state": action.state.value, "reason": action.reason, "time": str(bar_time)})
         elif action.action == "close_full":
-            self._close_trade(trade, float(bar["close"]), "thesis_exit", pip)
+            self._close_trade(trade, float(bar["close"]), "thesis_exit", pip, exit_time=bar_time)
 
     def _calculate_pnl(self, trade: BacktestTrade, exit_price: float, pip: float, percent: float = 1.0) -> float:
         """Calculate P&L for a trade (or partial)."""
@@ -438,9 +468,10 @@ class BacktestEngine:
         commission = self.commission_pips * pip * trade.lot_size * 100000 * percent
         return pnl - commission
 
-    def _close_trade(self, trade: BacktestTrade, exit_price: float, reason: str, pip: float):
+    def _close_trade(self, trade: BacktestTrade, exit_price: float, reason: str, pip: float, *, exit_time=None):
         """Close a trade and record it."""
         trade.exit_price = exit_price
+        trade.exit_time = exit_time
         trade.exit_reason = reason
         # Calculate P&L using the original partial amount and remaining live volume.
         remaining_percent = 1.0 - trade.partial_percent if trade.partial_closed else 1.0

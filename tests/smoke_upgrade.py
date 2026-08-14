@@ -29,6 +29,8 @@ from data.universe import DerivMarketUniverse
 from data.provider import DataProvider
 from analysis.optimizer import SelfOptimizer
 from analysis.research_governance import ResearchGovernance
+from analysis.adaptive_management import observation_from_broker_trade, observations_from_backtest, summarize_management
+from backtest.engine import BacktestResult, BacktestTrade
 from analysis.policies import ExperimentalPolicy, HypothesisEngine, PolicyEvaluator, PolicyGenerator
 from analysis.account_monitor import summarize_history, exposure_summary
 from execution.capital_reduction import CapitalReductionEngine
@@ -626,6 +628,49 @@ async def test_sizing_rejection_diagnostic_persistence() -> None:
         assert_true(latest["details"]["sizing_inputs"]["risk_pct"] == 1.0, "latest sizing rejection lost sizing inputs")
 
 
+async def test_adaptive_management_learning_evidence() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "management_learning.db")
+        await db.init_db(path)
+        setup_id = await db.record_setup(
+            account_mode="demo", symbol="Volatility 75 Index", timeframe="M5", direction="BUY",
+            setup_type="Liquidity Sweep Reversal", status="executed", entry_price=100.0,
+            stop_loss=98.0, take_profit=106.0, rr_ratio=3.0, db_path=path,
+        )
+        trade_id = await db.record_trade(
+            "Volatility 75 Index", "BUY", 100.0, 98.0, 106.0, 0.1, 80.0, 3.0, "mt5", "{}",
+            account_mode="demo", ticket=8123, setup_id=setup_id, initial_risk=10.0,
+            policy_version="model_v001", db_path=path,
+        )
+        await db.log_trade_action(8123, "SL Protected", "Policy breakeven at 1.00R", trade_id=trade_id, db_path=path)
+        await db.log_trade_action(8123, "TP Extended", "Policy structural trail", trade_id=trade_id, db_path=path)
+        await db.log_trade_action(8123, "Partial Take Profit", "policy partial exit", trade_id=trade_id, db_path=path)
+        await db.close_trade(
+            trade_id, 15.0, path, exit_price=103.0, exit_reason="take_profit",
+            pnl_r=1.5, max_favorable_r=2.2, max_adverse_r=-0.4,
+        )
+        rows = await db.get_management_learning_observations(account_mode="demo", db_path=path)
+        assert_true(len(rows) == 1 and rows[0]["exit_reason"] == "take_profit", "adaptive-management query lost broker-confirmed exit reason")
+        observation = observation_from_broker_trade(rows[0], rows[0]["management_actions"])
+        assert_true(observation.mae_r == -0.4 and observation.mfe_r == 2.2 and observation.final_r == 1.5, "adaptive-management observation lost MAE/MFE/final-R evidence")
+        assert_true(observation.sl_modifications == 1 and observation.tp_modifications == 1 and observation.partial_exit_used, "TP/SL management-action evidence was not retained")
+        summary = await db.get_management_learning_summary(account_mode="demo", db_path=path)
+        assert_true(summary["sample_size"] == 1 and summary["average_mae_r"] == -0.4 and summary["average_mfe_r"] == 2.2, "adaptive-management summary did not use persisted closed outcomes")
+        assert_true(summary["basis"] == "broker_confirmed_or_causal_replay_observations", "adaptive-management summary basis is not transparent")
+
+    replay_trade = BacktestTrade(
+        entry_time=pd.Timestamp("2026-01-01T00:00:00Z"), exit_time=pd.Timestamp("2026-01-01T00:15:00Z"),
+        symbol="Volatility 75 Index", direction="BUY", entry_price=100.0, initial_stop=98.0,
+        initial_target=106.0, rr_ratio=3.0, rr_result=1.25, max_favorable_r=2.0, max_adverse_r=-0.5,
+        sl_modifications=2, tp_modifications=1, breakeven_activated=True, trailing_activated=True,
+        partial_closed=True, exit_reason="take_profit", management_events=[{"action": "move_sl"}],
+    )
+    replay_result = BacktestResult(symbol="Volatility 75 Index", timeframe="M5", trades=[replay_trade])
+    replay_observations = observations_from_backtest(replay_result)
+    assert_true(len(replay_observations) == 1 and replay_observations[0].duration_seconds == 900, "causal replay duration was not converted into an adaptive-management observation")
+    assert_true(replay_observations[0].mae_r == -0.5 and replay_observations[0].mfe_r == 2.0 and replay_observations[0].sl_modifications == 2, "causal replay TP/SL telemetry was lost")
+
+
 def test_research_governance_rankings() -> None:
     settings = TradeSettings.defaults()
     settings.research_market_limit = 10
@@ -707,6 +752,7 @@ def run() -> None:
     asyncio.run(test_capital_reduction_isolation())
     asyncio.run(test_broker_authoritative_capital_state())
     asyncio.run(test_sizing_rejection_diagnostic_persistence())
+    asyncio.run(test_adaptive_management_learning_evidence())
     test_research_governance_rankings()
     asyncio.run(test_same_day_governance_deferral())
     asyncio.run(test_demo_live_partitioning())

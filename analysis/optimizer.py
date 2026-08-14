@@ -388,6 +388,9 @@ class SelfOptimizer:
         ranking_outcomes = await db.get_policy_trade_outcomes(
             account_mode=account_mode, days=self.settings.market_ranking_lookback_days
         )
+        management = await db.get_management_learning_summary(
+            account_mode=account_mode, days=self.settings.market_ranking_lookback_days
+        )
         model_versions = await db.list_model_versions(account_mode, limit=50)
         governance = ResearchGovernance(self.settings).governance_snapshot(
             broker_usable_symbols, ranking_outcomes, model_versions
@@ -424,6 +427,8 @@ class SelfOptimizer:
             f"#{row['rank']} {row['version']} ({row['evidence_stage']}, n={row['sample_size']}, E={row['expectancy_r']:.2f}R)"
             for row in strategy_rows
         ) or "No versioned policies yet"
+        management_pf = management.get("profit_factor")
+        management_pf_text = "N/A" if not math.isfinite(float(management_pf or 0.0)) else f"{float(management_pf):.2f}"
         capital_state = await db.get_account_state("demo") if account_mode == "demo" else None
         if capital_state:
             capital_text = (
@@ -452,6 +457,11 @@ class SelfOptimizer:
             "**Market Selection**",
             f"Execution cohort ({market_state}; max {market_selection['selection_limit']}): `{selected_markets}`.",
             f"Disabled for new strategy scans: `{len(market_selection['disabled_symbols'])}` broker-valid market(s). {market_selection['selection_explanation']}",
+            "",
+            "**Adaptive TP/SL Evidence**",
+            f"Completed broker-confirmed/replay observations: `{management['sample_size']}` | expectancy `{management['expectancy_r']:.2f}R` | profit factor `{management_pf_text}`.",
+            f"MAE `{management['average_mae_r']:.2f}R` | MFE `{management['average_mfe_r']:.2f}R` | SL changes `{management['sl_modifications']}` | TP changes `{management['tp_modifications']}` | partial exits `{management['partial_exits']}`.",
+            "These statistics inform future causal management research; they do not independently change a live TP/SL policy.",
             "",
             "**No-Revenge Governance**",
             "Losses are recorded as evidence but cannot trigger immediate risk escalation, extra trades, extra layers, or an intraday policy replacement. Policy governance runs no more than once per UTC day.",

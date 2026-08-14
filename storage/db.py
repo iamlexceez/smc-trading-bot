@@ -352,6 +352,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await _ensure_column(db, "trades", "setup_id", "INTEGER")
         await _ensure_column(db, "trades", "initial_risk", "REAL DEFAULT 0")
         await _ensure_column(db, "trades", "exit_price", "REAL")
+        await _ensure_column(db, "trades", "exit_reason", "TEXT")
         await _ensure_column(db, "trades", "closed_at", "TEXT")
         await _ensure_column(db, "trades", "pnl_r", "REAL")
         await _ensure_column(db, "trades", "max_favorable_r", "REAL DEFAULT 0")
@@ -430,6 +431,7 @@ async def close_trade(
     db_path: str = DB_PATH,
     *,
     exit_price: Optional[float] = None,
+    exit_reason: Optional[str] = None,
     pnl_r: Optional[float] = None,
     max_favorable_r: Optional[float] = None,
     max_adverse_r: Optional[float] = None,
@@ -439,6 +441,7 @@ async def close_trade(
     values: list = [pnl, datetime.utcnow().isoformat()]
     for column, value in (
         ("exit_price", exit_price),
+        ("exit_reason", exit_reason),
         ("pnl_r", pnl_r),
         ("max_favorable_r", max_favorable_r),
         ("max_adverse_r", max_adverse_r),
@@ -1129,6 +1132,55 @@ async def get_policy_trade_outcomes(
         row["features"] = json.loads(row.pop("features_json") or "{}")
         row["validation"] = json.loads(row.pop("validation_json") or "{}")
     return rows
+
+
+async def get_management_learning_observations(
+    *, account_mode: str = "demo", days: int = 365, symbol: Optional[str] = None, db_path: str = DB_PATH,
+) -> list[dict]:
+    """Return completed broker-confirmed management observations.
+
+    Capital-reduction tickets are excluded. This is read-only evidence for the
+    adaptive TP/SL journal; it never produces an execution instruction.
+    """
+    since = (datetime.utcnow() - timedelta(days=max(1, int(days)))).isoformat()
+    clauses = [
+        "t.account_mode = ?", "t.status = 'closed'", "t.pnl_r IS NOT NULL", "t.timestamp >= ?",
+        "(t.ticket IS NULL OR t.ticket NOT IN (SELECT ticket FROM capital_reduction_actions WHERE ticket IS NOT NULL AND action = 'order_filled'))",
+    ]
+    values: list[Any] = [account_mode, since]
+    if symbol:
+        clauses.append("t.symbol = ?")
+        values.append(str(symbol))
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            f"""SELECT t.*, s.setup_type, s.timeframe
+                FROM trades t LEFT JOIN setup_records s ON s.id = t.setup_id
+                WHERE {' AND '.join(clauses)} ORDER BY t.timestamp ASC, t.id ASC""",
+            values,
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    for row in rows:
+        row["management_actions"] = await get_trade_logs(
+            ticket=int(row["ticket"]) if row.get("ticket") is not None else None,
+            trade_id=int(row["id"]), db_path=db_path,
+        )
+    return rows
+
+
+async def get_management_learning_summary(
+    *, account_mode: str = "demo", days: int = 365, symbol: Optional[str] = None, db_path: str = DB_PATH,
+) -> dict:
+    """Summarize adaptive TP/SL evidence from only persisted closed outcomes."""
+    from analysis.adaptive_management import observation_from_broker_trade, summarize_management
+
+    rows = await get_management_learning_observations(
+        account_mode=account_mode, days=days, symbol=symbol, db_path=db_path
+    )
+    observations = [
+        observation_from_broker_trade(row, row.get("management_actions") or []) for row in rows
+    ]
+    return summarize_management(observations)
 
 
 async def get_performance_summary(account_mode: str, days: Optional[int] = None, db_path: str = DB_PATH) -> dict:
