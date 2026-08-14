@@ -40,6 +40,8 @@ class SupplyDemandZone:
     fresh: bool = True
     touches: int = 0
     strength: float = 0.0  # 0-100
+    available_index: int | None = None
+    available_at: str | None = None
 
     @property
     def midpoint(self) -> float:
@@ -122,6 +124,8 @@ def detect_sd_zones(df: pd.DataFrame, lookback: int = 50, min_base_bars: int = 1
                             zone_type=ZoneType.DEMAND,
                             pattern=pattern,
                             base_index=base_start,
+                            available_index=j,
+                            available_at=(str(df.iloc[j]["time"]) if "time" in df.columns else None),
                         )
                     else:
                         # Supply zone
@@ -137,6 +141,8 @@ def detect_sd_zones(df: pd.DataFrame, lookback: int = 50, min_base_bars: int = 1
                             zone_type=ZoneType.SUPPLY,
                             pattern=pattern,
                             base_index=base_start,
+                            available_index=j,
+                            available_at=(str(df.iloc[j]["time"]) if "time" in df.columns else None),
                         )
 
                     # Check freshness: has price returned to the zone since the impulse departed?

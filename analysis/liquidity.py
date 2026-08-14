@@ -110,8 +110,8 @@ def build_liquidity_pools(
                 side=LiquiditySide.BUY_SIDE,
                 kind=LiquidityKind.SWING,
                 timeframe=timeframe,
-                created_index=int(swing.index),
-                created_at=swing.timestamp,
+                created_index=int(swing.available_index if swing.available_index is not None else swing.index),
+                created_at=swing.available_at or swing.timestamp,
                 strength=60.0,
             )
         )
@@ -123,8 +123,8 @@ def build_liquidity_pools(
                 side=LiquiditySide.SELL_SIDE,
                 kind=LiquidityKind.SWING,
                 timeframe=timeframe,
-                created_index=int(swing.index),
-                created_at=swing.timestamp,
+                created_index=int(swing.available_index if swing.available_index is not None else swing.index),
+                created_at=swing.available_at or swing.timestamp,
                 strength=60.0,
             )
         )
@@ -137,8 +137,8 @@ def build_liquidity_pools(
                     side=LiquiditySide.BUY_SIDE,
                     kind=LiquidityKind.EQUAL_HIGH,
                     timeframe=timeframe,
-                    created_index=int(current.index),
-                    created_at=current.timestamp,
+                    created_index=int(current.available_index if current.available_index is not None else current.index),
+                    created_at=current.available_at or current.timestamp,
                     strength=90.0,
                 )
             )
@@ -151,8 +151,8 @@ def build_liquidity_pools(
                     side=LiquiditySide.SELL_SIDE,
                     kind=LiquidityKind.EQUAL_LOW,
                     timeframe=timeframe,
-                    created_index=int(current.index),
-                    created_at=current.timestamp,
+                    created_index=int(current.available_index if current.available_index is not None else current.index),
+                    created_at=current.available_at or current.timestamp,
                     strength=90.0,
                 )
             )

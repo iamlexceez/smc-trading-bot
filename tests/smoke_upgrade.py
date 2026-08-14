@@ -23,6 +23,10 @@ if PROJECT_ROOT not in sys.path:
 from config import TradeSettings
 from analysis.displacement import detect_displacement
 from analysis.indicators import causal_swing_highs
+from analysis.structure import analyze_structure
+from analysis.supply_demand import detect_sd_zones
+from analysis.confirmation import detect_inside_bar_breakout
+from analysis.evidence import completed_outcome_statistics
 from analysis.liquidity import build_liquidity_pools
 from execution.manager import ManagementState, TradeManager
 from executors.base import Position
@@ -1427,6 +1431,63 @@ async def test_demo_live_partitioning() -> None:
     assert_true(migrated.auto_trade, "legacy installation was not migrated to autonomous demo learning")
 
 
+def test_explicit_feature_availability() -> None:
+    times = pd.date_range("2026-01-01", periods=7, freq="min")
+    highs = [1.0, 2.0, 3.0, 10.0, 4.0, 3.0, 2.0]
+    lows = [0.0] * len(highs)
+    closes = [1.0, 2.0, 3.0, 9.0, 4.0, 3.0, 2.0]
+    frame = pd.DataFrame({"time": times, "open": closes, "high": highs, "low": lows, "close": closes})
+    structure = analyze_structure(frame, lookback=3)
+    assert_true(structure.swing_highs and structure.swing_highs[0].available_index == 6, "swing confirmation availability was not recorded at the final required right-side candle")
+    pools = build_liquidity_pools(frame, structure.swing_highs, structure.swing_lows, "M1")
+    assert_true(pools and pools[0].created_index >= structure.swing_highs[0].available_index, "liquidity pool became available before its confirmed swing")
+    inside = pd.DataFrame({
+        "time": pd.date_range("2026-01-02", periods=3, freq="min"),
+        "open": [100.0, 101.0, 102.0], "high": [110.0, 108.0, 112.0],
+        "low": [90.0, 92.0, 101.0], "close": [102.0, 103.0, 111.0],
+    })
+    confirmation = detect_inside_bar_breakout(inside, "BUY")
+    assert_true(confirmation.confirmed and confirmation.available_index == 2, "inside-bar breakout did not record its closed breakout candle as availability time")
+
+
+def test_completed_outcome_distribution_statistics() -> None:
+    stats = completed_outcome_statistics([
+        {"pnl_r": -1.0, "mae_r": -1.1, "mfe_r": 0.2, "target_r": 2.0},
+        {"pnl_r": 0.5, "mae_r": -0.4, "mfe_r": 2.2, "target_r": 2.0},
+        {"pnl_r": 1.5, "mae_r": -0.2, "mfe_r": 3.1, "target_r": 2.0},
+    ])
+    assert_true(stats["sample_size"] == 3 and stats["pnl_stddev_r"] is not None, "outcome distribution did not retain sample dispersion")
+    assert_true(stats["expectancy_ci95_low_r"] is not None and stats["expectancy_ci95_high_r"] is not None, "outcome uncertainty interval was not produced for a multi-trade sample")
+    assert_true(abs(stats["target_reach_probability"] - (2 / 3)) < 1e-9, "target reach probability was not derived from completed MFE observations")
+    assert_true(stats["mae_p90_r"] <= 0 and stats["mfe_p90_r"] >= stats["mfe_p50_r"], "MAE/MFE distribution quantiles are inconsistent")
+
+
+async def test_strategy_transition_evidence_persistence() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "transition_evidence.db")
+        await db.init_db(path)
+        setup_id = await db.record_setup(
+            account_mode="demo", symbol="Boom 500 Index", timeframe="M5", direction="SELL",
+            setup_type="liquidity_sweep_reversal", status="executed", entry_price=100.0,
+            stop_loss=101.0, take_profit=97.0, rr_ratio=3.0,
+            strategy_id="liquidity_sweep_reversal", regime="TRENDING",
+            previous_regime="RANGING", regime_transition="RANGING->TRENDING", db_path=path,
+        )
+        trade_id = await db.record_trade(
+            "Boom 500 Index", "SELL", 100.0, 101.0, 97.0, 0.1, 10.0, 3.0,
+            "mt5", "{}", setup_id=setup_id, account_mode="demo", db_path=path,
+        )
+        await db.close_trade(trade_id, 8.0, path, pnl_r=0.8, max_favorable_r=1.3, max_adverse_r=-0.25)
+        transition = await db.upsert_strategy_transition_evidence(
+            "demo", "Boom 500 Index", "liquidity_sweep_reversal", "RANGING", "TRENDING", "M5", path,
+        )
+        assert_true(transition["sample_size"] == 1 and transition["regime_transition"] == "RANGING->TRENDING", "transition evidence did not retain the originating prior/current regime context")
+        repeated = await db.upsert_strategy_transition_evidence(
+            "demo", "Boom 500 Index", "liquidity_sweep_reversal", "RANGING", "TRENDING", "M5", path,
+        )
+        assert_true(repeated["sample_size"] == 1, "transition evidence rebuilt the same closed trade more than once")
+
+
 def run() -> None:
     test_broker_stop_normalization()
     test_runtime_telemetry()
@@ -1441,11 +1502,14 @@ def run() -> None:
     test_no_widening_management()
     test_adaptive_capital_protection()
     test_causal_confirmation_invariants()
+    test_explicit_feature_availability()
+    test_completed_outcome_distribution_statistics()
     asyncio.run(test_broker_only_data_provider())
     asyncio.run(test_deriv_market_universe())
     asyncio.run(test_basket_persistence())
     asyncio.run(test_learning_telemetry_persistence())
     asyncio.run(test_strategy_evidence_persistence())
+    asyncio.run(test_strategy_transition_evidence_persistence())
     asyncio.run(test_model_governance_persistence())
     asyncio.run(test_experiment_engine_persistence())
     asyncio.run(test_chart_activity_notifications())

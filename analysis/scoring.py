@@ -49,6 +49,16 @@ class TradeSignal:
     experimental_policy: dict[str, Any] = field(default_factory=dict)
     passed: bool = False
     rejection_reason: str = ""
+    regime: str = "UNKNOWN"
+    previous_regime: str = "UNKNOWN"
+    regime_transition: str = "UNKNOWN"
+    primary_thesis: dict[str, Any] = field(default_factory=dict)
+    alternative_theses: list[dict[str, Any]] = field(default_factory=list)
+    evidence_summary: dict[str, Any] = field(default_factory=dict)
+    expected_value_r: Optional[float] = None
+    invalidation_reason: str = ""
+    management_plan: dict[str, Any] = field(default_factory=dict)
+    causality: dict[str, Any] = field(default_factory=dict)
 
     @property
     def passed_gates(self) -> bool:

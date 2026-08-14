@@ -38,6 +38,12 @@ class SymbolProfile:
     adx: float = 0.0
     rsi: float = 50.0
     momentum: float = 0.0
+    previous_regime: str = "UNKNOWN"
+    regime_transition: str = "UNKNOWN"
+    efficiency: float = 0.0
+    trend_persistence: float = 0.0
+    range_ratio: float = 1.0
+    displacement_ratio: float = 0.0
 
 
 class AdaptiveProfiler:
@@ -77,6 +83,14 @@ class AdaptiveProfiler:
 
         frame = df.copy().tail(500).reset_index(drop=True)
         context = market_context(frame)
+        previous = await db.get_symbol_profile(symbol, timeframe, account_mode)
+        previous_metrics = dict((previous or {}).get("metrics") or {})
+        previous_regime = str(previous_metrics.get("regime") or "UNKNOWN")
+        current_regime = str(context.get("regime") or "UNKNOWN")
+        regime_transition = (
+            f"{previous_regime}->{current_regime}"
+            if previous_regime not in {"", "UNKNOWN", current_regime} else current_regime
+        )
         atr_series = self._atr(frame)
         atr_values = atr_series.dropna()
         if atr_values.empty or float(frame["close"].iloc[-1]) == 0:
@@ -113,11 +127,17 @@ class AdaptiveProfiler:
             last_updated=pd.Timestamp.now(tz="UTC"),
             sample_size=int(all_outcomes["sample_size"]),
             expectancy_r=round(float(all_outcomes["expectancy_r"]), 4),
-            regime=str(context.get("regime") or "UNKNOWN"),
+            regime=current_regime,
             atr_ratio=round(float(context.get("atr_ratio") or 1.0), 4),
             adx=round(float(context.get("adx") or 0.0), 4),
             rsi=round(float(context.get("rsi") or 50.0), 4),
             momentum=round(float(context.get("momentum") or 0.0), 4),
+            previous_regime=previous_regime,
+            regime_transition=regime_transition,
+            efficiency=round(float(context.get("efficiency") or 0.0), 4),
+            trend_persistence=round(float(context.get("trend_persistence") or 0.0), 4),
+            range_ratio=round(float(context.get("range_ratio") or 1.0), 4),
+            displacement_ratio=round(float(context.get("displacement_ratio") or 0.0), 4),
         )
         self.profiles[symbol] = profile
         await db.upsert_symbol_profile(
@@ -139,6 +159,12 @@ class AdaptiveProfiler:
                 "adx": profile.adx,
                 "rsi": profile.rsi,
                 "momentum": profile.momentum,
+                "previous_regime": profile.previous_regime,
+                "regime_transition": profile.regime_transition,
+                "efficiency": profile.efficiency,
+                "trend_persistence": profile.trend_persistence,
+                "range_ratio": profile.range_ratio,
+                "displacement_ratio": profile.displacement_ratio,
             },
         )
         logger.info(
@@ -170,6 +196,12 @@ class AdaptiveProfiler:
             adx=0.0,
             rsi=50.0,
             momentum=0.0,
+            previous_regime="UNKNOWN",
+            regime_transition="UNKNOWN",
+            efficiency=0.0,
+            trend_persistence=0.0,
+            range_ratio=1.0,
+            displacement_ratio=0.0,
         )
 
 

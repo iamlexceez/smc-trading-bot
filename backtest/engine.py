@@ -318,7 +318,9 @@ class BacktestEngine:
                 quality = score_setup_quality(
                     validation, structure, min_score=0.0,
                     extreme_score=self.settings.extreme_setup_score,
-                    rr_reference=required_rr,
+                    # RR remains descriptive evidence in replay as it does in the
+                    # live research path; it is never a hidden execution filter.
+                    rr_reference=0.0,
                 )
                 features = {check.name.lower().replace("/", "_").replace(" ", "_"): check.passed for check in validation.checks}
                 features.update({

@@ -4,11 +4,13 @@ Uses aiosqlite for async operations.
 """
 
 import os
+import math
 import aiosqlite
 import json
 from datetime import datetime, date, timedelta
 from typing import Any, Optional
 from config import TradeSettings
+from analysis.evidence import completed_outcome_statistics
 
 DB_PATH = os.getenv("DB_PATH", "smc_bot.db")
 
@@ -113,6 +115,28 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 confidence TEXT NOT NULL DEFAULT 'UNKNOWN',
                 updated_at TEXT NOT NULL,
                 UNIQUE(account_mode, symbol, strategy_id, regime, timeframe)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_transition_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_mode TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                previous_regime TEXT NOT NULL,
+                regime TEXT NOT NULL,
+                regime_transition TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                sample_size INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                losses INTEGER NOT NULL DEFAULT 0,
+                expectancy_r REAL,
+                average_mae_r REAL,
+                average_mfe_r REAL,
+                max_drawdown_r REAL,
+                confidence TEXT NOT NULL DEFAULT 'UNKNOWN',
+                updated_at TEXT NOT NULL,
+                UNIQUE(account_mode, symbol, strategy_id, previous_regime, regime, timeframe)
             )
         """)
         await db.execute("""
@@ -446,11 +470,25 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await _ensure_column(db, "setup_records", "experiment_id", "INTEGER")
         await _ensure_column(db, "setup_records", "strategy_id", "TEXT")
         await _ensure_column(db, "setup_records", "regime", "TEXT")
+        await _ensure_column(db, "setup_records", "previous_regime", "TEXT")
+        await _ensure_column(db, "setup_records", "regime_transition", "TEXT")
+        await _ensure_column(db, "setup_records", "thesis_json", "TEXT NOT NULL DEFAULT '{}'")
+        await _ensure_column(db, "strategy_evidence", "recent_expectancy_r", "REAL")
+        await _ensure_column(db, "strategy_evidence", "pnl_stddev_r", "REAL")
+        await _ensure_column(db, "strategy_evidence", "expectancy_standard_error_r", "REAL")
+        await _ensure_column(db, "strategy_evidence", "expectancy_ci95_low_r", "REAL")
+        await _ensure_column(db, "strategy_evidence", "expectancy_ci95_high_r", "REAL")
+        await _ensure_column(db, "strategy_evidence", "mae_p50_r", "REAL")
+        await _ensure_column(db, "strategy_evidence", "mae_p90_r", "REAL")
+        await _ensure_column(db, "strategy_evidence", "mfe_p50_r", "REAL")
+        await _ensure_column(db, "strategy_evidence", "mfe_p90_r", "REAL")
+        await _ensure_column(db, "strategy_evidence", "target_reach_probability", "REAL")
         await _ensure_column(db, "trade_baskets", "policy_version", "TEXT")
         await _ensure_column(db, "trade_baskets", "experiment_id", "INTEGER")
         await _ensure_column(db, "trade_baskets", "account_mode", "TEXT NOT NULL DEFAULT 'demo'")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode_status ON trades(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_evidence_context ON strategy_evidence(account_mode, symbol, regime, strategy_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_transition_context ON strategy_transition_evidence(account_mode, symbol, previous_regime, regime, strategy_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_demo_session ON trades(demo_session_id, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_objective_phase ON trades(objective_phase_id, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_setups_objective_phase ON setup_records(objective_phase_id, status)")
@@ -589,6 +627,9 @@ async def record_setup(
     objective_phase_id: Optional[int] = None,
     strategy_id: Optional[str] = None,
     regime: Optional[str] = None,
+    previous_regime: Optional[str] = None,
+    regime_transition: Optional[str] = None,
+    thesis: Optional[dict] = None,
     db_path: str = DB_PATH,
 ) -> int:
     """Store every qualifying, rejected, and executed setup hypothesis."""
@@ -598,13 +639,15 @@ async def record_setup(
             """INSERT INTO setup_records
                (detected_at, updated_at, account_mode, symbol, timeframe, direction, setup_type,
                 status, rejection_reason, entry_price, stop_loss, take_profit, rr_ratio,
-                quality_score, validation_json, features_json, policy_version, experiment_id, objective_phase_id, strategy_id, regime)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                quality_score, validation_json, features_json, policy_version, experiment_id, objective_phase_id, strategy_id, regime,
+                previous_regime, regime_transition, thesis_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 now, now, account_mode, symbol, timeframe, direction, setup_type, status,
                 rejection_reason, entry_price, stop_loss, take_profit, rr_ratio, quality_score,
                 json.dumps(validation or {}, sort_keys=True), json.dumps(features or {}, sort_keys=True),
                 policy_version, experiment_id, objective_phase_id, strategy_id, regime,
+                previous_regime, regime_transition, json.dumps(thesis or {}, sort_keys=True),
             ),
         )
         await conn.commit()
@@ -621,6 +664,9 @@ async def update_setup_record(
     outcome: Optional[dict] = None,
     strategy_id: Optional[str] = None,
     regime: Optional[str] = None,
+    previous_regime: Optional[str] = None,
+    regime_transition: Optional[str] = None,
+    thesis: Optional[dict] = None,
     db_path: str = DB_PATH,
 ) -> None:
     """Update a setup's execution link or counterfactual/realized outcome."""
@@ -634,6 +680,9 @@ async def update_setup_record(
         ("outcome_json", json.dumps(outcome, sort_keys=True) if outcome is not None else None),
         ("strategy_id", strategy_id),
         ("regime", regime),
+        ("previous_regime", previous_regime),
+        ("regime_transition", regime_transition),
+        ("thesis_json", json.dumps(thesis, sort_keys=True) if thesis is not None else None),
     ):
         if value is not None:
             assignments.append(f"{column} = ?")
@@ -758,6 +807,7 @@ async def get_setup_record(setup_id: int, db_path: str = DB_PATH) -> Optional[di
     result["features"] = json.loads(result.pop("features_json") or "{}")
     result["validation"] = json.loads(result.pop("validation_json") or "{}")
     result["outcome"] = json.loads(result.pop("outcome_json") or "{}")
+    result["thesis"] = json.loads(result.pop("thesis_json", "{}") or "{}")
     return result
 
 
@@ -2595,7 +2645,7 @@ async def upsert_strategy_evidence(
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute(
-            """SELECT t.pnl_r, t.max_adverse_r, t.max_favorable_r,
+            """SELECT t.pnl_r, t.max_adverse_r, t.max_favorable_r, s.rr_ratio AS target_r,
                       COALESCE(t.closed_at, t.timestamp) AS event_time
                  FROM trades t
                  JOIN setup_records s ON s.id = t.setup_id
@@ -2607,20 +2657,27 @@ async def upsert_strategy_evidence(
         )
         rows = [dict(row) for row in await cursor.fetchall()]
         outcomes: list[tuple[float, float, float]] = []
+        evidence_rows: list[dict[str, float]] = []
         for row in rows:
             try:
                 pnl = float(row["pnl_r"])
             except (TypeError, ValueError):
                 continue
-            if not __import__("math").isfinite(pnl):
+            if not math.isfinite(pnl):
                 continue
             def finite_or_zero(value: Any) -> float:
                 try:
                     number = float(value or 0.0)
-                    return number if __import__("math").isfinite(number) else 0.0
+                    return number if math.isfinite(number) else 0.0
                 except (TypeError, ValueError):
                     return 0.0
-            outcomes.append((pnl, finite_or_zero(row["max_adverse_r"]), finite_or_zero(row["max_favorable_r"])))
+            mae = finite_or_zero(row["max_adverse_r"])
+            mfe = finite_or_zero(row["max_favorable_r"])
+            outcomes.append((pnl, mae, mfe))
+            evidence_rows.append({
+                "pnl_r": pnl, "mae_r": mae, "mfe_r": mfe,
+                "target_r": finite_or_zero(row.get("target_r")),
+            })
         trades = len(outcomes)
         wins = sum(1 for pnl, _, _ in outcomes if pnl > 0)
         losses = sum(1 for pnl, _, _ in outcomes if pnl < 0)
@@ -2636,6 +2693,7 @@ async def upsert_strategy_evidence(
             peak = max(peak, cumulative)
             max_drawdown = min(max_drawdown, cumulative - peak)
         confidence = _strategy_confidence(trades, expectancy)
+        statistics = completed_outcome_statistics(evidence_rows)
         now = datetime.utcnow().isoformat()
         await conn.execute(
             """INSERT INTO strategy_evidence
@@ -2653,6 +2711,20 @@ async def upsert_strategy_evidence(
              expectancy, profit_factor, average_mae, average_mfe, max_drawdown,
              trades, confidence, now),
         )
+        await conn.execute(
+            """UPDATE strategy_evidence
+                   SET recent_expectancy_r = ?, pnl_stddev_r = ?, expectancy_standard_error_r = ?,
+                       expectancy_ci95_low_r = ?, expectancy_ci95_high_r = ?, mae_p50_r = ?,
+                       mae_p90_r = ?, mfe_p50_r = ?, mfe_p90_r = ?, target_reach_probability = ?
+                 WHERE account_mode = ? AND symbol = ? AND strategy_id = ? AND regime = ? AND timeframe = ?""",
+            (
+                statistics["recent_expectancy_r"], statistics["pnl_stddev_r"],
+                statistics["expectancy_standard_error_r"], statistics["expectancy_ci95_low_r"],
+                statistics["expectancy_ci95_high_r"], statistics["mae_p50_r"], statistics["mae_p90_r"],
+                statistics["mfe_p50_r"], statistics["mfe_p90_r"], statistics["target_reach_probability"],
+                account_mode, symbol, strategy_id, regime, timeframe,
+            ),
+        )
         await conn.commit()
     return {
         "account_mode": account_mode, "symbol": symbol, "strategy_id": strategy_id,
@@ -2660,7 +2732,7 @@ async def upsert_strategy_evidence(
         "losses": losses, "expectancy_r": expectancy, "profit_factor": profit_factor,
         "average_mae_r": average_mae, "average_mfe_r": average_mfe,
         "max_drawdown_r": max_drawdown, "sample_size": trades, "confidence": confidence,
-        "updated_at": now,
+        **statistics, "updated_at": now,
     }
 
 
@@ -2742,3 +2814,102 @@ async def get_strategy_evidence_summary(
             (account_mode, since),
         )
         return [dict(row) for row in await cursor.fetchall()]
+
+
+async def upsert_strategy_transition_evidence(
+    account_mode: str,
+    symbol: str,
+    strategy_id: str,
+    previous_regime: str,
+    regime: str,
+    timeframe: str,
+    db_path: str = DB_PATH,
+) -> dict:
+    """Rebuild one transition context from broker-confirmed closed outcomes.
+
+    Rebuilding from durable records is idempotent, so a repeated reconciliation
+    cannot add the same closed trade to evidence twice.
+    """
+    transition = f"{previous_regime}->{regime}"
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT t.pnl_r, t.max_adverse_r, t.max_favorable_r,
+                      COALESCE(t.closed_at, t.timestamp) AS event_time
+                 FROM trades t JOIN setup_records s ON s.id = t.setup_id
+                WHERE t.account_mode = ? AND t.status = 'closed' AND t.pnl_r IS NOT NULL
+                  AND s.symbol = ? AND s.strategy_id = ? AND s.previous_regime = ?
+                  AND s.regime = ? AND s.timeframe = ?
+                ORDER BY event_time ASC, t.id ASC""",
+            (account_mode, symbol, strategy_id, previous_regime, regime, timeframe),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        outcomes: list[tuple[float, float, float]] = []
+        for row in rows:
+            try:
+                pnl = float(row["pnl_r"])
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(pnl):
+                continue
+            def finite_or_zero(value: Any) -> float:
+                try:
+                    number = float(value or 0.0)
+                    return number if math.isfinite(number) else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+            outcomes.append((pnl, finite_or_zero(row["max_adverse_r"]), finite_or_zero(row["max_favorable_r"])))
+        sample_size = len(outcomes)
+        wins = sum(pnl > 0 for pnl, _, _ in outcomes)
+        losses = sum(pnl < 0 for pnl, _, _ in outcomes)
+        expectancy = sum(pnl for pnl, _, _ in outcomes) / sample_size if sample_size else None
+        average_mae = sum(mae for _, mae, _ in outcomes) / sample_size if sample_size else None
+        average_mfe = sum(mfe for _, _, mfe in outcomes) / sample_size if sample_size else None
+        cumulative = peak = max_drawdown = 0.0
+        for pnl, _, _ in outcomes:
+            cumulative += pnl
+            peak = max(peak, cumulative)
+            max_drawdown = min(max_drawdown, cumulative - peak)
+        confidence = _strategy_confidence(sample_size, expectancy)
+        now = datetime.utcnow().isoformat()
+        await conn.execute(
+            """INSERT INTO strategy_transition_evidence
+                   (account_mode, symbol, strategy_id, previous_regime, regime, regime_transition,
+                    timeframe, sample_size, wins, losses, expectancy_r, average_mae_r,
+                    average_mfe_r, max_drawdown_r, confidence, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(account_mode, symbol, strategy_id, previous_regime, regime, timeframe) DO UPDATE SET
+                   regime_transition=excluded.regime_transition, sample_size=excluded.sample_size,
+                   wins=excluded.wins, losses=excluded.losses, expectancy_r=excluded.expectancy_r,
+                   average_mae_r=excluded.average_mae_r, average_mfe_r=excluded.average_mfe_r,
+                   max_drawdown_r=excluded.max_drawdown_r, confidence=excluded.confidence,
+                   updated_at=excluded.updated_at""",
+            (account_mode, symbol, strategy_id, previous_regime, regime, transition,
+             timeframe, sample_size, wins, losses, expectancy, average_mae, average_mfe,
+             max_drawdown, confidence, now),
+        )
+        await conn.commit()
+    return {
+        "account_mode": account_mode, "symbol": symbol, "strategy_id": strategy_id,
+        "previous_regime": previous_regime, "regime": regime, "regime_transition": transition,
+        "timeframe": timeframe, "sample_size": sample_size, "wins": wins, "losses": losses,
+        "expectancy_r": expectancy, "average_mae_r": average_mae, "average_mfe_r": average_mfe,
+        "max_drawdown_r": max_drawdown, "confidence": confidence, "updated_at": now,
+    }
+
+
+async def get_strategy_transition_evidence_for_context(
+    account_mode: str, symbol: str, previous_regime: str, regime: str, timeframe: str,
+    db_path: str = DB_PATH,
+) -> dict[str, dict]:
+    """Return recorded transition metrics for the exact current candidate context."""
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """SELECT * FROM strategy_transition_evidence
+                 WHERE account_mode = ? AND symbol = ? AND previous_regime = ?
+                   AND regime = ? AND timeframe = ?""",
+            (account_mode, symbol, previous_regime, regime, timeframe),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    return {row["strategy_id"]: row for row in rows}

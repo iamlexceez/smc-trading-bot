@@ -15,6 +15,7 @@ from statistics import mean
 from typing import Any, Iterable, Optional
 
 from analysis.policies import PolicyEvaluator
+from analysis.evidence import completed_outcome_statistics
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,15 @@ def summarize_management(observations: Iterable[ManagementObservation]) -> dict[
     """Calculate descriptive TP/SL evidence without an execution decision."""
     rows = list(observations)
     evaluation = PolicyEvaluator.evaluate([{"pnl_r": row.final_r} for row in rows]).to_dict()
+    distribution = completed_outcome_statistics([
+        {
+            "pnl_r": row.final_r,
+            "mae_r": row.mae_r,
+            "mfe_r": row.mfe_r,
+            "target_r": row.initial_rr,
+        }
+        for row in rows
+    ])
     return {
         "sample_size": len(rows),
         "expectancy_r": evaluation["expectancy_r"],
@@ -144,6 +154,7 @@ def summarize_management(observations: Iterable[ManagementObservation]) -> dict[
         "breakeven_activations": sum(row.breakeven_activated for row in rows),
         "trailing_activations": sum(row.trailing_activated for row in rows),
         "partial_exits": sum(row.partial_exit_used for row in rows),
+        **distribution,
         "basis": "broker_confirmed_or_causal_replay_observations",
     }
 

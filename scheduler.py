@@ -1326,6 +1326,9 @@ class MarketScheduler:
                 policy_version=policy_version or self.settings.active_model_version,
                 experiment_id=experiment_id,
                 objective_phase_id=self._operational_objective.get("phase_id"),
+                regime=profile.regime,
+                previous_regime=profile.previous_regime,
+                regime_transition=profile.regime_transition,
             )
         if not validation.valid:
             # Full-precision RR is checked before a candidate can reach policy,
@@ -1364,9 +1367,17 @@ class MarketScheduler:
         )
         features = self._feature_snapshot(df, structure, htf_structures, float(atr_val), validation)
         observed_features = self._strategy_observed_features(features)
-        regime = str(regime_context.get("regime") or "UNKNOWN")
+        regime = profile.regime or str(regime_context.get("regime") or "UNKNOWN")
+        previous_regime = profile.previous_regime or "UNKNOWN"
+        regime_transition = profile.regime_transition or regime
         context_evidence = await db.get_strategy_evidence_for_context(
             self.settings.trading_mode, symbol, regime, primary_tf
+        )
+        transition_evidence = (
+            await db.get_strategy_transition_evidence_for_context(
+                self.settings.trading_mode, symbol, previous_regime, regime, primary_tf
+            )
+            if previous_regime not in {"", "UNKNOWN", regime} else {}
         )
         strategy_assessments = evaluate_strategies(
             regime=regime,
@@ -1374,6 +1385,7 @@ class MarketScheduler:
             observed_features=observed_features,
             setup_quality=quality.score,
             evidence_by_strategy=context_evidence,
+            transition_evidence_by_strategy=transition_evidence,
         )
         if strategy_assessments:
             selected_assessment = strategy_assessments[0]
@@ -1384,19 +1396,45 @@ class MarketScheduler:
                 "expectancy_r": selected_assessment.expectancy_r,
                 "confidence": selected_assessment.confidence,
             })
+            strategy_evidence["transition"] = dict(transition_evidence.get(selected_strategy) or {})
+            strategy_evidence["evidence_stage"] = selected_assessment.evidence_stage
         else:
             # A setup remains an observable candidate; lack of a registry fit is
             # reported as uncertainty, never hidden or reclassified as evidence.
             selected_assessment = None
             selected_strategy = "unclassified_observation"
             strategy_score = 0.0
-            strategy_evidence = {"sample_size": 0, "expectancy_r": None, "confidence": "UNKNOWN"}
+            strategy_evidence = {
+                "sample_size": 0, "expectancy_r": None, "confidence": "UNKNOWN",
+                "transition": {}, "evidence_stage": "exploration",
+            }
         if setup_id is not None:
             await db.update_setup_record(
                 setup_id,
                 setup_type=selected_strategy,
                 strategy_id=selected_strategy,
                 regime=regime,
+                previous_regime=previous_regime,
+                regime_transition=regime_transition,
+                thesis={
+                    "primary": {
+                        "strategy_id": selected_strategy,
+                        "direction": direction,
+                        "entry": validation.entry_price,
+                        "stop_loss": validation.stop_loss,
+                        "take_profit": validation.take_profit,
+                        "target_source": validation.target_source,
+                        "invalidation": "Initial structural stop breached or opposing confirmed structure",
+                        "evidence_stage": strategy_evidence.get("evidence_stage", "exploration"),
+                    },
+                    "alternatives": [item.__dict__ for item in strategy_assessments[1:]],
+                    "causality": {
+                        "decision_index": len(df) - 1,
+                        "structure_event_available_index": getattr(structure.last_event, "available_index", None),
+                        "selected_zone_available_index": getattr(validation.zone, "available_index", None),
+                        "confirmation_available_index": getattr(validation.confirmation, "available_index", None),
+                    },
+                },
             )
         policy_ok, policy_reason = policy.accepts(
             score=quality.score, rr_ratio=validation.rr_ratio, features=features,
@@ -1441,6 +1479,31 @@ class MarketScheduler:
             setup_id=setup_id,
             passed=True,
             rejection_reason="",
+            regime=regime,
+            previous_regime=previous_regime,
+            regime_transition=regime_transition,
+            primary_thesis={
+                "strategy_id": selected_strategy,
+                "direction": direction,
+                "target_source": validation.target_source,
+                "invalidation": "Initial structural stop breached or opposing confirmed structure",
+                "evidence_stage": strategy_evidence.get("evidence_stage", "exploration"),
+            },
+            alternative_theses=[item.__dict__ for item in strategy_assessments[1:]],
+            evidence_summary=strategy_evidence,
+            expected_value_r=selected_assessment.expectancy_r if selected_assessment else None,
+            invalidation_reason="Initial structural stop breached or opposing confirmed structure",
+            management_plan={
+                "trailing_model": policy.trailing_model,
+                "breakeven_model": policy.breakeven_model,
+                "target_model": policy.target_model,
+                "layering_policy": policy.max_layers,
+            },
+            causality={
+                "decision_index": len(df) - 1,
+                "structure_event_available_index": getattr(structure.last_event, "available_index", None),
+                "confirmation_available_index": getattr(validation.confirmation, "available_index", None),
+            },
         )
         signal.policy_version = policy_version or self.settings.active_model_version
         signal.experiment_id = experiment_id
@@ -2441,6 +2504,19 @@ class MarketScheduler:
                         mae_r=float(trade.get("max_adverse_r") or 0.0),
                         mfe_r=float(trade.get("max_favorable_r") or 0.0),
                     )
+                    if str(setup.get("previous_regime") or "UNKNOWN") not in {
+                        "", "UNKNOWN", str(setup.get("regime") or "UNKNOWN")
+                    }:
+                        transition_evidence = await db.upsert_strategy_transition_evidence(
+                            self.settings.trading_mode,
+                            str(setup.get("symbol") or trade["symbol"]),
+                            str(setup["strategy_id"]),
+                            str(setup.get("previous_regime")),
+                            str(setup.get("regime")),
+                            str(setup.get("timeframe") or ""),
+                        )
+                    else:
+                        transition_evidence = None
                     await db.record_execution_event(
                         account_mode=self.settings.trading_mode,
                         symbol=str(setup.get("symbol") or trade["symbol"]),
@@ -2449,7 +2525,10 @@ class MarketScheduler:
                         ticket=int(ticket),
                         status="strategy_evidence_updated",
                         reason=str(evidence.get("confidence") or "UNKNOWN"),
-                        details={"strategy_evidence": evidence},
+                        details={
+                            "strategy_evidence": evidence,
+                            "transition_evidence": transition_evidence,
+                        },
                     )
 
     async def manage_open_positions(self):

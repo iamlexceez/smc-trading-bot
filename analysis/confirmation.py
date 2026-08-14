@@ -34,6 +34,8 @@ class ConfirmationResult:
     method: ConfirmationType
     detail: str
     candle_index: int = -1
+    available_index: int = -1
+    available_at: str | None = None
 
 
 def detect_engulfing(df: pd.DataFrame, direction: str, lookback: int = 3) -> ConfirmationResult:
@@ -57,7 +59,8 @@ def detect_engulfing(df: pd.DataFrame, direction: str, lookback: int = 3) -> Con
                 curr["open"] <= prev["close"]):   # curr open <= prev close
                 return ConfirmationResult(
                     True, ConfirmationType.ENGULFING,
-                    f"Bullish engulfing at bar {i}", i
+                    f"Bullish engulfing at bar {i}", i, i,
+                    (str(df.iloc[i]["time"]) if "time" in df.columns else None),
                 )
         else:
             # Bearish engulfing
@@ -67,7 +70,8 @@ def detect_engulfing(df: pd.DataFrame, direction: str, lookback: int = 3) -> Con
                 curr["close"] <= prev["open"]):
                 return ConfirmationResult(
                     True, ConfirmationType.ENGULFING,
-                    f"Bearish engulfing at bar {i}", i
+                    f"Bearish engulfing at bar {i}", i, i,
+                    (str(df.iloc[i]["time"]) if "time" in df.columns else None),
                 )
 
     return ConfirmationResult(False, ConfirmationType.NONE, "No engulfing pattern found")
@@ -97,14 +101,16 @@ def detect_pin_bar(df: pd.DataFrame, direction: str, lookback: int = 3) -> Confi
             if lower_wick >= body * 2 and lower_wick / total_range > 0.5:
                 return ConfirmationResult(
                     True, ConfirmationType.PIN_BAR,
-                    f"Bullish pin bar at bar {i}", i
+                    f"Bullish pin bar at bar {i}", i, i,
+                    (str(df.iloc[i]["time"]) if "time" in df.columns else None),
                 )
         else:
             # Bearish pin: upper wick >= 2x body, body in lower third
             if upper_wick >= body * 2 and upper_wick / total_range > 0.5:
                 return ConfirmationResult(
                     True, ConfirmationType.PIN_BAR,
-                    f"Bearish pin bar at bar {i}", i
+                    f"Bearish pin bar at bar {i}", i, i,
+                    (str(df.iloc[i]["time"]) if "time" in df.columns else None),
                 )
 
     return ConfirmationResult(False, ConfirmationType.NONE, "No pin bar found")
@@ -119,7 +125,9 @@ def detect_inside_bar_breakout(df: pd.DataFrame, direction: str, lookback: int =
     if len(df) < 3:
         return ConfirmationResult(False, ConfirmationType.NONE, "Not enough data")
 
-    for i in range(max(2, len(df) - lookback), len(df)):
+    # ``i`` is the inside bar and may be index 1. The following candle is the
+    # closed confirmation, so do not inspect an inside bar without a next bar.
+    for i in range(max(1, len(df) - lookback - 1), len(df) - 1):
         mother = df.iloc[i - 1]
         inside = df.iloc[i]
 
@@ -131,12 +139,14 @@ def detect_inside_bar_breakout(df: pd.DataFrame, direction: str, lookback: int =
                 if direction == "BUY" and breakout["close"] > mother["high"]:
                     return ConfirmationResult(
                         True, ConfirmationType.INSIDE_BAR_BREAKOUT,
-                        f"Bullish inside bar breakout at bar {i+1}", i + 1
+                        f"Bullish inside bar breakout at bar {i+1}", i + 1, i + 1,
+                        (str(df.iloc[i + 1]["time"]) if "time" in df.columns else None),
                     )
                 elif direction == "SELL" and breakout["close"] < mother["low"]:
                     return ConfirmationResult(
                         True, ConfirmationType.INSIDE_BAR_BREAKOUT,
-                        f"Bearish inside bar breakout at bar {i+1}", i + 1
+                        f"Bearish inside bar breakout at bar {i+1}", i + 1, i + 1,
+                        (str(df.iloc[i + 1]["time"]) if "time" in df.columns else None),
                     )
 
     return ConfirmationResult(False, ConfirmationType.NONE, "No inside bar breakout found")
@@ -161,12 +171,14 @@ def detect_displacement(df: pd.DataFrame, direction: str, lookback: int = 5) -> 
             if direction == "BUY" and candle["close"] > candle["open"]:
                 return ConfirmationResult(
                     True, ConfirmationType.DISPLACEMENT,
-                    f"Bullish displacement (body={body:.5f}, ATR={avg_atr:.5f}) at bar {i}", i
+                    f"Bullish displacement (body={body:.5f}, ATR={avg_atr:.5f}) at bar {i}", i, i,
+                    (str(df.iloc[i]["time"]) if "time" in df.columns else None),
                 )
             elif direction == "SELL" and candle["close"] < candle["open"]:
                 return ConfirmationResult(
                     True, ConfirmationType.DISPLACEMENT,
-                    f"Bearish displacement (body={body:.5f}, ATR={avg_atr:.5f}) at bar {i}", i
+                    f"Bearish displacement (body={body:.5f}, ATR={avg_atr:.5f}) at bar {i}", i, i,
+                    (str(df.iloc[i]["time"]) if "time" in df.columns else None),
                 )
 
     return ConfirmationResult(False, ConfirmationType.NONE, "No displacement found")

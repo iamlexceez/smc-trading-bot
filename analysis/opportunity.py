@@ -56,7 +56,12 @@ def adx_series(frame: pd.DataFrame, period: int = 14) -> pd.Series:
 def market_context(frame: pd.DataFrame) -> dict[str, Any]:
     """Return closed-candle ATR/ADX/RSI context and a non-entry regime label."""
     if frame.empty or len(frame) < 40:
-        return {"regime": "UNKNOWN", "atr": 0.0, "atr_ratio": 1.0, "adx": 0.0, "rsi": 50.0, "momentum": 0.0, "confidence": "UNKNOWN"}
+        return {
+            "regime": "UNKNOWN", "atr": 0.0, "atr_ratio": 1.0, "adx": 0.0,
+            "rsi": 50.0, "momentum": 0.0, "efficiency": 0.0,
+            "trend_persistence": 0.0, "range_ratio": 1.0, "displacement_ratio": 0.0,
+            "confidence": "UNKNOWN",
+        }
     data = frame.tail(500).reset_index(drop=True)
     atr = atr_series(data)
     adx = adx_series(data)
@@ -68,6 +73,21 @@ def market_context(frame: pd.DataFrame) -> dict[str, Any]:
     rsi_value = _finite(rsi.iloc[-1], 50.0)
     close = data["close"]
     momentum = _finite((close.iloc[-1] - close.iloc[-6]) / max(abs(close.iloc[-6]), 1e-12) * 100.0)
+    returns = close.diff().tail(20).dropna()
+    total_path = float(returns.abs().sum())
+    efficiency = abs(float(close.iloc[-1] - close.iloc[-min(20, len(close))])) / total_path if total_path > 0 else 0.0
+    signs = np.sign(returns.to_numpy())
+    directional_steps = signs[signs != 0]
+    trend_persistence = (
+        float(np.mean(directional_steps[1:] == directional_steps[:-1]))
+        if len(directional_steps) >= 2 else 0.0
+    )
+    ranges = (data["high"] - data["low"])
+    recent_range = _finite(ranges.tail(10).median())
+    baseline_range = _finite(ranges.tail(100).median(), recent_range)
+    range_ratio = recent_range / baseline_range if baseline_range > 0 else 1.0
+    current_range = _finite(ranges.iloc[-1])
+    displacement_ratio = current_range / current_atr if current_atr > 0 else 0.0
     # Regimes are descriptive classifications.  They never form a standalone
     # entry rule and are stored as context for policy evaluation.
     if atr_ratio < 0.75:
@@ -89,6 +109,10 @@ def market_context(frame: pd.DataFrame) -> dict[str, Any]:
         "adx": adx_value,
         "rsi": rsi_value,
         "momentum": momentum,
+        "efficiency": efficiency,
+        "trend_persistence": trend_persistence,
+        "range_ratio": range_ratio,
+        "displacement_ratio": displacement_ratio,
         "confidence": "OBSERVED",
     }
 
@@ -130,19 +154,33 @@ def rank_opportunities(
         atr_ratio = _finite(context.get("atr_ratio"), 1.0)
         volatility_fit = max(0.0, 1.0 - min(abs(atr_ratio - 1.0), 1.0))
         momentum = min(abs(_finite(context.get("momentum"))) / 1.0, 1.0)
-        expectancy = max(-1.0, min(1.0, _finite(evidence.get("expectancy_r"))))
-        sample = max(0, int(_finite(evidence.get("sample_size"))))
-        evidence_strength = min(sample / 20.0, 1.0) * max(expectancy, 0.0)
+        evidence_basis = strategy_evidence if strategy_evidence else evidence
+        expectancy = max(-1.0, min(1.0, _finite(evidence_basis.get("expectancy_r"))))
+        sample = max(0, int(_finite(evidence_basis.get("sample_size"))))
+        recent_expectancy = _finite(strategy_evidence.get("recent_expectancy_r"), expectancy)
+        ci_low_raw = strategy_evidence.get("expectancy_ci95_low_r")
+        ci_low = _finite(ci_low_raw, expectancy) if ci_low_raw is not None else expectancy
+        conservative_ev = min(_finite(getattr(signal, "expected_value_r", None), expectancy), recent_expectancy, ci_low)
+        evidence_strength = min(sample / 20.0, 1.0) * max(conservative_ev, 0.0)
+        target_reach = strategy_evidence.get("target_reach_probability")
+        target_reach_fit = max(0.0, min(1.0, _finite(target_reach, 0.5))) if target_reach is not None else 0.5
         profile_expectancy = max(0.0, min(1.0, _finite(getattr(profile, "expectancy_r", 0.0))))
+        geometry_valid = bool(
+            _finite(getattr(signal, "entry_price", 0.0)) > 0
+            and _finite(getattr(signal, "stop_loss", 0.0)) > 0
+            and _finite(getattr(signal, "take_profit", 0.0)) > 0
+        )
+        geometry_fit = 1.0 if geometry_valid else 0.0
         conflict = 1.0 if symbol in open_set else 0.0
-        score = quality * 0.48 + strategy_score * 0.10 + adx * 10.0 + volatility_fit * 8.0 + momentum * 7.0 + evidence_strength * 12.0 + profile_expectancy * 5.0 - conflict * 18.0
+        score = quality * 0.45 + strategy_score * 0.10 + adx * 8.0 + volatility_fit * 7.0 + momentum * 6.0 + evidence_strength * 12.0 + target_reach_fit * 4.0 + profile_expectancy * 4.0 + geometry_fit * 4.0 - conflict * 18.0
         rationale = [f"setup quality {quality:.1f}/100", f"{context.get('regime', 'UNKNOWN').lower()} regime", f"strategy {selected_strategy} score {strategy_score:.1f}/100"]
         if evidence_strength > 0:
-            rationale.append(f"positive completed-outcome evidence n={sample}")
+            rationale.append(f"positive conservative completed-outcome evidence n={sample}, EV={conservative_ev:+.2f}R")
         elif sample:
-            rationale.append(f"inconclusive completed-outcome evidence n={sample}")
+            rationale.append(f"inconclusive or uncertain completed-outcome evidence n={sample}, EV={conservative_ev:+.2f}R")
         else:
-            rationale.append("no completed-outcome evidence yet")
+            rationale.append("no completed-outcome evidence yet; exploratory context")
+        rationale.append("geometry present" if geometry_valid else "geometry incomplete; broker execution must withhold")
         if conflict:
             rationale.append("existing same-instrument exposure")
         classification = "BEST_OPPORTUNITY" if score >= 65.0 else ("GOOD_OPPORTUNITY" if score >= 45.0 else "WATCHLIST")
@@ -160,12 +198,22 @@ def rank_opportunities(
             "setup_score": quality,
             "strategy_score": strategy_score,
             "historical_expectancy_r": strategy_evidence.get("expectancy_r"),
+            "recent_expectancy_r": strategy_evidence.get("recent_expectancy_r"),
+            "conservative_expected_value_r": conservative_ev,
+            "expectancy_ci95_low_r": strategy_evidence.get("expectancy_ci95_low_r"),
+            "expectancy_ci95_high_r": strategy_evidence.get("expectancy_ci95_high_r"),
+            "target_reach_probability": target_reach,
             "confidence": strategy_evidence.get("confidence", "UNKNOWN"),
+            "evidence_stage": strategy_evidence.get("evidence_stage", "exploration"),
             "sample_size": strategy_evidence.get("sample_size", 0),
             "average_mae_r": strategy_evidence.get("average_mae_r"),
             "average_mfe_r": strategy_evidence.get("average_mfe_r"),
             "layering_suitability": bool(getattr(signal, "layering_suitable", False)),
             "portfolio_conflict": conflict,
+            "execution_geometry_present": geometry_valid,
+            "regime_transition": getattr(signal, "regime_transition", context.get("regime", "UNKNOWN")),
+            "primary_thesis": dict(getattr(signal, "primary_thesis", {}) or {}),
+            "alternative_theses": list(getattr(signal, "alternative_theses", []) or []),
             "thesis": list(rationale),
         }
         ranked.append(Opportunity(symbol, round(score, 4), classification, tuple(rationale), context, conflict, details))

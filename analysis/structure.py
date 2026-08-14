@@ -36,6 +36,8 @@ class SwingPoint:
     type: str  # "high" or "low"
     timestamp: Optional[str] = None
     confirmed: bool = True
+    available_index: Optional[int] = None
+    available_at: Optional[str] = None
 
 
 @dataclass
@@ -45,6 +47,8 @@ class StructureEvent:
     index: int
     timestamp: Optional[str] = None
     direction: str = "bullish"
+    available_index: Optional[int] = None
+    available_at: Optional[str] = None
 
 
 @dataclass
@@ -57,6 +61,8 @@ class OrderBlock:
     direction: str  # "bullish" or "bearish"
     mitigated: bool = False
     strength: float = 1.0
+    available_index: Optional[int] = None
+    available_at: Optional[str] = None
 
 
 @dataclass
@@ -66,6 +72,9 @@ class FairValueGap:
     bottom: float
     direction: str  # "bullish" or "bearish"
     mitigated: bool = False
+    strength: float = 1.0
+    available_index: Optional[int] = None
+    available_at: Optional[str] = None
 
 
 @dataclass
@@ -109,20 +118,30 @@ def detect_causal_swings(df: pd.DataFrame, lookback: int = 3) -> Tuple[List[Swin
     sh_list = []
     sl_list = []
 
-    for idx in df.index[sh_mask]:
+    for source_index, is_swing in enumerate(sh_mask.to_numpy()):
+        if not bool(is_swing):
+            continue
+        confirmation_index = source_index + lookback
         sh_list.append(SwingPoint(
-            index=int(idx),
-            price=float(df.loc[idx, "high"]),
+            index=source_index,
+            price=float(df.iloc[source_index]["high"]),
             type="high",
-            timestamp=str(df.loc[idx, "time"]) if "time" in df.columns else None
+            timestamp=str(df.iloc[source_index]["time"]) if "time" in df.columns else None,
+            available_index=confirmation_index,
+            available_at=(str(df.iloc[confirmation_index]["time"]) if "time" in df.columns and confirmation_index < len(df) else None),
         ))
 
-    for idx in df.index[sl_mask]:
+    for source_index, is_swing in enumerate(sl_mask.to_numpy()):
+        if not bool(is_swing):
+            continue
+        confirmation_index = source_index + lookback
         sl_list.append(SwingPoint(
-            index=int(idx),
-            price=float(df.loc[idx, "low"]),
+            index=source_index,
+            price=float(df.iloc[source_index]["low"]),
             type="low",
-            timestamp=str(df.loc[idx, "time"]) if "time" in df.columns else None
+            timestamp=str(df.iloc[source_index]["time"]) if "time" in df.columns else None,
+            available_index=confirmation_index,
+            available_at=(str(df.iloc[confirmation_index]["time"]) if "time" in df.columns and confirmation_index < len(df) else None),
         ))
 
     return sh_list, sl_list
@@ -195,7 +214,9 @@ def analyze_structure_causal(df: pd.DataFrame, lookback: int = 3) -> MarketStruc
                         close_price=candle["close"],
                         high=candle["high"],
                         low=candle["low"],
-                        direction="bullish"
+                        direction="bullish",
+                        available_index=idx + 1,
+                        available_at=(str(df.iloc[idx + 1]["time"]) if "time" in df.columns else None),
                     ))
                     break
 
@@ -208,7 +229,9 @@ def analyze_structure_causal(df: pd.DataFrame, lookback: int = 3) -> MarketStruc
                         close_price=candle["close"],
                         high=candle["high"],
                         low=candle["low"],
-                        direction="bearish"
+                        direction="bearish",
+                        available_index=idx + 1,
+                        available_at=(str(df.iloc[idx + 1]["time"]) if "time" in df.columns else None),
                     ))
                     break
 
@@ -224,7 +247,10 @@ def analyze_structure_causal(df: pd.DataFrame, lookback: int = 3) -> MarketStruc
             # Check if mitigated strictly by subsequent bars up to current
             mitigated = any(df.iloc[j]["low"] <= gap_top for j in range(i + 1, len(df)))
             if not mitigated:
-                fvgs.append(FairValueGap(index=i, top=gap_top, bottom=gap_bottom, direction="bullish", mitigated=False))
+                fvgs.append(FairValueGap(
+                    index=i, top=gap_top, bottom=gap_bottom, direction="bullish", mitigated=False,
+                    available_index=i, available_at=(str(df.iloc[i]["time"]) if "time" in df.columns else None),
+                ))
 
         # Bearish FVG
         gap_top2 = df.iloc[i - 2]["low"]
@@ -232,7 +258,10 @@ def analyze_structure_causal(df: pd.DataFrame, lookback: int = 3) -> MarketStruc
         if gap_top2 > gap_bottom2:
             mitigated = any(df.iloc[j]["high"] >= gap_bottom2 for j in range(i + 1, len(df)))
             if not mitigated:
-                fvgs.append(FairValueGap(index=i, top=gap_top2, bottom=gap_bottom2, direction="bearish", mitigated=False))
+                fvgs.append(FairValueGap(
+                    index=i, top=gap_top2, bottom=gap_bottom2, direction="bearish", mitigated=False,
+                    available_index=i, available_at=(str(df.iloc[i]["time"]) if "time" in df.columns else None),
+                ))
 
     # Premium / Discount
     eq, p_zone, d_zone, zone_name = 0.0, (0.0, 0.0), (0.0, 0.0), "equilibrium"
@@ -247,6 +276,11 @@ def analyze_structure_causal(df: pd.DataFrame, lookback: int = 3) -> MarketStruc
             zone_name = "premium"
         elif curr_price < eq - (rh - rl) * 0.05:
             zone_name = "discount"
+
+    # A BOS/CHOCH is only known when the current closed candle has confirmed it,
+    # not on the older swing that supplied the level.
+    last_event.available_index = len(df) - 1
+    last_event.available_at = str(df.iloc[-1]["time"]) if "time" in df.columns else None
 
     return MarketStructure(
         trend=trend,

@@ -14,6 +14,7 @@ from typing import Optional
 import pandas as pd
 
 from analysis.confirmation import ConfirmationResult, ConfirmationType, get_confirmation
+from analysis.causality import is_available
 from analysis.displacement import DisplacementResult, detect_displacement
 from analysis.indicators import atr
 from analysis.liquidity import (
@@ -49,6 +50,8 @@ class ValidatedZone:
     direction: str
     reference_index: int
     detail: str
+    available_index: Optional[int] = None
+    available_at: Optional[str] = None
 
     def contains(self, price: float) -> bool:
         return self.bottom <= price <= self.top
@@ -134,12 +137,15 @@ def _valid_zones_at_entry(
     zones: list[SupplyDemandZone],
     direction: str,
     entry_price: float,
+    decision_index: int,
 ) -> list[ValidatedZone]:
     expected_zone_type = ZoneType.DEMAND if direction == "BUY" else ZoneType.SUPPLY
     expected_direction = "bullish" if direction == "BUY" else "bearish"
     candidates: list[ValidatedZone] = []
 
     for order_block in structure.order_blocks:
+        if not is_available(order_block, decision_index, fallback=order_block.index):
+            continue
         if order_block.direction != expected_direction or order_block.mitigated:
             continue
         zone = ValidatedZone(
@@ -149,11 +155,15 @@ def _valid_zones_at_entry(
             direction=direction,
             reference_index=order_block.index,
             detail=f"{expected_direction.title()} order block",
+            available_index=getattr(order_block, "available_index", order_block.index),
+            available_at=getattr(order_block, "available_at", None),
         )
         if zone.contains(entry_price):
             candidates.append(zone)
 
     for fvg in structure.fvgs:
+        if not is_available(fvg, decision_index, fallback=fvg.index):
+            continue
         if fvg.direction != expected_direction or fvg.mitigated:
             continue
         zone = ValidatedZone(
@@ -163,11 +173,15 @@ def _valid_zones_at_entry(
             direction=direction,
             reference_index=fvg.index,
             detail=f"{expected_direction.title()} fair value gap",
+            available_index=getattr(fvg, "available_index", fvg.index),
+            available_at=getattr(fvg, "available_at", None),
         )
         if zone.contains(entry_price):
             candidates.append(zone)
 
     for sd_zone in zones:
+        if not is_available(sd_zone, decision_index, fallback=sd_zone.base_index):
+            continue
         if sd_zone.zone_type != expected_zone_type or not sd_zone.fresh:
             continue
         zone = ValidatedZone(
@@ -177,6 +191,8 @@ def _valid_zones_at_entry(
             direction=direction,
             reference_index=sd_zone.base_index,
             detail=f"Fresh {sd_zone.zone_type.value} zone",
+            available_index=getattr(sd_zone, "available_index", sd_zone.base_index),
+            available_at=getattr(sd_zone, "available_at", None),
         )
         if zone.contains(entry_price):
             candidates.append(zone)
@@ -282,7 +298,9 @@ class SetupValidator:
         event = structure.last_event
         structure_valid = _event_matches_direction(event.event_type, requested_direction)
         result.checks.append(ValidationCheck("BOS/CHOCH confirmation", structure_valid, event.event_type.value))
-        candidate_zones = _valid_zones_at_entry(structure, zones, requested_direction, entry)
+        candidate_zones = _valid_zones_at_entry(
+            structure, zones, requested_direction, entry, decision_index=len(df) - 1
+        )
         selected_zone = candidate_zones[0] if candidate_zones else None
         result.zone = selected_zone
         result.checks.append(ValidationCheck("Retracement into valid zone", selected_zone is not None, selected_zone.detail if selected_zone else "No matching zone at entry"))
@@ -294,6 +312,10 @@ class SetupValidator:
             )
         else:
             confirmation = ConfirmationResult(False, ConfirmationType.NONE, "No zone available for confirmation test")
+        if confirmation.confirmed and not is_available(
+            confirmation, len(confirmation_df) - 1, fallback=confirmation.candle_index
+        ):
+            confirmation = ConfirmationResult(False, ConfirmationType.NONE, "Confirmation became available after the decision bar")
         result.confirmation = confirmation
         result.checks.append(ValidationCheck("LTF confirmation", confirmation.confirmed, confirmation.detail))
 
@@ -431,7 +453,9 @@ class SetupValidator:
             )
         )
 
-        candidate_zones = _valid_zones_at_entry(structure, zones, requested_direction, entry)
+        candidate_zones = _valid_zones_at_entry(
+            structure, zones, requested_direction, entry, decision_index=len(df) - 1
+        )
         selected_zone = candidate_zones[0] if candidate_zones else None
         result.zone = selected_zone
         result.checks.append(
@@ -456,6 +480,10 @@ class SetupValidator:
             )
         else:
             confirmation = ConfirmationResult(False, ConfirmationType.NONE, "No valid zone to confirm")
+        if confirmation.confirmed and not is_available(
+            confirmation, len(confirmation_df) - 1, fallback=confirmation.candle_index
+        ):
+            confirmation = ConfirmationResult(False, ConfirmationType.NONE, "Confirmation became available after the decision bar")
         result.confirmation = confirmation
         result.checks.append(
             ValidationCheck(
