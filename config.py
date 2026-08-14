@@ -378,7 +378,7 @@ class TradeSettings:
             max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3")),
             max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "10")),
             max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "2")),
-            min_rr_ratio=max(0.0, float(os.getenv("MIN_RR_RATIO", "3.0"))),
+            min_rr_ratio=max(0.0, float(os.getenv("MIN_RR", os.getenv("MIN_RR_RATIO", "3.0")))),
             score_threshold=float(os.getenv("SCORE_THRESHOLD", "0.0")),
             min_setup_score=float(os.getenv("MIN_SETUP_SCORE", "0.0")),
             extreme_setup_score=float(os.getenv("EXTREME_SETUP_SCORE", "90.0")),
