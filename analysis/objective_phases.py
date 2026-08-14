@@ -58,9 +58,9 @@ def plan_objective_phases(
     evidence = dict(historical_evidence or {})
     multiple = target / start
     # The baseline produces readable geometric milestones while avoiding a
-    # fixed dollar ladder. It is bounded only to keep Telegram/SQLite records
-    # operationally manageable for extreme objectives.
-    phase_count = max(2, min(12, int(ceil(log(multiple) / log(2.0)))))
+    # fixed dollar ladder. The count remains derived from the actual objective
+    # multiple instead of being capped by a preset milestone limit.
+    phase_count = max(2, int(ceil(log(multiple) / log(2.0))))
     operating = max(0.0, _num(minimum_operating_capital))
     resolution = start / operating if operating > 0 else None
     if resolution is not None and resolution < 3:
@@ -78,7 +78,7 @@ def plan_objective_phases(
             phase_count -= 1
         elif expectancy <= 0 or drawdown >= 4:
             phase_count += 1
-    phase_count = max(2, min(12, phase_count))
+    phase_count = max(2, phase_count)
 
     multiplier = multiple ** (1.0 / phase_count)
     targets: list[float] = []
