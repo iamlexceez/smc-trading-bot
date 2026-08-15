@@ -2190,16 +2190,59 @@ class MarketScheduler:
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
         if not candidates:
+            self.last_opportunity_ranking = []
             reason = f"All {len(scan_symbols)} objective-allowed broker-valid symbols were analyzed; no thesis-qualified candidate passed the current validation and policy path."
-            self._set_scan_gate("NO_THESIS_QUALIFIED_CANDIDATE", reason, analysis_symbols=len(scan_symbols))
-            logger.info("[OPPORTUNITY RANKING] %s", reason)
+            self.telemetry.increment("no_trade_decisions")
+            await db.record_execution_event(
+                account_mode=self.settings.trading_mode, symbol="PORTFOLIO", status="no_trade_decision",
+                reason=reason, details={"decision": "NO_TRADE", "category": "no_thesis_qualified_candidate", "analysis_symbols": len(scan_symbols), "account_state": str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")},
+            )
+            self._set_scan_gate("NO_TRADE_NO_THESIS", reason, analysis_symbols=len(scan_symbols), decision="NO_TRADE")
+            logger.info("[NO TRADE] %s", reason)
             return
         positions = await self.executor.get_open_positions() if self.executor else []
         open_symbols = [str(getattr(position, "symbol", "")) for position in positions]
+        account = dict(capital.get("account") or {})
+        account_state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
+        low_capital_states = {AccountCapitalState.LOW_CAPITAL, AccountCapitalState.CRITICAL_CAPITAL, AccountCapitalState.MARGIN_PRESSURE}
+        low_capital = account_state in low_capital_states
+        free_margin = float(account.get("free_margin") or 0.0)
+        new_exposure_allowed = account_state not in AccountCapitalState.BLOCKING and free_margin > 0.0
+        operational = dict(self._operational_objective or {})
+        if not operational:
+            operational = dict((capital.get("objective") or {}).get("context", {}).get("operational") or {}) if isinstance(capital.get("objective"), dict) else {}
+        if not operational:
+            active_objective = await db.get_active_objective("demo")
+            operational = dict(((active_objective or {}).get("context") or {}).get("operational") or {})
+        phase_start = operational.get("starting_capital")
+        phase_target = operational.get("phase_target_equity")
+        objective_progress = None
+        try:
+            if phase_start is not None and phase_target is not None and float(phase_target) > float(phase_start):
+                objective_progress = max(0.0, min(1.0, (float(account.get("equity") or 0.0) - float(phase_start)) / (float(phase_target) - float(phase_start))))
+        except (TypeError, ValueError, ZeroDivisionError):
+            objective_progress = None
+        protected_count = sum(
+            1 for position in positions
+            if self._sl_protects_profit(position)
+        )
+        capacity_context = {
+            "account_state": account_state,
+            "low_capital": low_capital,
+            "new_exposure_allowed": new_exposure_allowed,
+            "open_position_count": len(positions),
+            "protected_position_count": protected_count,
+            "minimum_evidence_sample": self.settings.market_ranking_min_sample_size,
+            "objective_progress": objective_progress,
+            "free_margin": free_margin,
+        }
         historical = {str(row.get("symbol")): row for row in research["market_selection"].get("rankings", [])}
         profiles = {signal.symbol: getattr(signal, "symbol_profile", None) for signal in candidates}
         contexts = {signal.symbol: dict(getattr(signal, "market_context", {}) or {}) for signal in candidates}
-        ranked = rank_opportunities(candidates, profiles=profiles, contexts=contexts, historical=historical, open_symbols=open_symbols)
+        ranked = rank_opportunities(
+            candidates, profiles=profiles, contexts=contexts, historical=historical,
+            open_symbols=open_symbols, capacity_context=capacity_context,
+        )
         by_symbol = {signal.symbol: signal for signal in candidates}
         for rank, opportunity in enumerate(ranked, start=1):
             signal = by_symbol[opportunity.symbol]
@@ -2214,6 +2257,12 @@ class MarketScheduler:
                 "observed_features": list(getattr(signal, "registry_observed_features", []) or []),
                 "layering_suitability": bool(getattr(signal, "layering_suitable", False)),
                 "portfolio_conflict": opportunity.portfolio_conflict, "opportunity_board": dict(opportunity.details),
+                "confidence_classification": opportunity.details.get("confidence_classification"),
+                "capacity_allowed": opportunity.details.get("capacity_allowed"),
+                "capacity_reasons": list(opportunity.details.get("capacity_reasons") or []),
+                "account_state": opportunity.details.get("account_state"),
+                "low_capital": opportunity.details.get("low_capital"),
+                "maximum_peer_correlation": opportunity.details.get("maximum_peer_correlation"),
             }
             signal.opportunity_thesis = thesis
             if signal.setup_id is not None:
@@ -2222,13 +2271,51 @@ class MarketScheduler:
                     requested_price=signal.entry_price, status="opportunity_ranked",
                     reason=opportunity.classification, details=thesis,
                 )
+        for item in ranked:
+            item.details["why_selected"] = ""
+            if item is not ranked[0]:
+                self.telemetry.increment("opportunity_alternatives")
+        eligible = [item for item in ranked if bool(item.details.get("capacity_allowed", True))]
+        if not eligible:
+            self.last_opportunity_ranking = [
+                {"symbol": item.symbol, "score": item.score, "classification": item.classification,
+                 "rationale": list(item.rationale), "context": dict(item.context),
+                 "portfolio_conflict": item.portfolio_conflict, "details": dict(item.details)}
+                for item in ranked
+            ]
+            reasons = [
+                {"symbol": item.symbol, "score": item.score, "classification": item.classification,
+                 "capacity_reasons": list(item.details.get("capacity_reasons") or []),
+                 "confidence_classification": item.details.get("confidence_classification"),
+                 "uncertainty": item.details.get("uncertainty")}
+                for item in ranked
+            ]
+            reason = "No current opportunity justified additional exposure after account-capacity, evidence, and portfolio checks."
+            self.telemetry.increment("no_trade_decisions")
+            self.telemetry.increment("capacity_blocks", len(ranked))
+            await db.record_execution_event(
+                account_mode=self.settings.trading_mode, symbol="PORTFOLIO", status="no_trade_decision",
+                reason=reason, details={"decision": "NO_TRADE", "category": "capacity_or_evidence", "account_state": account_state, "low_capital": low_capital, "open_position_count": len(positions), "protected_position_count": protected_count, "ranked_candidates": reasons},
+            )
+            self._set_scan_gate("NO_TRADE_CAPACITY", reason, analysis_symbols=len(scan_symbols), candidates=len(ranked), decision="NO_TRADE", account_state=account_state)
+            await self._chart_activity(
+                "no_trade_decision", "PORTFOLIO",
+                f"🟡 **NO TRADE — CURRENT CAPACITY DECISION**\nAnalyzed: `{len(scan_symbols)}` | Candidates: `{len(ranked)}` | Account state: `{account_state}`\nReason: {reason}\nExisting positions remain under broker-confirmed protection.",
+                fingerprint=f"{account_state}:{len(ranked)}:{len(positions)}:{objective_progress}", essential=True,
+            )
+            logger.info("[NO TRADE] %s details=%s", reason, reasons)
+            return
+        best = eligible[0]
+        best.details["why_selected"] = f"Highest-ranked capacity-eligible opportunity at {best.score:.1f}; account state, evidence, uncertainty, and existing exposure were considered."
+        for item in ranked:
+            if item is not best:
+                item.details["why_not_selected"] = item.details.get("why_not_selected") or f"Not selected because the capacity-eligible leader ranked above it; candidate capacity reasons: {', '.join(item.details.get('capacity_reasons') or []) or 'none recorded'}."
         self.last_opportunity_ranking = [
             {"symbol": item.symbol, "score": item.score, "classification": item.classification,
              "rationale": list(item.rationale), "context": dict(item.context),
              "portfolio_conflict": item.portfolio_conflict, "details": dict(item.details)}
             for item in ranked
         ]
-        best = ranked[0]
         selected = by_symbol[best.symbol]
         self._set_scan_gate(
             "FINAL_EXECUTION_GATE", "Strongest current thesis is undergoing final broker, sizing, and portfolio validation.",
@@ -2237,7 +2324,7 @@ class MarketScheduler:
         logger.info("[OPPORTUNITY RANKING] candidates=%s selected=%s score=%.2f regime=%s", len(ranked), best.symbol, best.score, best.context.get("regime"))
         await self._chart_activity(
             "best_opportunity", selected.symbol,
-            f"🎯 **BEST CURRENT OPPORTUNITY — {selected.symbol}**\nRank: `1/{len(ranked)}` | Opportunity score: `{best.score:.1f}`\nRegime: `{best.context.get('regime', 'UNKNOWN')}` | Strategy: `{getattr(selected, 'selected_strategy', selected.setup_type)}`\nDirection: `{selected.direction}` | Strategy evidence: `{dict(getattr(selected, 'strategy_evidence', {}) or {}).get('confidence', 'UNKNOWN')}`\nThesis: {'; '.join(best.rationale)}\nOnly this strongest current thesis proceeds to final broker and portfolio validation.",
+            f"🎯 **BEST CURRENT OPPORTUNITY — {selected.symbol}**\nRank: `1/{len(ranked)}` | Opportunity score: `{best.score:.1f}` | Confidence: `{best.details.get('confidence_classification', 'UNKNOWN')}`\nRegime: `{best.context.get('regime', 'UNKNOWN')}` | Strategy: `{getattr(selected, 'selected_strategy', selected.setup_type)}`\nDirection: `{selected.direction}` | Strategy evidence: `{dict(getattr(selected, 'strategy_evidence', {}) or {}).get('confidence', 'UNKNOWN')}`\nThesis: {'; '.join(best.rationale)}\nOnly this strongest capacity-eligible thesis proceeds to final broker and portfolio validation.",
             fingerprint=f"{selected.setup_id}:opportunity:{best.score:.4f}",
         )
         primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"

@@ -1011,6 +1011,8 @@ class BotHandlers:
                 f"MAE {details.get('average_mae_r') if details.get('average_mae_r') is not None else 'UNKNOWN'}R | MFE {details.get('average_mfe_r') if details.get('average_mfe_r') is not None else 'UNKNOWN'}R | target-reach {details.get('target_reach_probability') if details.get('target_reach_probability') is not None else 'UNKNOWN'} | geometry present: {'YES' if details.get('execution_geometry_present') else 'NO'}",
                 f"Entry {details.get('entry')} | SL {details.get('stop_loss')} | TP {details.get('take_profit')} | actual RR 1:{float(details.get('rr') or 0.0):.2f}",
                 f"Layering evidence-supported: {'YES' if details.get('layering_suitability') else 'NO'} | Portfolio impact: {float(details.get('portfolio_conflict') or 0.0):.1f}",
+                f"Confidence class: {details.get('confidence_classification') or 'UNKNOWN'} | Capacity eligible: {'YES' if details.get('capacity_allowed') else 'NO'} | Account state: {details.get('account_state') or 'UNKNOWN'} | Low capital: {'YES' if details.get('low_capital') else 'NO'}",
+                f"Capacity reasons: {'; '.join(details.get('capacity_reasons') or ['none recorded'])} | Peer correlation: {details.get('maximum_peer_correlation') if details.get('maximum_peer_correlation') is not None else 'UNAVAILABLE'}",
                 "Thesis: " + "; ".join(item.get("rationale") or ["no descriptive thesis available"]),
                 "Selection: " + (details.get("why_selected") or details.get("why_not_selected") or "comparative explanation unavailable"),
             ])

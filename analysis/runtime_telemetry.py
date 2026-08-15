@@ -27,6 +27,7 @@ class RuntimeTelemetry:
         "sizing_checked", "sizing_rejected", "margin_checked", "execution_approved",
         "trade_candidates", "orders_submitted", "orders_filled", "orders_rejected",
         "positions_checked", "positions_modified", "positions_closed",
+        "no_trade_decisions", "capacity_blocks", "opportunity_alternatives",
         "observations", "experiments", "optimization_runs",
     )
 

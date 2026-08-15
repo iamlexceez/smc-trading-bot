@@ -59,6 +59,11 @@ class ExperimentalPolicy:
     daily_target_pct: Optional[float] = None
     max_positions: Optional[int] = None
     max_trades_per_day: Optional[int] = None
+    # Cross-symbol selection and concentration are research variables. They do
+    # not replace broker validation, account-state blocking, or execution gates.
+    selection_model: str = "evidence_capacity"
+    concentration_model: str = "adaptive"
+    low_capital_entry_model: str = "high_confidence_only"
     symbol_cooldown_minutes: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -160,6 +165,18 @@ class HypothesisEngine:
                 source="bootstrap_policy_space",
                 candidate_values=(0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0),
             ),
+            Hypothesis(
+                key="concentration_policy",
+                statement="Compare one highest-ranked opportunity with two or three independently justified positions using retained profit, drawdown, margin utilization, and objective completion evidence.",
+                source="bootstrap_policy_space",
+                candidate_values=(1, 2, 3),
+            ),
+            Hypothesis(
+                key="low_capital_selectivity",
+                statement="When capital is scarce, compare high-confidence-only entry selection with evidence-supported exploration and measure retained profit, drawdown, and target progress rather than assuming the stricter choice is optimal.",
+                source="bootstrap_policy_space",
+                candidate_values=("high_confidence_only", "evidence_supported"),
+            ),
         ]
         if not completed:
             return hypotheses
@@ -197,12 +214,18 @@ class PolicyGenerator:
         """
         rr_values: tuple[Optional[float], ...] = (None,)
         risk_values: tuple[Optional[float], ...] = (0.75,)
+        max_position_values: tuple[Optional[int], ...] = (None,)
+        low_capital_entry_models: tuple[str, ...] = ("high_confidence_only",)
         feature_variants: list[tuple[str, ...]] = [()]
         for hypothesis in hypotheses:
             if hypothesis.key == "rr_policy":
                 rr_values = tuple(float(value) for value in hypothesis.candidate_values)
             elif hypothesis.key == "risk_policy":
                 risk_values = tuple(float(value) for value in hypothesis.candidate_values)
+            elif hypothesis.key == "concentration_policy":
+                max_position_values = tuple(max(1, int(value)) for value in hypothesis.candidate_values)
+            elif hypothesis.key == "low_capital_selectivity":
+                low_capital_entry_models = tuple(str(value) for value in hypothesis.candidate_values if str(value)) or low_capital_entry_models
             elif hypothesis.feature and hypothesis.candidate_values:
                 feature_variants.append((hypothesis.feature,))
 
@@ -242,6 +265,10 @@ class PolicyGenerator:
                 max_layers=layers,
                 layer_style=layer_style,
                 layer_allocation=allocation,
+                max_positions=max_position_values[index % len(max_position_values)],
+                selection_model="evidence_capacity",
+                concentration_model=("single_best" if max_position_values[index % len(max_position_values)] == 1 else "adaptive_capacity"),
+                low_capital_entry_model=low_capital_entry_models[index % len(low_capital_entry_models)],
                 **management,
             )
             if policy.fingerprint in seen:

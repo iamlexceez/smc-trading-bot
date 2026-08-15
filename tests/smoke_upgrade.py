@@ -108,6 +108,41 @@ def test_opportunity_context_and_ranking() -> None:
     assert_true("strategy" in ranked[0].details and "confidence" in ranked[0].details and "thesis" in ranked[0].details, "opportunity board did not retain complete strategy thesis details")
 
 
+def test_capacity_aware_opportunity_selection() -> None:
+    def candidate(symbol: str, evidence: dict, policy: dict | None = None) -> SimpleNamespace:
+        return SimpleNamespace(
+            symbol=symbol, score=85.0, selected_strategy="continuation", strategy_score=80.0,
+            strategy_evidence=evidence, expected_value_r=0.5, entry_price=100.0,
+            stop_loss=99.0, take_profit=102.0, direction="BUY", timeframe="M15",
+            htf_bias=["BULLISH"], layering_suitable=False,
+            experimental_policy=policy or {"max_positions": 1, "low_capital_entry_model": "high_confidence_only"},
+        )
+
+    contexts = {
+        "Weak Evidence": {"regime": "TRENDING", "adx": 30.0, "atr_ratio": 1.0, "momentum": 0.4, "return_signature": [0.01, 0.02, 0.01, 0.02]},
+        "Strong Evidence": {"regime": "TRENDING", "adx": 30.0, "atr_ratio": 1.0, "momentum": 0.4, "return_signature": [0.01, 0.02, 0.01, 0.02]},
+    }
+    ranked = rank_opportunities(
+        [
+            candidate("Weak Evidence", {"sample_size": 0}),
+            candidate("Strong Evidence", {"sample_size": 10, "expectancy_r": 0.5, "recent_expectancy_r": 0.4, "expectancy_ci95_low_r": 0.1}),
+        ],
+        profiles={}, contexts=contexts,
+        historical={},
+        capacity_context={"account_state": "LOW_CAPITAL", "low_capital": True, "new_exposure_allowed": True, "open_position_count": 0, "minimum_evidence_sample": 10},
+    )
+    by_symbol = {item.symbol: item for item in ranked}
+    assert_true(by_symbol["Strong Evidence"].details["capacity_allowed"], "low-capital selection rejected an A+ evidence-supported opportunity")
+    assert_true(not by_symbol["Weak Evidence"].details["capacity_allowed"] and "A+ / high-confidence" in " ".join(by_symbol["Weak Evidence"].details["capacity_reasons"]), "low-capital selection admitted an under-evidenced candidate")
+    assert_true(by_symbol["Strong Evidence"].details["maximum_peer_correlation"] is not None, "closed-candle peer correlation was not reported")
+    blocked = rank_opportunities(
+        [candidate("Blocked", {"sample_size": 50, "expectancy_r": 0.5})], profiles={},
+        contexts={"Blocked": contexts["Strong Evidence"]}, historical={},
+        capacity_context={"account_state": "MARGIN_PRESSURE", "low_capital": True, "new_exposure_allowed": False, "open_position_count": 0, "minimum_evidence_sample": 10},
+    )
+    assert_true(not blocked[0].details["capacity_allowed"] and "blocks new exposure" in " ".join(blocked[0].details["capacity_reasons"]), "broker account-state capacity block was not enforced in opportunity selection")
+
+
 def test_strategy_registry_and_selection() -> None:
     assert_true(len(definitions()) >= 10, "strategy registry did not expose the declared strategy families")
     trending = applicable_strategies("TRENDING", "M15", {"structure_event", "displacement", "htf_alignment"})
@@ -645,6 +680,7 @@ async def test_experiment_engine_persistence() -> None:
     assert_true(accepted and not rejected, "policy feature hypotheses were not applied explicitly")
     policies = PolicyGenerator().generate(HypothesisEngine().generate([]), limit=100)
     assert_true(any(item.risk_pct == 7.5 for item in policies), "risk search space omitted aggressive experimental values")
+    assert_true({1, 2, 3}.issubset({item.max_positions for item in policies}), "concentration challenger search space did not include one-, two-, and three-position alternatives")
     evaluation = PolicyEvaluator.evaluate([{"pnl_r": 2.0}, {"pnl_r": -1.0}, {"pnl_r": 1.0}])
     assert_true(evaluation.sample_size == 3 and evaluation.expectancy_r > 0, "policy evaluation did not use actual R outcomes")
 
@@ -1697,6 +1733,7 @@ def run() -> None:
     test_scanner_gate_telemetry()
     test_runtime_telemetry()
     test_opportunity_context_and_ranking()
+    test_capacity_aware_opportunity_selection()
     test_strategy_registry_and_selection()
     test_full_precision_rr_validation()
     asyncio.run(test_single_flight_scan_guard())

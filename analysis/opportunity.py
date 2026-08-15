@@ -127,6 +127,9 @@ def market_context(frame: pd.DataFrame) -> dict[str, Any]:
         "range_ratio": range_ratio,
         "displacement_ratio": displacement_ratio,
         "confidence": "OBSERVED",
+        # Compact closed-candle return evidence supports transparent candidate
+        # correlation reporting; it never creates an entry signal by itself.
+        "return_signature": [round(float(value), 8) for value in close.pct_change().tail(40).fillna(0.0).tolist()],
     }
 
 
@@ -141,9 +144,25 @@ class Opportunity:
     details: dict[str, Any] = field(default_factory=dict)
 
 
+def _return_correlation(first: Any, second: Any) -> float | None:
+    """Return absolute Pearson correlation when both closed-candle signatures exist."""
+    try:
+        left = np.asarray(list(first or []), dtype=float)
+        right = np.asarray(list(second or []), dtype=float)
+        if len(left) < 3 or len(right) < 3 or len(left) != len(right):
+            return None
+        if float(np.std(left)) <= 1e-12 or float(np.std(right)) <= 1e-12:
+            return None
+        value = float(np.corrcoef(left, right)[0, 1])
+        return abs(value) if math.isfinite(value) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def rank_opportunities(
     candidates: Iterable[Any], *, profiles: dict[str, Any], contexts: dict[str, dict[str, Any]],
     historical: dict[str, dict[str, Any]], open_symbols: Iterable[str] = (),
+    capacity_context: dict[str, Any] | None = None,
 ) -> list[Opportunity]:
     """Rank existing eligible candidates without converting rankings into entries.
 
@@ -153,6 +172,12 @@ def rank_opportunities(
     checks that follow it.
     """
     open_set = {str(item) for item in open_symbols}
+    capacity = dict(capacity_context or {})
+    account_state = str(capacity.get("account_state") or "ACCOUNT_STATE_UNKNOWN")
+    low_capital = bool(capacity.get("low_capital"))
+    minimum_evidence_sample = max(0, int(_finite(capacity.get("minimum_evidence_sample"), 0)))
+    new_exposure_allowed = bool(capacity.get("new_exposure_allowed", True))
+    open_position_count = max(0, int(_finite(capacity.get("open_position_count"), 0)))
     ranked: list[Opportunity] = []
     for signal in candidates:
         symbol = str(signal.symbol)
@@ -186,6 +211,41 @@ def rank_opportunities(
         geometry_fit = 1.0 if geometry_valid else 0.0
         conflict = 1.0 if symbol in open_set else 0.0
         uncertainty = uncertainty_label(sample, conservative_ev, conflict=bool(conflict))
+        technical_high_confidence = quality >= 80.0 and strategy_score >= 70.0
+        evidence_high_confidence = sample >= minimum_evidence_sample and conservative_ev > 0.0 if minimum_evidence_sample > 0 else conservative_ev > 0.0
+        confidence_class = (
+            "CONFLICTED" if conflict else
+            "A_PLUS_HIGH_CONFIDENCE" if technical_high_confidence and evidence_high_confidence else
+            "GOOD" if quality >= 60.0 and geometry_valid else
+            "MARGINAL" if geometry_valid else
+            "INSUFFICIENT_EVIDENCE"
+        )
+        policy = dict(getattr(signal, "experimental_policy", {}) or {})
+        max_positions = policy.get("max_positions")
+        capacity_reasons: list[str] = []
+        if not new_exposure_allowed:
+            capacity_reasons.append(f"account state {account_state} blocks new exposure")
+        if conflict:
+            capacity_reasons.append("existing same-instrument exposure")
+        if max_positions is not None:
+            try:
+                if open_position_count >= int(max_positions):
+                    capacity_reasons.append(f"policy capacity {open_position_count}/{int(max_positions)} is full")
+            except (TypeError, ValueError):
+                capacity_reasons.append("invalid policy position capacity")
+        low_capital_entry_model = str(policy.get("low_capital_entry_model") or "high_confidence_only")
+        if low_capital and low_capital_entry_model == "high_confidence_only" and confidence_class != "A_PLUS_HIGH_CONFIDENCE":
+            capacity_reasons.append("low-capital policy requires A+ / high-confidence evidence")
+        capacity_allowed = not capacity_reasons
+        peer_correlations = []
+        signature = context.get("return_signature")
+        for other_symbol, other_context in contexts.items():
+            if other_symbol == symbol:
+                continue
+            correlation = _return_correlation(signature, dict(other_context or {}).get("return_signature"))
+            if correlation is not None:
+                peer_correlations.append(correlation)
+        max_peer_correlation = max(peer_correlations, default=None)
         score = quality * 0.45 + strategy_score * 0.10 + adx * 8.0 + volatility_fit * 7.0 + momentum * 6.0 + evidence_strength * 12.0 + target_reach_fit * 4.0 + profile_expectancy * 4.0 + geometry_fit * 4.0 - conflict * 18.0
         rationale = [f"setup quality {quality:.1f}/100", f"{context.get('regime', 'UNKNOWN').lower()} regime", f"strategy {selected_strategy} score {strategy_score:.1f}/100"]
         if evidence_strength > 0:
@@ -197,6 +257,12 @@ def rank_opportunities(
         rationale.append("geometry present" if geometry_valid else "geometry incomplete; broker execution must withhold")
         if conflict:
             rationale.append("existing same-instrument exposure")
+        if max_peer_correlation is not None:
+            rationale.append(f"maximum peer return correlation {max_peer_correlation:.2f}")
+        if low_capital:
+            rationale.append("low-capital account state increases selectivity and protection priority")
+        if capacity_reasons:
+            rationale.append("capacity decision: " + "; ".join(capacity_reasons))
         classification = "BEST_OPPORTUNITY" if score >= 65.0 else ("GOOD_OPPORTUNITY" if score >= 45.0 else "WATCHLIST")
         details = {
             "instrument": symbol,
@@ -219,6 +285,16 @@ def rank_opportunities(
             "target_reach_probability": target_reach,
             "confidence": strategy_evidence.get("confidence", "UNKNOWN"),
             "uncertainty": uncertainty,
+            "confidence_classification": confidence_class,
+            "capacity_allowed": capacity_allowed,
+            "capacity_reasons": list(capacity_reasons),
+            "account_state": account_state,
+            "low_capital": low_capital,
+            "open_position_count": open_position_count,
+            "protected_position_count": int(_finite(capacity.get("protected_position_count"), 0)),
+            "objective_progress": capacity.get("objective_progress"),
+            "maximum_peer_correlation": max_peer_correlation,
+            "correlation_observation": "closed-candle candidate correlation" if max_peer_correlation is not None else "not available",
             "evidence_stage": strategy_evidence.get("evidence_stage", "exploration"),
             "sample_size": strategy_evidence.get("sample_size", 0),
             "average_mae_r": strategy_evidence.get("average_mae_r"),
@@ -246,6 +322,7 @@ def rank_opportunities(
             gap = top.score - item.score
             details["why_selected"] = ""
             details["why_not_selected"] = f"Ranked #{index}, {gap:.1f} points behind the leading opportunity; review its uncertainty, evidence, and portfolio impact before selection."
+            details["capacity_allowed"] = bool(details.get("capacity_allowed", True))
             ranked[index - 1] = Opportunity(item.symbol, item.score, item.classification, item.rationale, item.context, item.portfolio_conflict, details)
     return ranked
 
