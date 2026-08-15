@@ -447,6 +447,19 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 FOREIGN KEY(basket_id) REFERENCES trade_baskets(id)
             )
         """)
+        await _ensure_column(db, "research_hypotheses", "classification", "TEXT NOT NULL DEFAULT 'HYPOTHESIS'")
+        await _ensure_column(db, "research_hypotheses", "why_proposed", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "data_tested_json", "TEXT NOT NULL DEFAULT '[]'")
+        await _ensure_column(db, "research_hypotheses", "sample_size", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "research_hypotheses", "historical_sample_size", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "research_hypotheses", "forward_sample_size", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "research_hypotheses", "result", "TEXT NOT NULL DEFAULT 'Not tested yet'")
+        await _ensure_column(db, "research_hypotheses", "evidence_strength", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        await _ensure_column(db, "research_hypotheses", "decision", "TEXT NOT NULL DEFAULT 'INCONCLUSIVE'")
+        await _ensure_column(db, "research_hypotheses", "current_plan", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "what_would_change", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "live_promotion_allowed", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "research_hypotheses", "last_tested_at", "TEXT")
         await _ensure_column(db, "demo_sessions", "objective_id", "INTEGER")
         await _ensure_column(db, "demo_sessions", "objective_version", "INTEGER")
         await _ensure_column(db, "objective_phases", "session_phase_number", "INTEGER")
@@ -498,6 +511,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_model_versions_mode_role ON model_versions(account_mode, role, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_objectives_mode_status ON trading_objectives(account_mode, status, id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hypotheses_mode_status ON research_hypotheses(account_mode, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_hypotheses_decision ON research_hypotheses(account_mode, decision, evidence_strength)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_experiments_mode_status ON policy_experiments(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_demo_sessions_login_status ON demo_sessions(broker_login, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_demo_sessions_objective ON demo_sessions(objective_id, id)")
@@ -1001,6 +1015,18 @@ async def upsert_research_hypothesis(
     feature_name: Optional[str],
     candidate_values: list | tuple,
     evidence: Optional[dict] = None,
+    classification: str = "HYPOTHESIS",
+    why_proposed: str = "",
+    data_tested: Optional[list | tuple] = None,
+    sample_size: int = 0,
+    historical_sample_size: int = 0,
+    forward_sample_size: int = 0,
+    result: str = "Not tested yet",
+    evidence_strength: str = "UNKNOWN",
+    decision: str = "INCONCLUSIVE",
+    current_plan: str = "",
+    what_would_change: str = "",
+    live_promotion_allowed: bool = False,
     db_path: str = DB_PATH,
 ) -> int:
     """Persist a falsifiable research hypothesis without overwriting prior evidence."""
@@ -1009,14 +1035,35 @@ async def upsert_research_hypothesis(
         await conn.execute(
             """INSERT INTO research_hypotheses
                (account_mode, hypothesis_key, statement, source, feature_name,
-                candidate_values_json, evidence_json, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                candidate_values_json, evidence_json, classification, why_proposed,
+                data_tested_json, sample_size, historical_sample_size, forward_sample_size,
+                result, evidence_strength, decision, current_plan, what_would_change,
+                live_promotion_allowed, status, created_at, last_tested_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
                ON CONFLICT(account_mode, hypothesis_key, statement) DO UPDATE SET
                  evidence_json = excluded.evidence_json,
+                 classification = excluded.classification,
+                 why_proposed = excluded.why_proposed,
+                 data_tested_json = excluded.data_tested_json,
+                 sample_size = excluded.sample_size,
+                 historical_sample_size = excluded.historical_sample_size,
+                 forward_sample_size = excluded.forward_sample_size,
+                 result = excluded.result,
+                 evidence_strength = excluded.evidence_strength,
+                 decision = excluded.decision,
+                 current_plan = excluded.current_plan,
+                 what_would_change = excluded.what_would_change,
+                 live_promotion_allowed = 0,
+                 last_tested_at = excluded.last_tested_at,
                  status = CASE WHEN research_hypotheses.status = 'archived' THEN 'archived' ELSE 'open' END""",
             (
                 account_mode, hypothesis_key, statement, source, feature_name,
-                json.dumps(list(candidate_values)), json.dumps(evidence or {}, sort_keys=True), now,
+                json.dumps(list(candidate_values)), json.dumps(evidence or {}, sort_keys=True),
+                str(classification or "HYPOTHESIS"), str(why_proposed or ""), json.dumps(list(data_tested or [])),
+                max(0, int(sample_size or 0)), max(0, int(historical_sample_size or 0)), max(0, int(forward_sample_size or 0)),
+                str(result or "Not tested yet"), str(evidence_strength or "UNKNOWN"), str(decision or "INCONCLUSIVE"),
+                str(current_plan or ""), str(what_would_change or ""), 0, now,
+                now if int(sample_size or 0) > 0 else None,
             ),
         )
         cursor = await conn.execute(
@@ -2913,3 +2960,117 @@ async def get_strategy_transition_evidence_for_context(
         )
         rows = [dict(row) for row in await cursor.fetchall()]
     return {row["strategy_id"]: row for row in rows}
+
+
+async def ensure_expert_knowledge_seeded(account_mode: str = "demo", db_path: str = DB_PATH) -> int:
+    """Seed user-supplied methodology claims once as open, unverified hypotheses."""
+    from analysis.expert_knowledge import catalog_rows
+
+    rows = catalog_rows()
+    now = datetime.utcnow().isoformat()
+    inserted = 0
+    async with aiosqlite.connect(db_path) as conn:
+        for item in rows:
+            cursor = await conn.execute(
+                """INSERT OR IGNORE INTO research_hypotheses
+                   (account_mode, hypothesis_key, statement, source, feature_name,
+                    candidate_values_json, evidence_json, classification, why_proposed,
+                    data_tested_json, sample_size, historical_sample_size, forward_sample_size,
+                    result, evidence_strength, decision, current_plan, what_would_change,
+                    live_promotion_allowed, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, 0, 0, 0, 'Not tested yet',
+                           'UNKNOWN', 'INCONCLUSIVE', ?, ?, 0, 'open', ?)""",
+                (
+                    account_mode, item["key"], item["statement"], "user_supplied_expert_methodology",
+                    item["feature_name"], json.dumps(list(item["candidate_values"])), item["classification"],
+                    item["why_proposed"], json.dumps(list(item["data_to_test"])), item["current_plan"],
+                    item["what_would_change"], now,
+                ),
+            )
+            inserted += int(cursor.rowcount or 0)
+        await conn.commit()
+    return inserted
+
+
+async def record_expert_hypothesis_test(
+    *,
+    account_mode: str,
+    hypothesis_key: str,
+    data_tested: list | tuple,
+    sample_size: int,
+    historical_sample_size: int,
+    forward_sample_size: int,
+    expectancy_r: Optional[float],
+    ci_low_r: Optional[float],
+    ci_high_r: Optional[float],
+    result: str,
+    evidence: Optional[dict] = None,
+    db_path: str = DB_PATH,
+) -> dict:
+    """Record a dated hypothesis result; only governed DEMO evidence can update it."""
+    from analysis.expert_knowledge import evaluate_hypothesis_evidence
+
+    evaluation = evaluate_hypothesis_evidence(
+        sample_size=sample_size, expectancy_r=expectancy_r,
+        ci_low_r=ci_low_r, ci_high_r=ci_high_r,
+        forward_sample_size=forward_sample_size,
+        historical_sample_size=historical_sample_size,
+    )
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM research_hypotheses WHERE account_mode = ? AND hypothesis_key = ? ORDER BY id LIMIT 1",
+            (account_mode, hypothesis_key),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise ValueError(f"Unknown expert hypothesis: {hypothesis_key}")
+        details = dict(json.loads(row["evidence_json"] or "{}"))
+        details.update(evidence or {})
+        details.update({
+            "expectancy_r": expectancy_r, "ci95_low_r": ci_low_r,
+            "ci95_high_r": ci_high_r, "result": result,
+            "recorded_at": now, "provenance": "DEMO_RESEARCH_EVIDENCE",
+        })
+        await conn.execute(
+            """UPDATE research_hypotheses SET data_tested_json = ?, sample_size = ?,
+               historical_sample_size = ?, forward_sample_size = ?, result = ?,
+               evidence_json = ?, evidence_strength = ?, decision = ?,
+               live_promotion_allowed = 0, last_tested_at = ? WHERE id = ?""",
+            (
+                json.dumps(list(data_tested)), int(evaluation["sample_size"]),
+                int(evaluation["historical_sample_size"]), int(evaluation["forward_sample_size"]),
+                str(result or "Observed result recorded"), json.dumps(details, sort_keys=True),
+                evaluation["evidence_strength"], evaluation["decision"], now, int(row["id"]),
+            ),
+        )
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM research_hypotheses WHERE id = ?", (int(row["id"]),))
+        updated = dict(await cursor.fetchone())
+    for key in ("candidate_values_json", "data_tested_json", "evidence_json"):
+        raw = updated.pop(key, "[]" if key != "evidence_json" else "{}")
+        updated[key.removesuffix("_json")] = json.loads(raw or ("{}" if key == "evidence_json" else "[]"))
+    updated["live_promotion_allowed"] = False
+    return updated
+
+
+async def get_expert_knowledge_journal(
+    account_mode: str = "demo", *, include_archived: bool = True,
+    limit: int = 100, db_path: str = DB_PATH,
+) -> list[dict]:
+    """Return the plain persistence view of expert claims and test provenance."""
+    where = "" if include_archived else " AND status != 'archived'"
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            f"SELECT * FROM research_hypotheses WHERE account_mode = ?{where} ORDER BY created_at ASC, id ASC LIMIT ?",
+            (account_mode, max(1, int(limit))),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    for row in rows:
+        row["candidate_values"] = json.loads(row.pop("candidate_values_json") or "[]")
+        row["data_tested"] = json.loads(row.pop("data_tested_json") or "[]")
+        row["evidence"] = json.loads(row.pop("evidence_json") or "{}")
+        row["live_promotion_allowed"] = False
+    return rows

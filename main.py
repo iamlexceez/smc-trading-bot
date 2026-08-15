@@ -150,6 +150,7 @@ async def main():
         BotCommand("engine", "Actual scheduler, scanner, analysis, execution, and task diagnostics"),
         BotCommand("learning", "Measured learning status"),
         BotCommand("learned", "Plain-language objective and strategy evidence"),
+        BotCommand("knowledge", "Expert methodology hypotheses and evidence journal"),
         BotCommand("opportunities", "Current ranked strategy opportunity board"),
         BotCommand("experiments", "Policy experiment lifecycle"),
         BotCommand("champion", "Current validated champion policy"),

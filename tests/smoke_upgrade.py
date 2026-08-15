@@ -27,6 +27,7 @@ from analysis.structure import analyze_structure
 from analysis.supply_demand import detect_sd_zones
 from analysis.confirmation import detect_inside_bar_breakout
 from analysis.evidence import completed_outcome_statistics
+from analysis.expert_knowledge import DEFAULT_EXPERT_HYPOTHESES, evaluate_hypothesis_evidence, evidence_strength
 from analysis.liquidity import build_liquidity_pools
 from execution.manager import ManagementState, TradeManager
 from executors.base import Position
@@ -124,6 +125,31 @@ def test_strategy_registry_and_selection() -> None:
     assert_true(evidence_class(20, 0.2) == "PROMISING" and evidence_class(60, -0.2) == "VALIDATED", "confidence bands did not use the documented completed-outcome sample sizes")
 
 
+def test_expert_hypothesis_evidence_classifier() -> None:
+    assert_true(evidence_strength(0) == "UNKNOWN" and evidence_strength(3) == "EARLY" and evidence_strength(50) == "VALIDATED", "expert hypothesis evidence-depth bands are incorrect")
+    early = evaluate_hypothesis_evidence(sample_size=5, expectancy_r=0.8, ci_low_r=-0.5, ci_high_r=1.5, historical_sample_size=5, forward_sample_size=5)
+    assert_true(early["decision"] == "INCONCLUSIVE" and not early["promotion_eligible"] and not early["live_promotion_allowed"], "small expert hypothesis samples were overstated")
+    robust = evaluate_hypothesis_evidence(sample_size=60, expectancy_r=0.4, ci_low_r=0.1, ci_high_r=0.7, historical_sample_size=40, forward_sample_size=55)
+    assert_true(robust["decision"] == "SUPPORTED" and robust["promotion_eligible"] and not robust["live_promotion_allowed"], "robust DEMO hypothesis evidence was not classified conservatively for LIVE")
+
+
+async def test_expert_knowledge_journal_persistence() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "expert_knowledge.db")
+        await db.init_db(path)
+        inserted = await db.ensure_expert_knowledge_seeded("demo", path)
+        journal = await db.get_expert_knowledge_journal("demo", db_path=path)
+        assert_true(inserted == len(DEFAULT_EXPERT_HYPOTHESES) and len(journal) == len(DEFAULT_EXPERT_HYPOTHESES), "expert methodology claims were not seeded idempotently")
+        assert_true(all(row["classification"] in {"HYPOTHESIS", "LEARNABLE_PARAMETER"} and row["decision"] == "INCONCLUSIVE" and not row["live_promotion_allowed"] for row in journal), "expert claims were seeded as permanent or LIVE-ready rules")
+        updated = await db.record_expert_hypothesis_test(
+            account_mode="demo", hypothesis_key=DEFAULT_EXPERT_HYPOTHESES[0].key,
+            data_tested=["historical_replay", "forward_demo"], sample_size=60,
+            historical_sample_size=40, forward_sample_size=55, expectancy_r=0.4,
+            ci_low_r=0.1, ci_high_r=0.7, result="Positive result in the tested context.", db_path=path,
+        )
+        assert_true(updated["decision"] == "SUPPORTED" and updated["evidence_strength"] == "VALIDATED" and not updated["live_promotion_allowed"], "expert hypothesis test result was not persisted with provenance and LIVE prohibition")
+
+
 async def test_strategy_evidence_persistence() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "strategy_evidence.db")
@@ -185,6 +211,7 @@ def test_pause_resume_command_registration() -> None:
     command_sets = [set(getattr(handler, "commands", set())) for handler in registered]
     assert_true(any("resume" in commands for commands in command_sets), "implemented /resume handler is absent from Telegram command registration")
     assert_true(any("pause" in commands for commands in command_sets), "implemented /pause handler is absent from Telegram command registration")
+    assert_true(any("knowledge" in commands for commands in command_sets), "implemented /knowledge handler is absent from Telegram command registration")
 
 
 def test_scanner_gate_telemetry() -> None:
@@ -1615,6 +1642,8 @@ def run() -> None:
     asyncio.run(test_deriv_market_universe())
     asyncio.run(test_basket_persistence())
     asyncio.run(test_learning_telemetry_persistence())
+    test_expert_hypothesis_evidence_classifier()
+    asyncio.run(test_expert_knowledge_journal_persistence())
     asyncio.run(test_strategy_evidence_persistence())
     asyncio.run(test_strategy_transition_evidence_persistence())
     asyncio.run(test_model_governance_persistence())

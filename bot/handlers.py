@@ -529,6 +529,7 @@ class BotHandlers:
             "`/objective [set|confirm|start|cancel|history|explain|pause]` — saved objective template and explicit DEMO session controls\n"
             "`/session` — current saved-objective DEMO session\n"
             "`/learned` — plain-language evidence summary across saved objective sessions\n"
+            "`/knowledge` — persistent expert methodology hypotheses, tests, decisions, and uncertainties\n"
             "`/opportunities` — current ranked strategy, regime, evidence, and thesis board\n"
             "`/activity [detailed|essential|off]` — chart-study notification mode\n"
             "`/settings` — autonomy, alerts, and explicit DEMO/LIVE controls\n"
@@ -855,6 +856,53 @@ class BotHandlers:
             f"Collect at least `{self.settings.optimization_min_sample_size}` completed DEMO R-recorded outcomes, then compare independently specified policies through train, validation, out-of-sample, and forward-DEMO evidence. Broker and software integrity remain mandatory; risk, RR, features, layering, and management are experimental.",
         ]
         await self._render_menu(update, "\n".join(text))
+
+    @admin_only
+    async def cmd_knowledge(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show the supplied expert methodology as evidence-labelled hypotheses."""
+        await db.ensure_expert_knowledge_seeded("demo")
+        rows = await db.get_expert_knowledge_journal("demo", include_archived=False, limit=100)
+        lines = [
+            "🧪 EXPERT KNOWLEDGE / HYPOTHESIS JOURNAL",
+            "",
+            "The supplied SMC/ICT methodology is stored as prior knowledge. It is not a permanent rule set, does not force trades, and cannot authorize LIVE promotion.",
+            "",
+            "WHAT I WAS TAUGHT",
+            f"{len(rows)} claims were recorded from the user-supplied expert methodology package.",
+            "",
+            "WHAT ACTUALLY WORKS",
+        ]
+        supported = [row for row in rows if str(row.get("decision")) == "SUPPORTED"]
+        rejected = [row for row in rows if str(row.get("decision")) == "REJECTED"]
+        testing = [row for row in rows if str(row.get("decision")) not in {"SUPPORTED", "REJECTED"}]
+        if supported:
+            for row in supported[:4]:
+                lines.append(f"SUPPORTED — {row.get('hypothesis_key')}: n={int(row.get('sample_size') or 0)}, strength={row.get('evidence_strength') or 'UNKNOWN'}. {row.get('result') or ''}")
+        else:
+            lines.append("UNKNOWN — no claim currently has sufficient chronological forward-DEMO evidence for a supported conclusion.")
+        lines.extend(["", "WHAT DOES NOT WORK"])
+        if rejected:
+            for row in rejected[:4]:
+                lines.append(f"REJECTED — {row.get('hypothesis_key')}: n={int(row.get('sample_size') or 0)}. {row.get('result') or ''}")
+        else:
+            lines.append("UNKNOWN — no supplied claim has been rejected by sufficient evidence yet.")
+        lines.extend(["", "WHAT I AM STILL TESTING"])
+        if testing:
+            for row in testing[:8]:
+                lines.append(f"{row.get('hypothesis_key')} — {row.get('decision') or 'INCONCLUSIVE'} | {row.get('evidence_strength') or 'UNKNOWN'} | historical n={int(row.get('historical_sample_size') or 0)} | forward DEMO n={int(row.get('forward_sample_size') or 0)}")
+        else:
+            lines.append("No open hypothesis remains in the journal.")
+        lines.extend(["", "WHAT I CURRENTLY PLAN TO USE"])
+        planned = [row for row in rows if row.get("current_plan")]
+        if planned:
+            lines.extend(f"{row.get('hypothesis_key')}: {row.get('current_plan')}" for row in planned[:4])
+        else:
+            lines.append("Use existing broker-validated structure, strategy selection, and evidence governance; no expert claim is promoted as a fixed rule.")
+        lines.extend(["", "WHAT I CURRENTLY PLAN TO AVOID"])
+        lines.append("Avoid treating expert claims as proven, using a handful of trades as confirmation, look-ahead data, forced entries, or automatic LIVE promotion.")
+        lines.extend(["", "WHAT WOULD CHANGE THE DECISION"])
+        lines.append("A claim requires chronological historical/replay evidence plus forward-DEMO evidence with sample size, expectancy, uncertainty, MAE/MFE, drawdown, and instrument/regime/timeframe partitions. LIVE activation remains manual-only.")
+        await self._render_plain_menu(update, "\n".join(lines))
 
     @admin_only
     async def cmd_learned(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2643,6 +2691,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("demo_auto_resume", self.cmd_demo_auto_resume))
         app.add_handler(CommandHandler("learning", self.cmd_learning))
         app.add_handler(CommandHandler("learned", self.cmd_learned))
+        app.add_handler(CommandHandler("knowledge", self.cmd_knowledge))
         app.add_handler(CommandHandler("opportunities", self.cmd_opportunities))
         app.add_handler(CommandHandler("session", self.cmd_session))
         app.add_handler(CommandHandler("experiments", self.cmd_experiments))
