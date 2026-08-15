@@ -19,16 +19,17 @@ class RuntimeTelemetry:
     """Single-event-loop telemetry ledger with resettable heartbeat windows."""
 
     COUNTERS = (
-        "scan_cycles_started", "scan_cycles_completed", "scan_cycles_failed", "scan_cycles_skipped_overlap",
-        "symbols_attempted", "symbols_analyzed",
+        "scan_cycles_started", "scan_cycles_completed", "scan_cycles_failed", "scan_cycles_skipped_overlap", "scan_cycles_no_work", "scan_cycles_degraded",
+        "symbols_attempted", "symbols_analyzed", "symbols_rejected", "symbols_failed", "symbols_skipped", "symbols_deferred",
         "candle_requests", "successful_candle_requests", "failed_candle_requests",
+        "analysis_candle_requests", "position_management_candle_requests", "execution_candle_requests",
         "analysis_runs", "analysis_failures", "setups_detected", "setups_rejected",
         "setups_rr_checked", "setups_rr_passed", "setups_rr_rejected",
         "sizing_checked", "sizing_rejected", "margin_checked", "execution_approved",
         "trade_candidates", "orders_submitted", "orders_filled", "orders_rejected",
-        "positions_checked", "positions_modified", "positions_closed",
+        "positions_checked", "positions_requiring_action", "positions_modified", "sl_modifications", "tp_modifications", "positions_closed", "unprotected_profitable_positions",
         "no_trade_decisions", "capacity_blocks", "opportunity_alternatives",
-        "observations", "experiments", "optimization_runs",
+        "observations", "live_observations", "experiments", "optimization_runs",
     )
 
     COMPONENTS = (
@@ -57,6 +58,10 @@ class RuntimeTelemetry:
         return {
             "counters": {name: 0 for name in cls.COUNTERS},
             "timeframes": Counter(),
+            "candle_purposes": Counter(),
+            "candle_failures_by_purpose": Counter(),
+            "candle_samples": [],
+            "management_reasons": Counter(),
             "rejections": Counter(),
             "errors": Counter(),
         }
@@ -66,6 +71,7 @@ class RuntimeTelemetry:
         return {
             "state": "NOT_STARTED", "started_at": None, "last_started": None,
             "last_success": None, "last_failure": None, "last_error": None,
+            "reason": "Not started",
             "running": 0,
         }
 
@@ -78,20 +84,43 @@ class RuntimeTelemetry:
         state["started_at"] = state["started_at"] or now
         state["last_started"] = now
         state["state"] = "RUNNING"
+        state["reason"] = "Running"
         state["running"] = int(state.get("running") or 0) + 1
 
-    def component_succeeded(self, name: str, *, waiting: bool = False) -> None:
+    def component_succeeded(self, name: str, *, waiting: bool = False, state_override: str | None = None, reason: str | None = None) -> None:
+        component = self._component(name)
+        component["last_success"] = self._now()
+        component["last_error"] = None
+        component["running"] = max(0, int(component.get("running") or 0) - 1)
+        component["state"] = state_override or ("WAITING" if waiting else "RUNNING")
+        component["reason"] = reason or ("Waiting for work" if waiting else "Completed current operation")
+
+    def component_waiting(self, name: str, reason: str) -> None:
         state = self._component(name)
-        state["last_success"] = self._now()
-        state["last_error"] = None
-        state["running"] = max(0, int(state.get("running") or 0) - 1)
-        state["state"] = "WAITING" if waiting else "RUNNING"
+        state["state"] = "WAITING"
+        state["reason"] = str(reason)
+        state["running"] = 0
+
+    def component_blocked(self, name: str, reason: str) -> None:
+        state = self._component(name)
+        state["state"] = "BLOCKED"
+        state["reason"] = str(reason)
+        state["last_error"] = str(reason)
+        state["running"] = 0
+
+    def component_degraded(self, name: str, reason: str) -> None:
+        state = self._component(name)
+        state["state"] = "DEGRADED"
+        state["reason"] = str(reason)
+        state["last_error"] = str(reason)
+        state["running"] = 0
 
     def component_failed(self, name: str, error: BaseException | str) -> None:
         state = self._component(name)
         message = f"{type(error).__name__}: {error}" if isinstance(error, BaseException) else str(error)
         state["last_failure"] = self._now()
         state["last_error"] = message
+        state["reason"] = message
         state["running"] = max(0, int(state.get("running") or 0) - 1)
         state["state"] = "FAILED"
         self.record_error(f"{name}: {message}")
@@ -125,6 +154,27 @@ class RuntimeTelemetry:
         key = str(timeframe or "UNKNOWN")
         self._window["timeframes"][key] += int(amount)
         self._lifetime["timeframes"][key] += int(amount)
+
+    def record_candle_request(self, *, request_id: str, symbol: str, timeframe: str, purpose: str, scan_cycle_id: str | None, outcome: str) -> None:
+        """Record candle provenance without treating a data request as analysis."""
+        purpose_key = str(purpose or "unknown")
+        self._window["candle_purposes"][purpose_key] += 1
+        self._lifetime["candle_purposes"][purpose_key] += 1
+        if str(outcome).lower() not in {"success", "ok"}:
+            self._window["candle_failures_by_purpose"][purpose_key] += 1
+            self._lifetime["candle_failures_by_purpose"][purpose_key] += 1
+        sample = {
+            "request_id": str(request_id), "symbol": str(symbol), "timeframe": str(timeframe),
+            "purpose": purpose_key, "scan_cycle_id": scan_cycle_id, "outcome": str(outcome), "at": self._now(),
+        }
+        for ledger in (self._window, self._lifetime):
+            ledger["candle_samples"].append(sample)
+            del ledger["candle_samples"][:-100]
+
+    def record_management_reason(self, reason: str) -> None:
+        key = str(reason or "NO_ACTION_UNSPECIFIED")
+        self._window["management_reasons"][key] += 1
+        self._lifetime["management_reasons"][key] += 1
 
     def record_rejection(self, reason: str) -> None:
         key = str(reason or "Unspecified rejection")
@@ -162,6 +212,10 @@ class RuntimeTelemetry:
         return {
             "counters": dict(metrics["counters"]),
             "timeframes": dict(metrics["timeframes"]),
+            "candle_purposes": dict(metrics["candle_purposes"]),
+            "candle_failures_by_purpose": dict(metrics["candle_failures_by_purpose"]),
+            "candle_samples": list(metrics["candle_samples"]),
+            "management_reasons": dict(metrics["management_reasons"]),
             "rejections": dict(metrics["rejections"]),
             "errors": dict(metrics["errors"]),
         }

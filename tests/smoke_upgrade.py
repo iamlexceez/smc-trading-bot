@@ -277,11 +277,15 @@ def test_runtime_telemetry() -> None:
     telemetry.increment("symbols_attempted", 3)
     telemetry.increment("candle_requests", 6)
     telemetry.record_timeframe("M15", 3)
+    telemetry.record_candle_request(request_id="req-1", symbol="Volatility 75 Index", timeframe="M15", purpose="analysis", scan_cycle_id="cycle-1", outcome="success")
+    telemetry.record_management_reason("NO_ACTION_WAITING_FOR_1R")
     telemetry.record_rejection("No directional structure")
     telemetry.component_succeeded("market_scanner")
     first = telemetry.heartbeat_snapshot_and_reset()
     assert_true(first["window"]["counters"]["scan_cycles_started"] == 1, "heartbeat window lost a real scan start")
     assert_true(first["window"]["counters"]["symbols_attempted"] == 3 and first["window"]["timeframes"]["M15"] == 3, "runtime symbol/timeframe evidence is incorrect")
+    assert_true(first["window"]["candle_purposes"]["analysis"] == 1 and first["window"]["candle_samples"][0]["scan_cycle_id"] == "cycle-1", "candle provenance was not retained")
+    assert_true(first["window"]["management_reasons"]["NO_ACTION_WAITING_FOR_1R"] == 1, "management no-action reason was not retained")
     after = telemetry.snapshot()
     assert_true(after["window"]["counters"]["scan_cycles_started"] == 0, "heartbeat did not reset its activity window")
     assert_true(after["lifetime"]["counters"]["scan_cycles_started"] == 1, "lifetime telemetry was incorrectly reset")
@@ -289,6 +293,29 @@ def test_runtime_telemetry() -> None:
     telemetry.component_failed("analysis_engine", RuntimeError("fixture failure"))
     assert_true(after["components"]["market_scanner"]["last_success"], "component success state was not retained")
     assert_true(telemetry.snapshot()["components"]["analysis_engine"]["state"] == "FAILED", "component failure was not exposed")
+    assert_true(telemetry.snapshot()["components"]["analysis_engine"]["reason"].startswith("RuntimeError"), "component failure reason was not exposed")
+
+
+def test_scan_disposition_truthfulness() -> None:
+    engine = object.__new__(scheduler.MarketScheduler)
+    engine._active_scan_cycle_id = "cycle-zero"
+    engine._set_scan_disposition("ACCOUNT_BLOCKED", "MARGIN_PRESSURE blocks new exposure", symbols_discovered=92, symbols_targeted=0, symbols_attempted=0)
+    assert_true(engine._last_scan_disposition["state"] == "ACCOUNT_BLOCKED", "blocked scan state was not persisted")
+    assert_true(engine._last_scan_disposition["symbols_attempted"] == 0 and engine._last_scan_disposition["reason"].startswith("MARGIN_PRESSURE"), "zero-work scan was incorrectly represented as a normal scan")
+
+
+async def test_candle_purpose_separation() -> None:
+    engine = object.__new__(scheduler.MarketScheduler)
+    engine.telemetry = RuntimeTelemetry()
+    engine._active_scan_cycle_id = "cycle-candles"
+    frame = pd.DataFrame([{"time": pd.Timestamp("2026-08-15T00:00:00Z"), "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "tick_volume": 1}])
+    engine.data_provider = SimpleNamespace(get_candles=AsyncMock(return_value=frame))
+    result = await scheduler.MarketScheduler.fetch_candles(engine, "Volatility 75 Index", "M5", 200, purpose="position_management")
+    assert_true(not result.empty, "fixture candle request did not return data")
+    metrics = engine.telemetry.snapshot()["lifetime"]
+    assert_true(metrics["counters"]["position_management_candle_requests"] == 1, "position-management candle request was not separated")
+    assert_true(metrics["candle_purposes"]["position_management"] == 1, "position-management candle purpose was not recorded")
+    assert_true(metrics["candle_samples"][0]["scan_cycle_id"] == "cycle-candles" and metrics["candle_samples"][0]["symbol"] == "Volatility 75 Index", "candle request metadata was incomplete")
 
 
 def test_full_precision_rr_validation() -> None:
@@ -1527,6 +1554,60 @@ async def test_phase_boundary_closes_unprotected_position() -> None:
     assert_true(engine.executor.closed == [91] and [position.ticket for position in engine.executor.positions] == [92], "phase boundary did not confirm close/protection outcomes before returning")
 
 
+async def test_phase_boundary_preserves_unprotected_profit() -> None:
+    class BoundaryExecutor:
+        def __init__(self):
+            self.positions = [Position(ticket=93, symbol="Boom 100 Index", direction="BUY", volume=0.2, entry_price=100.0, sl=99.0, tp=103.0, profit=1.0)]
+            self.closed = []
+
+        async def get_open_positions(self):
+            return list(self.positions)
+
+        async def close_position(self, ticket):
+            self.closed.append(int(ticket))
+            self.positions = [position for position in self.positions if int(position.ticket) != int(ticket)]
+            return True
+
+        async def modify_position(self, ticket, sl=None, tp=None):
+            return False
+
+    engine = object.__new__(scheduler.MarketScheduler)
+    engine.settings = TradeSettings.defaults()
+    engine.settings.trading_mode = "demo"
+    engine.executor = BoundaryExecutor()
+    engine._position_management_lock = asyncio.Lock()
+    engine.optimizer = SimpleNamespace(active_policy=AsyncMock(return_value=(SimpleNamespace(to_dict=lambda: {}), None, None)))
+    engine.fetch_candles = AsyncMock(return_value=pd.DataFrame())
+    engine.telemetry = RuntimeTelemetry()
+    engine.last_capital_state = {"account": {"equity": 100.0, "balance": 100.0, "free_margin": 100.0}}
+    engine._management_protection_context = AsyncMock(return_value={})
+    original_basket = db.get_basket_for_ticket
+    original_logs = db.log_trade_action
+    original_baskets = db.get_open_baskets
+    original_flat = db.close_basket_if_flat
+    async def _no_basket(*args, **kwargs):
+        return None
+    async def _no_log(*args, **kwargs):
+        return None
+    async def _no_baskets(*args, **kwargs):
+        return []
+    async def _no_flat(*args, **kwargs):
+        return True
+    db.get_basket_for_ticket = _no_basket
+    db.log_trade_action = _no_log
+    db.get_open_baskets = _no_baskets
+    db.close_basket_if_flat = _no_flat
+    try:
+        result = await engine._phase_boundary_protect_positions(phase={"id": 8, "session_phase_number": 1, "phase_number": 20})
+    finally:
+        db.get_basket_for_ticket = original_basket
+        db.log_trade_action = original_logs
+        db.get_open_baskets = original_baskets
+        db.close_basket_if_flat = original_flat
+    assert_true(result["attempted"] == 1 and result["closed"] == 0 and result["protected"] == 0 and result["failed"] == 1, "unprotected profitable position did not leave the phase boundary pending")
+    assert_true(engine.executor.closed == [] and [position.ticket for position in engine.executor.positions] == [93], "phase boundary closed a profitable position merely because protection was unconfirmed")
+
+
 async def test_legacy_objective_phase_migration() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "legacy_objective.db")
@@ -1805,6 +1886,8 @@ def run() -> None:
     test_capital_reduction_view_is_phase_free()
     test_scanner_gate_telemetry()
     test_runtime_telemetry()
+    test_scan_disposition_truthfulness()
+    asyncio.run(test_candle_purpose_separation())
     test_opportunity_context_and_ranking()
     test_capacity_aware_opportunity_selection()
     test_strategy_registry_and_selection()
@@ -1845,6 +1928,7 @@ def run() -> None:
     asyncio.run(test_phase_zero_recovery_lifecycle())
     asyncio.run(test_sl_protection_requires_broker_confirmation())
     asyncio.run(test_phase_boundary_closes_unprotected_position())
+    asyncio.run(test_phase_boundary_preserves_unprotected_profit())
     asyncio.run(test_legacy_objective_phase_migration())
     test_causal_replay_safety()
     asyncio.run(test_adaptive_management_learning_evidence())

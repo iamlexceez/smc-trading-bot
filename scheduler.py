@@ -14,6 +14,7 @@ import os
 from time import monotonic, perf_counter
 from typing import Optional
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 import pandas as pd
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -93,6 +94,13 @@ class MarketScheduler:
             "state": "NOT_SCANNED", "reason": "No scan has completed in this process.",
             "updated_at": None, "analysis_symbols": 0,
         }
+        self._active_scan_cycle_id: str | None = None
+        self._last_scan_disposition: dict = {
+            "state": "NOT_SCANNED", "reason": "No scan has completed in this process.",
+            "symbols_discovered": 0, "symbols_targeted": 0, "symbols_eligible": 0,
+            "symbols_attempted": 0, "symbols_analyzed": 0, "symbols_rejected": 0,
+            "symbols_failed": 0, "symbols_skipped": 0, "symbols_deferred": 0,
+        }
         self.account_reconciliation = AccountReconciliationEngine(self.executor, self.settings.trading_mode)
         self.last_account_reconciliation: dict = {}
         self.capital_state_service = CapitalStateService(self.settings, self.executor)
@@ -130,6 +138,15 @@ class MarketScheduler:
             "updated_at": datetime.utcnow().isoformat(), **details,
         }
         logger.info("[SCAN GATE] state=%s reason=%s details=%s", state, reason, details)
+
+    def _set_scan_disposition(self, state: str, reason: str, **counts) -> None:
+        """Record factual scan work accounting independently of cycle scheduling."""
+        self._last_scan_disposition = {
+            "state": str(state), "reason": str(reason),
+            "updated_at": datetime.utcnow().isoformat(),
+            "scan_cycle_id": self._active_scan_cycle_id,
+            **{key: (int(value or 0) if key != "scan_cycle_id" else (str(value) if value else None)) for key, value in counts.items()},
+        }
 
     def _set_analysis_eligible_symbols(self, audit: Optional[dict]) -> tuple[str, ...]:
         audit = audit or {}
@@ -740,11 +757,93 @@ class MarketScheduler:
         state = str(component.get("state") or "NOT_STARTED")
         if state == "FAILED":
             return "🔴 FAILED"
+        if state == "BLOCKED":
+            return "⛔ BLOCKED"
+        if state == "DEGRADED":
+            return "🟠 DEGRADED"
         if state == "NOT_STARTED":
             return "🟡 WAITING" if enabled_waiting else "🟡 NOT STARTED"
         if state == "WAITING":
             return "🟡 WAITING"
         return "🟢 RUNNING"
+
+    async def _portfolio_snapshot(self) -> dict:
+        """Return fresh broker position metrics for diagnostics only."""
+        result = {
+            "open_positions": 0, "total_open_risk": 0.0, "total_unrealized_profit": 0.0,
+            "protected_profit": 0.0, "unprotected_profit": 0.0, "protected_positions": 0,
+            "unprotected_profitable_positions": 0, "margin_utilization": None,
+            "directional_concentration": None, "risk_by_symbol": {},
+        }
+        try:
+            positions = await self.executor.get_open_positions()
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            return result
+        result["open_positions"] = len(positions)
+        symbols: dict[str, int] = {}
+        directions: dict[str, int] = {}
+        for position in positions:
+            symbol = str(getattr(position, "symbol", ""))
+            direction = str(getattr(position, "direction", "")).upper()
+            symbols[symbol] = symbols.get(symbol, 0) + 1
+            directions[direction] = directions.get(direction, 0) + 1
+            profit = float(getattr(position, "profit", 0.0) or 0.0)
+            result["total_unrealized_profit"] += profit
+            if self._sl_protects_profit(position):
+                result["protected_positions"] += 1
+                result["protected_profit"] += max(0.0, profit)
+            elif profit > 0:
+                result["unprotected_profitable_positions"] += 1
+                result["unprotected_profit"] += profit
+            try:
+                info = await self.executor.get_symbol_info(symbol)
+                risk = self.risk_manager.calculate_position_risk(position, info)
+            except Exception:
+                risk = float("inf") if not getattr(position, "sl", 0.0) else 0.0
+            if risk == float("inf"):
+                result["total_open_risk"] = float("inf")
+            elif result["total_open_risk"] != float("inf"):
+                result["total_open_risk"] += max(0.0, float(risk))
+            result["risk_by_symbol"][symbol] = result["risk_by_symbol"].get(symbol, 0.0) + (0.0 if risk == float("inf") else float(risk))
+        if positions:
+            result["directional_concentration"] = max(directions.values()) / len(positions)
+            result["symbol_concentration"] = max(symbols.values()) / len(positions)
+        return result
+
+    async def _emit_portfolio_health_alerts(self, capital: dict, portfolio: dict, window: dict) -> None:
+        """Emit factual operator alerts without changing execution policy."""
+        account = dict(capital.get("account") or {})
+        state = str(capital.get("state") or "UNKNOWN")
+        free_margin = float(account.get("free_margin") or 0.0)
+        if free_margin <= 0 or state in {AccountCapitalState.MARGIN_PRESSURE, AccountCapitalState.CRITICAL_CAPITAL}:
+            await self._chart_activity(
+                "free_margin_critical", "ACCOUNT",
+                f"🚨 **FREE MARGIN CRITICAL**\nFree margin: `${free_margin:.2f}` | Account state: `{state}`\nNew entries remain blocked. Position management, account monitoring, and broker-confirmed protection remain operational.",
+                fingerprint=f"{state}:{round(free_margin, 2)}", essential=True,
+            )
+        max_positions = int(getattr(self.settings, "max_open_positions", 0) or 0)
+        open_positions = int(portfolio.get("open_positions") or 0)
+        if max_positions > 0 and open_positions > max_positions:
+            await self._chart_activity(
+                "excessive_position_count", "PORTFOLIO",
+                f"⚠️ **EXCESSIVE POSITION COUNT**\nOpen positions: `{open_positions}` | Configured research capacity: `{max_positions}`\nNo new exposure is being forced; existing positions remain under independent management.",
+                fingerprint=f"{open_positions}:{max_positions}", essential=True,
+            )
+        unprotected = int(portfolio.get("unprotected_profitable_positions") or 0)
+        if unprotected:
+            await self._chart_activity(
+                "profitable_positions_unprotected", "POSITION MANAGEMENT",
+                f"🛡 **PROFITABLE POSITIONS UNPROTECTED**\nCount: `{unprotected}`\nThe manager is evaluating them with the active phase policy; no stop is widened and no protection success is claimed without broker confirmation.",
+                fingerprint=f"{unprotected}:{portfolio.get('open_positions', 0)}", essential=True,
+            )
+        disposition = self._last_scan_disposition or {}
+        if int(disposition.get("symbols_attempted") or 0) == 0 and int((window.get("candle_purposes") or {}).get("position_management", 0) or 0) > 0:
+            await self._chart_activity(
+                "candle_prefetch_without_analysis", "MARKET ENGINE",
+                f"⚠️ **CANDLE REQUESTS WITHOUT SYMBOL ANALYSIS**\nPosition-management candle requests are present, but the latest scan attempted zero symbols.\nReason: {disposition.get('reason', 'unknown')}\nThese requests are labelled as position management, not analysis.",
+                fingerprint=f"{disposition.get('state')}:{disposition.get('reason')}", essential=True,
+            )
 
     async def send_activity_heartbeat(self) -> None:
         """Send a ten-minute factual report, resetting only confirmed delivered-window counters."""
@@ -765,48 +864,64 @@ class MarketScheduler:
             components = runtime.get("components") or {}
             rejections = sorted((window.get("rejections") or {}).items(), key=lambda item: (-item[1], item[0]))[:3]
             errors = sorted((window.get("errors") or {}).items(), key=lambda item: (-item[1], item[0]))[:3]
+            management_reasons = sorted((window.get("management_reasons") or {}).items(), key=lambda item: (-item[1], item[0]))[:3]
             timeframe_text = ", ".join(f"{name}: {count}" for name, count in sorted((window.get("timeframes") or {}).items())) or "None"
             scanner = components.get("market_scanner", {})
             analysis = components.get("analysis_engine", {})
             execution = components.get("execution_engine", {})
-            positions = components.get("position_manager", {})
+            position_component = components.get("position_manager", {})
             learning = components.get("learning_engine", {})
             heartbeat = components.get("heartbeat", {})
-            trading = "🟢 ENABLED" if state not in AccountCapitalState.BLOCKING and not self.settings.is_paused and self.settings.auto_trade else "🔴 HALTED"
+            portfolio = await self._portfolio_snapshot()
+            await self._emit_portfolio_health_alerts(capital, portfolio, window)
+            new_entries_blocked = state in AccountCapitalState.BLOCKING or self.settings.is_paused or not self.settings.auto_trade
+            new_entries_label = "🔴 HALTED" if new_entries_blocked else "🟢 RUNNING"
+            new_entries_reason = str(self.last_scan_gate.get("reason") or ("Bot-wide pause is active" if self.settings.is_paused else "No block recorded"))
             scanner_label = self._component_label(scanner)
             analysis_label = self._component_label(analysis)
             execution_label = self._component_label(execution, enabled_waiting=bool(self.settings.auto_trade and not self.settings.is_paused))
-            position_label = self._component_label(positions, enabled_waiting=True)
+            position_label = self._component_label(position_component, enabled_waiting=True)
             learning_label = self._component_label(learning, enabled_waiting=True)
-            overall = "🟢 ACTIVE" if counters.get("scan_cycles_completed", 0) > 0 and scanner.get("state") != "FAILED" else ("🔴 FAILED" if scanner.get("state") == "FAILED" else "🟡 AWAITING FIRST SCAN")
-            position_count = self.last_account_reconciliation.get("broker_open_positions", 0)
+            disposition = self._last_scan_disposition or {}
+            overall = "🟠 DEGRADED" if scanner.get("state") in {"DEGRADED", "BLOCKED"} or counters.get("scan_cycles_no_work", 0) else ("🟢 ACTIVE" if counters.get("scan_cycles_completed", 0) > 0 and scanner.get("state") != "FAILED" else ("🔴 FAILED" if scanner.get("state") == "FAILED" else "🟡 AWAITING FIRST SCAN"))
+            position_count = int(portfolio.get("open_positions") or self.last_account_reconciliation.get("broker_open_positions", 0) or 0)
+            timeframe_text = ", ".join(f"{name}: {count}" for name, count in sorted((window.get("timeframes") or {}).items())) or "None"
+            purpose_text = ", ".join(f"{name}: {count}" for name, count in sorted((window.get("candle_purposes") or {}).items())) or "None"
+            total_risk = portfolio.get("total_open_risk")
+            total_risk_text = "UNPROTECTED/UNKNOWN" if total_risk == float("inf") else f"{float(total_risk or 0.0):,.2f}"
             lines = [
                 "🧠 BOT ACTIVITY — LAST 10 MINUTES",
                 "", "SYSTEM",
                 f"Heartbeat: {self._component_label(heartbeat)} | MT5: {'🟢 CONNECTED' if capital.get('current') else '🔴 UNAVAILABLE'} | Account: {str(account.get('broker_account_mode') or self.settings.trading_mode).upper()}",
                 "", "MARKET ENGINE",
-                f"Scanner: {scanner_label} | Scan cycles: {counters.get('scan_cycles_completed', 0)} complete / {counters.get('scan_cycles_failed', 0)} failed / {counters.get('scan_cycles_skipped_overlap', 0)} overlap-skipped",
-                f"Last scan: {scanner.get('last_success') or 'never'} | Symbols attempted: {counters.get('symbols_attempted', 0)} | Analyzed: {counters.get('symbols_analyzed', 0)}",
+                f"Scanner: {scanner_label} | Cycles: {counters.get('scan_cycles_completed', 0)} completed / {counters.get('scan_cycles_no_work', 0)} no-work / {counters.get('scan_cycles_failed', 0)} failed",
+                f"Last disposition: {disposition.get('state', 'UNKNOWN')} | Reason: {disposition.get('reason', 'unknown')}",
+                f"Symbols discovered/targeted/eligible: {disposition.get('symbols_discovered', 0)}/{disposition.get('symbols_targeted', 0)}/{disposition.get('symbols_eligible', 0)} | attempted/analyzed/rejected/failed: {disposition.get('symbols_attempted', 0)}/{disposition.get('symbols_analyzed', 0)}/{disposition.get('symbols_rejected', 0)}/{disposition.get('symbols_failed', 0)}",
                 f"Candle requests: {counters.get('candle_requests', 0)} | Success: {counters.get('successful_candle_requests', 0)} | Failures: {counters.get('failed_candle_requests', 0)}",
-                f"Timeframes actually requested: {timeframe_text}",
+                f"Candle purpose: {purpose_text} | Timeframes: {timeframe_text}",
                 "", "ANALYSIS",
-                f"Analysis engine: {analysis_label} | Runs: {counters.get('analysis_runs', 0)} | Failures: {counters.get('analysis_failures', 0)}",
+                f"Analysis engine: {analysis_label} | Runs: {counters.get('analysis_runs', 0)} | Failures: {counters.get('analysis_failures', 0)} | Reason: {analysis.get('reason', 'unknown')}",
                 f"Setups detected: {counters.get('setups_detected', 0)} | Setups rejected: {counters.get('setups_rejected', 0)}",
                 "Top rejection reasons:",
                 *([f"- {count}× {reason}" for reason, count in rejections] or ["- None recorded"]),
                 "", "EXECUTION",
-                f"Execution engine: {execution_label} | Trade candidates: {counters.get('trade_candidates', 0)}",
+                f"Execution engine: {execution_label} | Trade candidates: {counters.get('trade_candidates', 0)} | Reason: {execution.get('reason', 'unknown')}",
                 f"Orders submitted: {counters.get('orders_submitted', 0)} | Filled: {counters.get('orders_filled', 0)} | Rejected: {counters.get('orders_rejected', 0)}",
                 "", "POSITION MANAGEMENT",
-                f"Position manager: {position_label} | Checked: {counters.get('positions_checked', 0)} | SL/TP modifications: {counters.get('positions_modified', 0)} | Closed: {counters.get('positions_closed', 0)}",
+                f"Position management: {position_label} | Reason: {position_component.get('reason', 'unknown')}",
+                f"Checked: {counters.get('positions_checked', 0)} | Requiring action: {counters.get('positions_requiring_action', 0)} | SL modifications: {counters.get('sl_modifications', 0)} | TP modifications: {counters.get('tp_modifications', 0)} | Closed: {counters.get('positions_closed', 0)}",
+                f"Protected positions: {portfolio.get('protected_positions', 0)} | Unprotected profitable: {portfolio.get('unprotected_profitable_positions', 0)}",
+                "Management reasons: " + ("; ".join(f"{count}× {reason}" for reason, count in management_reasons) if management_reasons else "None recorded"),
                 "", "LEARNING",
-                f"Learning engine: {learning_label} | Observations: {counters.get('observations', 0)} | Experiments: {counters.get('experiments', 0)} | Optimization runs: {counters.get('optimization_runs', 0)}",
+                f"Learning engine: {learning_label} | Reason: {learning.get('reason', 'unknown')} | Completed observations: {counters.get('observations', 0)} | Experiments: {counters.get('experiments', 0)} | Optimization runs: {counters.get('optimization_runs', 0)}",
                 "", "ACCOUNT",
                 f"Balance: {account.get('currency') or 'USD'} {float(account.get('balance') or 0.0):,.2f} | Equity: {account.get('currency') or 'USD'} {float(account.get('equity') or 0.0):,.2f}",
                 f"Free margin: {account.get('currency') or 'USD'} {float(account.get('free_margin') or 0.0):,.2f} | Open positions: {position_count}",
+                f"Total open risk: {total_risk_text} | Unrealized P/L: {float(portfolio.get('total_unrealized_profit') or 0.0):,.2f} | Protected profit: {float(portfolio.get('protected_profit') or 0.0):,.2f}",
+                f"New entries: {new_entries_label} | Reason: {new_entries_reason}",
                 "", "UNIVERSE",
                 f"Broker symbols: {(audit.get('pipeline') or {}).get('broker_symbols_returned', 0)} | Targets: {audit.get('target_count', 0)} | Usable: {audit.get('usable_count', 0)} | Invalid: {audit.get('invalid_count', 0)}",
-                f"Capital state: {state} | Trading: {trading}",
+                f"Capital state: {state} | New-entry gate: {self.last_scan_gate.get('state', 'UNKNOWN')}",
                 "", f"OVERALL STATUS: {overall}",
             ]
             if errors:
@@ -1087,23 +1202,43 @@ class MarketScheduler:
             "calculated_margin_probe": candidate_probe,
         }
 
-    async def fetch_candles(self, symbol: str, timeframe: str, count: int = 200) -> "pd.DataFrame":
-        """Fetch broker-native, closed OHLCV data and record the actual outcome."""
+    async def fetch_candles(self, symbol: str, timeframe: str, count: int = 200, *, purpose: str = "analysis", scan_cycle_id: str | None = None) -> "pd.DataFrame":
+        """Fetch closed broker candles with auditable subsystem provenance."""
+        purpose_key = str(purpose or "unknown").strip().lower().replace("-", "_")
+        request_id = str(uuid4())
+        cycle_id = scan_cycle_id or self._active_scan_cycle_id
         self.telemetry.increment("candle_requests")
+        purpose_counter = {
+            "analysis": "analysis_candle_requests",
+            "position_management": "position_management_candle_requests",
+            "execution": "execution_candle_requests",
+        }.get(purpose_key)
+        if purpose_counter:
+            self.telemetry.increment(purpose_counter)
         self.telemetry.record_timeframe(timeframe)
         try:
             frame = await self.data_provider.get_candles(symbol, timeframe, count)
         except Exception as exc:
             self.telemetry.increment("failed_candle_requests")
-            self.telemetry.record_error(f"candle {symbol} {timeframe}: {type(exc).__name__}: {exc}")
-            logger.exception("[CANDLE FAILURE] %s %s", symbol, timeframe)
+            self.telemetry.record_candle_request(
+                request_id=request_id, symbol=symbol, timeframe=timeframe, purpose=purpose_key,
+                scan_cycle_id=cycle_id, outcome="failure",
+            )
+            self.telemetry.record_error(f"candle {symbol} {timeframe} purpose={purpose_key} request_id={request_id}: {type(exc).__name__}: {exc}")
+            logger.exception("[CANDLE FAILURE] request_id=%s purpose=%s cycle=%s %s %s", request_id, purpose_key, cycle_id, symbol, timeframe)
             raise
         if frame is None or frame.empty:
             self.telemetry.increment("failed_candle_requests")
-            self.telemetry.record_error(f"candle {symbol} {timeframe}: empty broker response")
-            logger.warning("[CANDLE FAILURE] %s %s returned no closed candles", symbol, timeframe)
+            outcome = "empty"
+            self.telemetry.record_error(f"candle {symbol} {timeframe} purpose={purpose_key} request_id={request_id}: empty broker response")
+            logger.warning("[CANDLE FAILURE] request_id=%s purpose=%s cycle=%s %s %s returned no closed candles", request_id, purpose_key, cycle_id, symbol, timeframe)
         else:
             self.telemetry.increment("successful_candle_requests")
+            outcome = "success"
+        self.telemetry.record_candle_request(
+            request_id=request_id, symbol=symbol, timeframe=timeframe, purpose=purpose_key,
+            scan_cycle_id=cycle_id, outcome=outcome,
+        )
         return frame
 
     @staticmethod
@@ -1236,10 +1371,34 @@ class MarketScheduler:
         Full analysis of a single symbol across all timeframes.
         Returns a TradeSignal if a tradeable setup is found, else None.
         """
+        analysis_run_id = str(uuid4())
+        primary_tf_hint = self.settings.timeframes[0] if self.settings.timeframes else "M15"
+        requested_timeframes = [primary_tf_hint, *list(self.settings.htf_timeframes[:2])]
+        if primary_tf_hint not in ("M1", "M5"):
+            requested_timeframes.append("M5")
+
+        async def record_analysis_outcome(outcome: str, reason: str, *, details: dict | None = None, signal=None):
+            payload = {
+                "analysis_run_id": analysis_run_id,
+                "scan_cycle_id": self._active_scan_cycle_id,
+                "symbol": symbol,
+                "timeframes": requested_timeframes,
+                "outcome": outcome,
+                "reason": str(reason),
+                **dict(details or {}),
+            }
+            try:
+                await db.record_execution_event(
+                    account_mode=self.settings.trading_mode, symbol=symbol,
+                    setup_id=getattr(signal, "setup_id", None), status="analysis_outcome",
+                    reason=f"{outcome}: {reason}", details=payload,
+                )
+            except Exception as exc:
+                logger.warning("Could not persist analysis outcome for %s: %s", symbol, exc)
+            return signal
+
         await self._reload_settings()
         self.telemetry.increment("analysis_runs")
-        self.telemetry.increment("symbols_analyzed")
-        self.telemetry.increment("observations")
         self.optimizer.settings = self.settings
         policy, experiment_id, policy_version = await self.optimizer.active_policy(self.settings.trading_mode)
         phase = await self._active_objective_phase()
@@ -1250,11 +1409,11 @@ class MarketScheduler:
             self.telemetry.increment("setups_rejected")
             self.telemetry.record_rejection(reason)
             logger.warning("[ANALYSIS PRE-CANDLE REJECTED] symbol=%s broker_usable=%s settings_enabled=%s", symbol, len(self._analysis_eligible_symbols), len(self.settings.enabled_symbols))
-            return None
+            return await record_analysis_outcome("DATA_FAILURE", reason)
 
         # Fetch data for primary timeframe
         primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"
-        df = await self.fetch_candles(symbol, primary_tf, 200)
+        df = await self.fetch_candles(symbol, primary_tf, 200, purpose="analysis")
 
         if df.empty or len(df) < 20:
             reason = "Insufficient closed broker candles for structural analysis"
@@ -1266,7 +1425,7 @@ class MarketScheduler:
                 f"⚠️ **CHART STUDY PAUSED — {symbol}**\nTimeframe: `{primary_tf}`\nReason: insufficient closed broker candles for structural analysis.",
                 fingerprint=f"{primary_tf}:insufficient:{len(df)}",
             )
-            return None
+            return await record_analysis_outcome("INSUFFICIENT_EVIDENCE", reason)
         bar_time = str(df.iloc[-1]["time"])
         current_price = float(df.iloc[-1]["close"])
         await self._chart_activity(
@@ -1294,7 +1453,7 @@ class MarketScheduler:
         # Fetch HTF structures for confluence
         htf_structures = []
         for htf in self.settings.htf_timeframes[:2]:
-            htf_df = await self.fetch_candles(symbol, htf, 200)
+            htf_df = await self.fetch_candles(symbol, htf, 200, purpose="analysis")
             if not htf_df.empty and len(htf_df) >= 20:
                 htf_struct = analyze_structure(htf_df, lookback=3)
                 htf_structures.append(htf_struct)
@@ -1324,8 +1483,9 @@ class MarketScheduler:
                 direction = "SELL"
             else:
                 self.telemetry.increment("setups_rejected")
-                self.telemetry.record_rejection("No directional structure or valid premium/discount reversal context")
-                return None  # No clear direction
+                reason = "No directional structure or valid premium/discount reversal context"
+                self.telemetry.record_rejection(reason)
+                return await record_analysis_outcome("NO_SETUP", reason, details={"regime": regime_context.get("regime"), "bias": structure.trend.value})
 
         # The active experimental policy chooses how the observed market features
         # are used.  No global SMC sequence is universally required in DEMO.
@@ -1338,7 +1498,7 @@ class MarketScheduler:
         # the lowest supported timeframe, so it validates on its own closed bars.
         ltf_df = df
         if primary_tf not in ("M1", "M5"):
-            candidate_ltf = await self.fetch_candles(symbol, "M5", 200)
+            candidate_ltf = await self.fetch_candles(symbol, "M5", 200, purpose="analysis")
             if not candidate_ltf.empty:
                 ltf_df = candidate_ltf
 
@@ -1419,7 +1579,7 @@ class MarketScheduler:
                 f"⛔ **SETUP REJECTED — {symbol}**\nDirection: `{direction}`\nTP source: `{validation.target_source or 'none'}` | TP price: `{validation.take_profit:.5f}`\nEntry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}`\nRisk distance: `{risk_distance:.5f}` | Reward distance: `{reward_distance:.5f}`\nActual RR: `1:{validation.rr_ratio:.8f}` | Configured minimum RR: `1:{required_rr:.8f}`\nFinal decision: `{reason}`\nTP detail: {validation.target_reason or 'No valid target source'}\nNo sizing performed. No order submitted.",
                 fingerprint=f"{bar_time}:{direction}:{reason}:{validation.rr_ratio:.8f}",
             )
-            return None
+            return await record_analysis_outcome("CONFLICTED", reason, details={"bias": direction, "actual_rr": validation.rr_ratio, "required_rr": required_rr})
 
         self.telemetry.increment("setups_rr_checked")
         self.telemetry.increment("setups_rr_passed")
@@ -1514,7 +1674,7 @@ class MarketScheduler:
                 f"🧪 **POLICY SAMPLE DEFERRED — {symbol}**\nThe candidate remains stored for counterfactual analysis.\nActive policy: `{policy_version or self.settings.active_model_version}`\nReason: {policy_reason}",
                 fingerprint=f"{bar_time}:{direction}:{policy.fingerprint}:{policy_reason}",
             )
-            return None
+            return await record_analysis_outcome("NO_SETUP", policy_reason, details={"regime": regime, "bias": direction, "strategy": selected_strategy, "actual_rr": validation.rr_ratio},)
 
         await self._chart_activity(
             "setup_validated", symbol,
@@ -1587,7 +1747,11 @@ class MarketScheduler:
             selected_strategy == "layered_continuation"
             and str(strategy_evidence.get("confidence") or "UNKNOWN") in {"PROMISING", "VALIDATED", "STRONG_EVIDENCE"}
         )
-        return signal
+        return await record_analysis_outcome(
+            "SETUP_FOUND", "Candidate passed analysis and policy validation",
+            details={"regime": regime, "bias": direction, "strategy": selected_strategy, "uncertainty": strategy_evidence.get("confidence"), "setups_detected": 1},
+            signal=signal,
+        )
 
     async def scan_markets(self) -> list[TradeSignal]:
         """Scan only the current broker-validated usable handoff and return accepted signals."""
@@ -2074,22 +2238,43 @@ class MarketScheduler:
         if self._scan_lock.locked():
             self.telemetry.increment("scan_cycles_skipped_overlap")
             logger.warning("[SCANNER SKIPPED] reason=overlap active_scan_started=%s", self.telemetry.snapshot().get("components", {}).get("market_scanner", {}).get("last_started"))
-            return {"skipped": "scan already running"}
+            return {"skipped": "scan already running", "state": "SKIPPED_OVERLAP", "reason": "Another scan cycle is already running"}
         async with self._scan_lock:
             started = perf_counter()
+            self._active_scan_cycle_id = str(uuid4())
+            self._set_scan_disposition("STARTING", "Scan cycle started", scan_cycle_id=self._active_scan_cycle_id)
             self.telemetry.component_started("market_scanner")
             self.telemetry.increment("scan_cycles_started")
-            logger.info("[SCANNER START] timestamp=%s", datetime.utcnow().isoformat())
+            logger.info("[SCANNER START] cycle=%s timestamp=%s", self._active_scan_cycle_id, datetime.utcnow().isoformat())
             try:
                 result = await self._scan_and_execute()
             except Exception as exc:
                 self.telemetry.increment("scan_cycles_failed")
                 self.telemetry.component_failed("market_scanner", exc)
-                logger.exception("[SCANNER FAILURE] duration=%.3fs", perf_counter() - started)
+                self._set_scan_disposition("FAILED", f"{type(exc).__name__}: {exc}")
+                logger.exception("[SCANNER FAILURE] cycle=%s duration=%.3fs", self._active_scan_cycle_id, perf_counter() - started)
+                self._active_scan_cycle_id = None
                 raise
             self.telemetry.increment("scan_cycles_completed")
-            self.telemetry.component_succeeded("market_scanner", waiting=False)
-            logger.info("[SCANNER COMPLETE] timestamp=%s duration=%.3fs", datetime.utcnow().isoformat(), perf_counter() - started)
+            disposition = dict(getattr(self, "_last_scan_disposition", {}) or {})
+            if int(disposition.get("symbols_attempted") or 0) == 0:
+                self.telemetry.increment("scan_cycles_no_work")
+                self.telemetry.increment("scan_cycles_degraded")
+                reason = str(disposition.get("reason") or "No symbols were attempted")
+                if str(disposition.get("state") or "").endswith("BLOCKED") or str(disposition.get("state") or "") in {"PAUSED", "NO_ELIGIBLE_SYMBOLS", "OBJECTIVE_UNIVERSE_EMPTY"}:
+                    self.telemetry.component_blocked("market_scanner", reason)
+                else:
+                    self.telemetry.component_degraded("market_scanner", reason)
+                if getattr(self, "settings", None) is not None and callable(getattr(self, "_chart_activity", None)):
+                    await self._chart_activity(
+                        "scanner_no_work", "SYSTEM",
+                        f"⚠️ **ZERO SYMBOLS ATTEMPTED**\nScan cycle: `{getattr(self, '_active_scan_cycle_id', 'unknown')}`\nState: `{disposition.get('state', 'UNKNOWN')}`\nReason: {reason}\nPosition management remains independent.",
+                        fingerprint=f"{disposition.get('state')}:{reason}", essential=True,
+                    )
+            else:
+                self.telemetry.component_succeeded("market_scanner", state_override="RUNNING", reason=f"Processed {disposition.get('symbols_attempted', 0)} symbol(s)")
+            logger.info("[SCANNER COMPLETE] cycle=%s disposition=%s duration=%.3fs", self._active_scan_cycle_id, disposition, perf_counter() - started)
+            self._active_scan_cycle_id = None
             return result
 
     async def _scan_and_execute(self):
@@ -2097,6 +2282,7 @@ class MarketScheduler:
         await self._reload_settings()
         self.capital_state_service.settings = self.settings
         self.capital_state_service.executor = self.executor
+        self._set_scan_disposition("RUNNING", "Evaluating fresh broker account state")
         capital = await self.capital_state_service.evaluate()
         self.last_capital_state = capital
         self._set_scan_gate("ACCOUNT_EVALUATED", "Fresh broker account and universe evaluation completed.", account_state=str(capital.get("state") or "UNKNOWN"))
@@ -2119,38 +2305,54 @@ class MarketScheduler:
                 await db.save_settings(self.settings)
             reason = str(capital.get("reason") or "Authoritative broker account state blocks new exposure.")
             self._set_scan_gate("ACCOUNT_BLOCKED", reason, account_state=str(capital.get("state") or "UNKNOWN"), analysis_symbols=0)
+            self._set_scan_disposition("ACCOUNT_BLOCKED", reason, symbols_discovered=len((capital.get("broker_metadata") or {}).get("pipeline", {}).get("broker_symbols_returned", []) if isinstance((capital.get("broker_metadata") or {}).get("pipeline", {}).get("broker_symbols_returned"), list) else []))
+            self.telemetry.component_blocked("analysis_engine", reason)
+            self.telemetry.component_waiting("execution_engine", "New entries are blocked before candidate analysis")
             logger.warning("Scan halted by authoritative account state: %s (%s)", capital.get("state"), reason)
-            return
+            return {"state": "ACCOUNT_BLOCKED", "reason": reason}
 
         capital_session = await db.get_active_capital_reduction_session("demo")
         if capital_session:
             reason = f"Capital reduction session #{capital_session['id']} is {capital_session['status']}; normal strategy scanning is suspended."
             self._set_scan_gate("CAPITAL_REDUCTION_ACTIVE", reason, analysis_symbols=0)
+            self._set_scan_disposition("CAPITAL_REDUCTION_BLOCKED", reason)
+            self.telemetry.component_blocked("analysis_engine", reason)
+            self.telemetry.component_waiting("execution_engine", "Normal new entries are suspended during capital reduction")
             logger.info(reason)
-            return
+            return {"state": "CAPITAL_REDUCTION_BLOCKED", "reason": reason}
 
         if not self.settings.auto_trade or self.settings.is_paused:
             reason = "Auto-trade is disabled." if not self.settings.auto_trade else "Bot-wide pause is active."
             self._set_scan_gate("AUTOMATION_PAUSED", reason, auto_trade=bool(self.settings.auto_trade), is_paused=bool(self.settings.is_paused), analysis_symbols=0)
+            self._set_scan_disposition("PAUSED", reason)
+            self.telemetry.component_waiting("analysis_engine", reason)
+            self.telemetry.component_waiting("execution_engine", reason)
             logger.debug("%s Skipping scan.", reason)
-            return
+            return {"state": "PAUSED", "reason": reason}
             
         audit = capital.get("broker_metadata") or {}
         broker_usable_symbols = list(audit.get("usable_symbols") or [])
         if not broker_usable_symbols:
             reason = "No broker-validated usable Synthetic Index or approved Gold target is active."
             self._set_scan_gate("BROKER_UNIVERSE_EMPTY", reason, analysis_symbols=0)
+            self._set_scan_disposition("NO_ELIGIBLE_SYMBOLS", reason, symbols_discovered=int((audit.get("pipeline") or {}).get("broker_symbols_returned", 0) or 0), symbols_eligible=0)
+            self.telemetry.component_blocked("analysis_engine", reason)
+            self.telemetry.component_waiting("execution_engine", "No broker-usable symbols reached execution")
             logger.warning("%s Skipping scan.", reason)
-            return
+            return {"state": "NO_ELIGIBLE_SYMBOLS", "reason": reason}
         research = await self.refresh_research_governance(broker_usable_symbols)
         scan_symbols = list(research["market_selection"].get("analysis_symbols") or research["market_selection"]["selected_symbols"])
         if not scan_symbols:
             state = str(research["market_selection"].get("state") or "objective_universe_empty")
             reason = f"Objective/broker universe produced no analysis symbols (state={state})."
             self._set_scan_gate("OBJECTIVE_UNIVERSE_EMPTY", reason, market_selection_state=state, analysis_symbols=0)
+            self._set_scan_disposition("OBJECTIVE_UNIVERSE_EMPTY", reason, symbols_discovered=len(broker_usable_symbols), symbols_eligible=0)
+            self.telemetry.component_blocked("analysis_engine", reason)
+            self.telemetry.component_waiting("execution_engine", "Objective universe produced no execution candidates")
             logger.warning("%s Skipping scan.", reason)
-            return
+            return {"state": "OBJECTIVE_UNIVERSE_EMPTY", "reason": reason}
 
+        self._set_scan_disposition("ANALYZING", "Scanning broker-validated objective symbols", symbols_discovered=len(broker_usable_symbols), symbols_targeted=len(scan_symbols), symbols_eligible=len(scan_symbols), symbols_attempted=0, symbols_analyzed=0, symbols_rejected=0, symbols_failed=0)
         self._set_scan_gate(
             "ANALYZING", "Scanning broker-validated objective symbols.", analysis_symbols=len(scan_symbols),
             broker_usable_symbols=len(broker_usable_symbols),
@@ -2162,6 +2364,9 @@ class MarketScheduler:
             research["market_selection"]["state"],
         )
         candidates: list[TradeSignal] = []
+        analyzed_count = 0
+        rejected_count = 0
+        failed_count = 0
         for symbol in scan_symbols:
             self.telemetry.increment("symbols_attempted")
             logger.info("[SYMBOL LOOP START] %s", symbol)
@@ -2173,12 +2378,18 @@ class MarketScheduler:
                 self.telemetry.component_started("analysis_engine")
                 try:
                     signal = await self.analyze_symbol(symbol)
+                    analyzed_count += 1
+                    self.telemetry.increment("symbols_analyzed")
                 except Exception as exc:
+                    failed_count += 1
+                    self.telemetry.increment("symbols_failed")
                     self.telemetry.increment("analysis_failures")
                     self.telemetry.component_failed("analysis_engine", exc)
                     raise
                 self.telemetry.component_succeeded("analysis_engine", waiting=not bool(signal and signal.passed))
                 if not signal or not signal.passed:
+                    rejected_count += 1
+                    self.telemetry.increment("symbols_rejected")
                     continue
                 self.telemetry.increment("setups_detected")
                 self.telemetry.increment("trade_candidates")
@@ -2195,6 +2406,16 @@ class MarketScheduler:
                 self.telemetry.record_error(f"symbol {symbol}: {type(e).__name__}: {e}")
                 logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
+        self.telemetry.component_succeeded(
+            "analysis_engine", state_override="COMPLETED",
+            reason=f"Completed {analyzed_count} analysis job(s); {rejected_count} rejected and {failed_count} failed",
+        )
+        self._set_scan_disposition(
+            "ANALYZED", "Symbol-analysis loop completed",
+            symbols_discovered=len(broker_usable_symbols), symbols_targeted=len(scan_symbols), symbols_eligible=len(scan_symbols),
+            symbols_attempted=len(scan_symbols), symbols_analyzed=analyzed_count,
+            symbols_rejected=rejected_count, symbols_failed=failed_count,
+        )
         if not candidates:
             self.last_opportunity_ranking = []
             reason = f"All {len(scan_symbols)} objective-allowed broker-valid symbols were analyzed; no thesis-qualified candidate passed the current validation and policy path."
@@ -2204,8 +2425,10 @@ class MarketScheduler:
                 reason=reason, details={"decision": "NO_TRADE", "category": "no_thesis_qualified_candidate", "analysis_symbols": len(scan_symbols), "account_state": str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")},
             )
             self._set_scan_gate("NO_TRADE_NO_THESIS", reason, analysis_symbols=len(scan_symbols), decision="NO_TRADE")
+            self._set_scan_disposition("NO_TRADE", reason, symbols_discovered=len(broker_usable_symbols), symbols_targeted=len(scan_symbols), symbols_eligible=len(scan_symbols), symbols_attempted=len(scan_symbols), symbols_analyzed=analyzed_count, symbols_rejected=rejected_count, symbols_failed=failed_count)
+            self.telemetry.component_waiting("execution_engine", "No thesis-qualified candidate reached execution")
             logger.info("[NO TRADE] %s", reason)
-            return
+            return {"state": "NO_TRADE", "reason": reason}
         positions = await self.executor.get_open_positions() if self.executor else []
         open_symbols = [str(getattr(position, "symbol", "")) for position in positions]
         account = dict(capital.get("account") or {})
@@ -2304,13 +2527,15 @@ class MarketScheduler:
                 reason=reason, details={"decision": "NO_TRADE", "category": "capacity_or_evidence", "account_state": account_state, "low_capital": low_capital, "open_position_count": len(positions), "protected_position_count": protected_count, "ranked_candidates": reasons},
             )
             self._set_scan_gate("NO_TRADE_CAPACITY", reason, analysis_symbols=len(scan_symbols), candidates=len(ranked), decision="NO_TRADE", account_state=account_state)
+            self._set_scan_disposition("NO_TRADE", reason, symbols_discovered=len(broker_usable_symbols), symbols_targeted=len(scan_symbols), symbols_eligible=len(scan_symbols), symbols_attempted=len(scan_symbols), symbols_analyzed=analyzed_count, symbols_rejected=rejected_count, symbols_failed=failed_count)
             await self._chart_activity(
                 "no_trade_decision", "PORTFOLIO",
                 f"🟡 **NO TRADE — CURRENT CAPACITY DECISION**\nAnalyzed: `{len(scan_symbols)}` | Candidates: `{len(ranked)}` | Account state: `{account_state}`\nReason: {reason}\nExisting positions remain under broker-confirmed protection.",
                 fingerprint=f"{account_state}:{len(ranked)}:{len(positions)}:{objective_progress}", essential=True,
             )
             logger.info("[NO TRADE] %s details=%s", reason, reasons)
-            return
+            self.telemetry.component_waiting("execution_engine", "All ranked candidates were blocked by capacity, evidence, or portfolio interaction")
+            return {"state": "NO_TRADE", "reason": reason}
         best = eligible[0]
         best.details["why_selected"] = f"Highest-ranked capacity-eligible opportunity at {best.score:.1f}; account state, evidence, uncertainty, and existing exposure were considered."
         for item in ranked:
@@ -2334,7 +2559,7 @@ class MarketScheduler:
             fingerprint=f"{selected.setup_id}:opportunity:{best.score:.4f}",
         )
         primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"
-        df = await self.fetch_candles(selected.symbol, primary_tf, 500)
+        df = await self.fetch_candles(selected.symbol, primary_tf, 500, purpose="execution")
         await self.execute_signal(selected, df)
 
     @staticmethod
@@ -2483,7 +2708,7 @@ class MarketScheduler:
                         if not policy_data:
                             active_policy, _, _ = await self.optimizer.active_policy(self.settings.trading_mode)
                             policy_data = active_policy.to_dict()
-                        df = await self.fetch_candles(position.symbol, "M5", 200)
+                        df = await self.fetch_candles(position.symbol, "M5", 200, purpose="position_management")
                         if not df.empty and len(df) >= 30:
                             current_price = float(df.iloc[-1]["close"])
                             atr_value = float(atr(df, 14).iloc[-1])
@@ -2535,6 +2760,11 @@ class MarketScheduler:
                             await db.log_trade_action(ticket, "Phase Boundary SL Protected", json.dumps({"old_sl": position.sl, "new_sl": live.sl, "phase_id": phase["id"], "reason": candidate_reason}, sort_keys=True))
                         summary["details"].append({"ticket": ticket, "action": "protected", "sl": live.sl})
                         continue
+                if float(getattr(position, "profit", 0.0) or 0.0) > 0:
+                    summary["failed"] += 1
+                    self.telemetry.record_management_reason("PHASE_BOUNDARY_PROFIT_PROTECTION_PENDING")
+                    summary["details"].append({"ticket": ticket, "action": "protection_pending", "reason": "Profitable position was not broker-confirmed protected; automatic closure is forbidden"})
+                    continue
                 closed = await self.executor.close_position(ticket)
                 refreshed = await self.executor.get_open_positions()
                 still_open = any(int(item.ticket) == ticket for item in refreshed)
@@ -2819,7 +3049,7 @@ class MarketScheduler:
                 "reason": "A DEMO governance cycle already ran today; recent losses cannot trigger an intraday policy change.",
                 "next_eligible_date": (datetime.utcnow().date() + timedelta(days=1)).isoformat(),
             }
-            self.telemetry.component_succeeded("learning_engine", waiting=True)
+            self.telemetry.component_succeeded("learning_engine", waiting=True, reason=result["reason"])
             return result
         logger.info("Running daily bounded walk-forward optimization...")
         try:
@@ -2834,7 +3064,10 @@ class MarketScheduler:
             raise
         self.telemetry.increment("optimization_runs")
         self.telemetry.increment("experiments")
-        self.telemetry.component_succeeded("learning_engine", waiting=True)
+        self.telemetry.component_succeeded(
+            "learning_engine", waiting=True,
+            reason=str(result.get("reason") or result.get("decision") or "Governance cycle completed; waiting for the next eligible cycle"),
+        )
         if result.get("decision") in {"promoted", "rolled_back"}:
             await self._notify(
                 "🧠 **MODEL GOVERNANCE UPDATE**\n"
@@ -2947,6 +3180,7 @@ class MarketScheduler:
                 max_favorable_r=float(trade.get("max_favorable_r") or 0.0),
                 max_adverse_r=float(trade.get("max_adverse_r") or 0.0),
             )
+            self.telemetry.increment("observations")
             await self._chart_activity(
                 "broker_exit", trade["symbol"],
                 f"🏁 **BROKER EXIT CONFIRMED — {trade['symbol']}**\nTicket: `#{ticket}` | Realized P/L: `${pnl:.2f}` | Result: `{pnl_r_text}`\nExit price: `{float(outcome.get('exit_price') or 0.0):.5f}` | MFE: `{float(trade.get('max_favorable_r') or 0.0):.2f}R` | MAE: `{float(trade.get('max_adverse_r') or 0.0):.2f}R`",
@@ -3017,7 +3251,10 @@ class MarketScheduler:
             except Exception as exc:
                 self.telemetry.component_failed("position_manager", exc)
                 raise
-            self.telemetry.component_succeeded("position_manager", waiting=bool(result == 0))
+            self.telemetry.component_succeeded(
+                "position_manager", waiting=bool(result == 0),
+                reason=("No broker-open positions required management" if result == 0 else f"Reviewed {result} broker-open position(s)"),
+            )
             return result
 
     async def _management_protection_context(self, positions) -> dict:
@@ -3063,6 +3300,9 @@ class MarketScheduler:
             protection_context = await self._management_protection_context(positions)
 
             for position in positions:
+                self.telemetry.increment("live_observations")
+                if float(getattr(position, "profit", 0.0) or 0.0) > 0 and not self._sl_protects_profit(position):
+                    self.telemetry.increment("unprotected_profitable_positions")
                 basket = await db.get_basket_for_ticket(position.ticket, self.settings.trading_mode)
                 if basket:
                     initial_stop = float(basket["initial_stop"])
@@ -3089,11 +3329,13 @@ class MarketScheduler:
                 )
 
                 if initial_stop <= 0:
+                    self.telemetry.record_management_reason("NO_ACTION_UNPROTECTED_STOP_UNKNOWN")
                     logger.warning("Skipping unprotected position #%s; no initial structural stop is known", position.ticket)
                     continue
 
-                df = await self.fetch_candles(position.symbol, "M5", 200)
+                df = await self.fetch_candles(position.symbol, "M5", 200, purpose="position_management")
                 if df.empty or len(df) < 30:
+                    self.telemetry.record_management_reason("NO_ACTION_INSUFFICIENT_POSITION_DATA")
                     continue
                 current_price = float(df.iloc[-1]["close"])
                 if basket and basket.get("metadata", {}).get("trade_id"):
@@ -3107,6 +3349,7 @@ class MarketScheduler:
                     await db.update_trade_excursions(int(basket["metadata"]["trade_id"]), current_r=current_r)
                 atr_val = float(atr(df, 14).iloc[-1])
                 if atr_val <= 0:
+                    self.telemetry.record_management_reason("NO_ACTION_INVALID_ATR")
                     continue
 
                 structure = analyze_structure(df, lookback=3)
@@ -3129,8 +3372,10 @@ class MarketScheduler:
                     protection_context=protection_context,
                 )
                 if action.action == "none":
+                    self.telemetry.record_management_reason(action.reason or "NO_ACTION_POLICY")
                     continue
 
+                self.telemetry.increment("positions_requiring_action")
                 if action.action == "move_sl" and action.new_sl is not None:
                     success = await self.executor.modify_position(position.ticket, sl=action.new_sl, tp=position.tp)
                     live, confirmation_reason = (None, "executor rejected the SL modification")
@@ -3139,6 +3384,7 @@ class MarketScheduler:
                     if live is not None:
                         broker_sl = float(getattr(live, "sl", 0.0) or 0.0)
                         self.telemetry.increment("positions_modified")
+                        self.telemetry.increment("sl_modifications")
                         if basket:
                             await db.update_basket_state(basket["id"], state=action.state.value)
                             await db.update_trade_layer(basket["layer_id"], stop_loss=broker_sl)
@@ -3162,6 +3408,7 @@ class MarketScheduler:
                     success = await self.executor.modify_position(position.ticket, sl=position.sl, tp=action.new_tp)
                     if success:
                         self.telemetry.increment("positions_modified")
+                        self.telemetry.increment("tp_modifications")
                         if basket:
                             await db.update_basket_state(basket["id"], state=action.state.value)
                             await db.update_trade_layer(basket["layer_id"], take_profit=action.new_tp)
@@ -3247,7 +3494,7 @@ class MarketScheduler:
         initial_stop = float(basket["initial_stop"])
         policy_data = dict(basket.get("metadata", {}).get("experimental_policy") or {})
         layer_style = str(policy_data.get("layer_style", "none"))
-        current_price_df = await self.fetch_candles(position.symbol, "M5", 200)
+        current_price_df = await self.fetch_candles(position.symbol, "M5", 200, purpose="position_management")
         if current_price_df.empty:
             return False
         current_price = float(current_price_df.iloc[-1]["close"])
@@ -3392,7 +3639,7 @@ class MarketScheduler:
         if initial_stop <= 0:
             return f"❌ Ticket `#{ticket}` has no recorded protective stop, so safe R-based management is unavailable."
 
-        df = await self.fetch_candles(position.symbol, "M5", 200)
+        df = await self.fetch_candles(position.symbol, "M5", 200, purpose="position_management")
         if df.empty or len(df) < 30:
             return f"❌ Could not fetch sufficient closed M5 data for {position.symbol}."
         current_price = float(df.iloc[-1]["close"])

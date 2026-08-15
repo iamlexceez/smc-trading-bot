@@ -609,12 +609,16 @@ class BotHandlers:
             return
         runtime = self.scheduler.telemetry.snapshot(include_lifetime=True)
         lifetime = (runtime.get("lifetime") or {}).get("counters") or {}
+        window = (runtime.get("window") or {})
         components = runtime.get("components") or {}
         tasks = self.scheduler.scheduled_task_status()
         scan_gate = dict(getattr(self.scheduler, "last_scan_gate", {}) or {})
+        scan_disposition = dict(getattr(self.scheduler, "_last_scan_disposition", {}) or {})
+        candle_purposes = dict((window.get("candle_purposes") or {}))
+        management_reasons = dict((window.get("management_reasons") or {}))
         def status(name: str) -> str:
             component = components.get(name) or {}
-            return f"{component.get('state', 'NOT_STARTED')} | last success: {component.get('last_success') or 'never'} | last failure: {component.get('last_failure') or 'none'}"
+            return f"{component.get('state', 'NOT_STARTED')} | reason: {component.get('reason') or 'none'} | last success: {component.get('last_success') or 'never'} | last failure: {component.get('last_failure') or 'none'}"
         lines = [
             "ENGINE DIAGNOSTICS — READ-ONLY",
             f"Process started: {runtime.get('started_at')}",
@@ -630,6 +634,11 @@ class BotHandlers:
             f"State: `{scan_gate.get('state') or 'UNKNOWN'}` | Updated: `{scan_gate.get('updated_at') or 'never'}`",
             f"Reason: {scan_gate.get('reason') or 'No completed scan disposition is available.'}",
             f"Analysis symbols: `{int(scan_gate.get('analysis_symbols') or 0)}` | Broker-usable: `{scan_gate.get('broker_usable_symbols', 'UNKNOWN')}` | Objective/universe state: `{scan_gate.get('market_selection_state', 'UNKNOWN')}`",
+            "", "LATEST SCAN WORK ACCOUNTING",
+            f"Disposition: `{scan_disposition.get('state', 'UNKNOWN')}` | Reason: {scan_disposition.get('reason', 'none')}",
+            f"Discovered/targeted/eligible: `{scan_disposition.get('symbols_discovered', 0)}/{scan_disposition.get('symbols_targeted', 0)}/{scan_disposition.get('symbols_eligible', 0)}`",
+            f"Attempted/analyzed/rejected/failed: `{scan_disposition.get('symbols_attempted', 0)}/{scan_disposition.get('symbols_analyzed', 0)}/{scan_disposition.get('symbols_rejected', 0)}/{scan_disposition.get('symbols_failed', 0)}`",
+            f"Candle purposes in current window: `{', '.join(f'{key}={value}' for key, value in sorted(candle_purposes.items())) or 'none'}`",
             "", "SCHEDULED TASKS",
         ]
         for task in tasks:
@@ -645,13 +654,16 @@ class BotHandlers:
             f"Strategies evaluated on current board: `{len({str((item.get('details') or {}).get('strategy') or '') for item in ranking if (item.get('details') or {}).get('strategy')})}` | Ranked opportunities: `{len(ranking)}`.",
             f"Top opportunity: `{top_opportunity.get('symbol') or 'none'}` | strategy `{top_details.get('strategy') or 'UNKNOWN'}` | regime `{top_details.get('regime') or 'UNKNOWN'}` | score `{float(top_opportunity.get('score') or 0.0):.1f}` | evidence `{top_details.get('confidence') or 'UNKNOWN'}`.",
             "", "PROCESS-LIFETIME COUNTERS",
-            f"Scan cycles: {lifetime.get('scan_cycles_started', 0)} started / {lifetime.get('scan_cycles_completed', 0)} completed / {lifetime.get('scan_cycles_failed', 0)} failed / {lifetime.get('scan_cycles_skipped_overlap', 0)} overlap-skipped",
-            f"Symbols: {lifetime.get('symbols_attempted', 0)} attempted / {lifetime.get('symbols_analyzed', 0)} analyzed | Candles: {lifetime.get('candle_requests', 0)} requested / {lifetime.get('failed_candle_requests', 0)} failed",
+            f"Scan cycles: {lifetime.get('scan_cycles_started', 0)} started / {lifetime.get('scan_cycles_completed', 0)} completed / {lifetime.get('scan_cycles_no_work', 0)} no-work / {lifetime.get('scan_cycles_failed', 0)} failed / {lifetime.get('scan_cycles_skipped_overlap', 0)} overlap-skipped",
+            f"Symbols: {lifetime.get('symbols_attempted', 0)} attempted / {lifetime.get('symbols_analyzed', 0)} analyzed / {lifetime.get('symbols_rejected', 0)} rejected / {lifetime.get('symbols_failed', 0)} failed | Candles: {lifetime.get('candle_requests', 0)} requested / {lifetime.get('failed_candle_requests', 0)} failed",
+            f"Candle purpose totals: analysis={lifetime.get('analysis_candle_requests', 0)} | execution={lifetime.get('execution_candle_requests', 0)} | position-management={lifetime.get('position_management_candle_requests', 0)}",
             f"Analysis: {lifetime.get('analysis_runs', 0)} runs / {lifetime.get('setups_detected', 0)} detected / {lifetime.get('setups_rejected', 0)} rejected",
             f"RR pipeline: {lifetime.get('setups_rr_checked', 0)} checked / {lifetime.get('setups_rr_passed', 0)} passed / {lifetime.get('setups_rr_rejected', 0)} rejected",
             f"Sizing pipeline: {lifetime.get('sizing_checked', 0)} checked / {lifetime.get('sizing_rejected', 0)} rejected | Margin: {lifetime.get('margin_checked', 0)} checked",
             f"Execution pipeline: {lifetime.get('execution_approved', 0)} approved / {lifetime.get('orders_submitted', 0)} submitted / {lifetime.get('orders_filled', 0)} filled / {lifetime.get('orders_rejected', 0)} rejected",
-            f"Positions: {lifetime.get('positions_checked', 0)} checked / {lifetime.get('positions_modified', 0)} modified / {lifetime.get('positions_closed', 0)} closed",
+            f"Positions: {lifetime.get('positions_checked', 0)} checked / {lifetime.get('positions_requiring_action', 0)} requiring action / {lifetime.get('positions_modified', 0)} modified / {lifetime.get('positions_closed', 0)} closed",
+            f"SL/TP modifications: {lifetime.get('sl_modifications', 0)} / {lifetime.get('tp_modifications', 0)} | Live observations: {lifetime.get('live_observations', 0)} | Completed observations: {lifetime.get('observations', 0)}",
+            f"Current-window management reasons: `{', '.join(f'{key}={value}' for key, value in sorted(management_reasons.items())) or 'none'}`",
         ])
         await self._render_plain_menu(update, "\n".join(lines))
 
