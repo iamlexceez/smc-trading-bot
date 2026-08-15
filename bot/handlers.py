@@ -1750,7 +1750,9 @@ class BotHandlers:
         else:
             self.settings.is_paused = False
             await db.save_settings(self.settings)
-            msg = "▶️ DEMO broker state verified. Auto-trading resumed."
+            if self.scheduler:
+                self.scheduler._start_background_task("resume_scan", self.scheduler.activate_and_scan_now())
+            msg = "▶️ DEMO broker state verified. Auto-trading resumed; an immediate scan has been started."
         if update.callback_query:
             await update.callback_query.edit_message_text(msg, reply_markup=keyboards.main_menu())
         else:

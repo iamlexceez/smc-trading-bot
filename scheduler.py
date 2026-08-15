@@ -876,7 +876,14 @@ class MarketScheduler:
             await self._emit_portfolio_health_alerts(capital, portfolio, window)
             new_entries_blocked = state in AccountCapitalState.BLOCKING or self.settings.is_paused or not self.settings.auto_trade
             new_entries_label = "🔴 HALTED" if new_entries_blocked else "🟢 RUNNING"
-            new_entries_reason = str(self.last_scan_gate.get("reason") or ("Bot-wide pause is active" if self.settings.is_paused else "No block recorded"))
+            if self.settings.is_paused:
+                new_entries_reason = "Bot-wide pause is active. Use /resume after fresh broker verification."
+            elif not self.settings.auto_trade:
+                new_entries_reason = "Auto-trade is disabled."
+            elif state in AccountCapitalState.BLOCKING:
+                new_entries_reason = str(capital.get("reason") or f"Broker account state {state} blocks new exposure.")
+            else:
+                new_entries_reason = str(self.last_scan_gate.get("reason") or "No new-entry block recorded")
             scanner_label = self._component_label(scanner)
             analysis_label = self._component_label(analysis)
             execution_label = self._component_label(execution, enabled_waiting=bool(self.settings.auto_trade and not self.settings.is_paused))
