@@ -46,8 +46,14 @@ class AccountCapitalState:
 
     BLOCKING = {
         TARGET_UNIVERSE_INITIALIZING, TARGET_UNIVERSE_EMPTY, TARGET_SYMBOLS_VALIDATING,
-        TARGET_SYMBOLS_INVALID, CAPITAL_EXHAUSTED, CRITICAL_CAPITAL, MARGIN_PRESSURE, TRADING_HALTED,
+        TARGET_SYMBOLS_INVALID, CAPITAL_EXHAUSTED, TRADING_HALTED,
         AWAITING_RESUME, ACCOUNT_STATE_UNKNOWN,
+    }
+    # These states restrict NEW exposure only. They must never pause the bot-wide
+    # runtime or stop position management. Broker sizing/order validation remains
+    # authoritative if an individual candidate cannot be funded.
+    EXPOSURE_BLOCKING = {
+        MARGIN_PRESSURE, CRITICAL_CAPITAL, CAPITAL_EXHAUSTED,
     }
 
 

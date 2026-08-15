@@ -1116,7 +1116,7 @@ async def test_broker_authoritative_capital_state() -> None:
 
         broker.margin_level = 99.0
         critical = await service.evaluate()
-        assert_true(critical["state"] == AccountCapitalState.CRITICAL_CAPITAL and critical["state"] in AccountCapitalState.BLOCKING, "broker margin-call condition did not halt execution as capital-critical")
+        assert_true(critical["state"] == AccountCapitalState.CRITICAL_CAPITAL and critical["state"] in AccountCapitalState.EXPOSURE_BLOCKING and critical["state"] not in AccountCapitalState.BLOCKING, "broker margin-call condition did not enter exposure-only critical protection state")
 
         broker.margin_level = 1_000.0
         broker.free_margin = 5.0
@@ -1602,8 +1602,8 @@ async def test_phase_boundary_closes_unprotected_position() -> None:
         db.log_trade_action = original_logs
         db.get_open_baskets = original_baskets
         db.close_basket_if_flat = original_flat
-    assert_true(result["attempted"] == 2 and result["closed"] == 1 and result["protected"] == 1 and result["failed"] == 0, "phase boundary did not prefer protection and close the unprotected position")
-    assert_true(engine.executor.closed == [91] and [position.ticket for position in engine.executor.positions] == [92], "phase boundary did not confirm close/protection outcomes before returning")
+    assert_true(result["attempted"] == 2 and result["closed"] == 0 and result["unchanged"] == 1 and result["protected"] == 1 and result["pending"] == 0 and result["failed"] == 0, "phase boundary did not preserve positions while recording protection state")
+    assert_true(engine.executor.closed == [] and [position.ticket for position in engine.executor.positions] == [91, 92], "phase boundary closed a position merely because the phase completed")
 
 
 async def test_phase_boundary_preserves_unprotected_profit() -> None:
@@ -1656,7 +1656,7 @@ async def test_phase_boundary_preserves_unprotected_profit() -> None:
         db.log_trade_action = original_logs
         db.get_open_baskets = original_baskets
         db.close_basket_if_flat = original_flat
-    assert_true(result["attempted"] == 1 and result["closed"] == 0 and result["protected"] == 0 and result["failed"] == 1, "unprotected profitable position did not leave the phase boundary pending")
+    assert_true(result["attempted"] == 1 and result["closed"] == 0 and result["protected"] == 0 and result["pending"] == 1 and result["failed"] == 0, "unprotected profitable position did not leave the phase boundary pending")
     assert_true(engine.executor.closed == [] and [position.ticket for position in engine.executor.positions] == [93], "phase boundary closed a profitable position merely because protection was unconfirmed")
 
 

@@ -73,3 +73,40 @@ def test_live_position_enrichment_uses_fresh_side_price() -> None:
     assert rows[0].current_r == 1.0
     assert rows[0].unrealized_pnl == 12.5
     assert rows[0].market.stale is False
+
+
+def test_forward_demo_challenger_is_allowed_to_trade_in_isolated_demo() -> None:
+    from analysis.decision_gates import evaluate_trading_gate
+
+    decision = evaluate_trading_gate(
+        setup_valid=True,
+        broker_symbol_valid=True,
+        valid_market_data=True,
+        objective_permits_exposure=True,
+        evidence={"evidence_classification": "STRONG", "confidence_classification": "HIGH"},
+        champion_governed=False,
+        forward_demo_experiment_allowed=True,
+        portfolio_approved=True,
+        structural_conflict=False,
+        required_htf_context_available=True,
+    )
+    assert decision.trading_decision == "TRADE_APPROVED"
+
+
+def test_challenger_without_isolated_demo_authority_is_rejected() -> None:
+    from analysis.decision_gates import evaluate_trading_gate
+
+    decision = evaluate_trading_gate(
+        setup_valid=True,
+        broker_symbol_valid=True,
+        valid_market_data=True,
+        objective_permits_exposure=True,
+        evidence={"evidence_classification": "STRONG", "confidence_classification": "HIGH"},
+        champion_governed=False,
+        forward_demo_experiment_allowed=False,
+        portfolio_approved=True,
+        structural_conflict=False,
+        required_htf_context_available=True,
+    )
+    assert decision.trading_decision == "OBJECTIVE_INELIGIBLE"
+    assert "Champion/challenger governance" in decision.failures

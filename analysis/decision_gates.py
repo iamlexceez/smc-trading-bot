@@ -84,6 +84,7 @@ def evaluate_trading_gate(
     objective_permits_exposure: bool,
     evidence: Mapping[str, Any] | None,
     champion_governed: bool,
+    forward_demo_experiment_allowed: bool = False,
     portfolio_approved: bool = True,
     structural_conflict: bool = False,
     required_htf_context_available: bool = True,
@@ -111,7 +112,7 @@ def evaluate_trading_gate(
         failures.append("Unresolved structural conflict")
     if confidence_classification in {"LOW", "UNVALIDATED"}:
         failures.append(f"Validated confidence ({confidence_classification})")
-    if not champion_governed:
+    if not champion_governed and not forward_demo_experiment_allowed:
         failures.append("Champion/challenger governance")
     if not portfolio_approved:
         failures.append("Portfolio context")
