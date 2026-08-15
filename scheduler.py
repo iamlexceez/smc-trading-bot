@@ -316,6 +316,25 @@ class MarketScheduler:
         if not active:
             self._operational_objective = {}
             return list(snapshot["market_selection"]["selected_symbols"])
+        context = dict(active.get("context") or {})
+        operational = dict(context.get("operational") or {})
+        if operational.get("scope_disabled"):
+            usable = sorted({str(symbol) for symbol in broker_usable_symbols if str(symbol).strip()})
+            self._operational_objective = {
+                "id": active.get("id"), "version": active.get("version"),
+                "status": "STANDALONE", "scope_disabled": True,
+                "allowed_symbols": usable,
+                "scope_disabled_reason": operational.get("scope_disabled_reason") or "User disabled objective execution scope",
+            }
+            snapshot["market_selection"] = {
+                **snapshot["market_selection"],
+                "state": "standalone_broker_universe",
+                "analysis_symbols": usable,
+                "selected_symbols": usable,
+                "disabled_symbols": [],
+                "selection_explanation": "Objective scope is disabled. The existing standalone DEMO scanner uses the current broker-verified Synthetic Index / Gold universe; ranking, evidence, broker validation, and final execution gates remain active.",
+            }
+            return usable
         active = await self._ensure_objective_phase_plan(active)
         if active.get("is_paused"):
             self._operational_objective = {"id": active.get("id"), "version": active.get("version"), "status": "PAUSED"}
@@ -1978,7 +1997,7 @@ class MarketScheduler:
             # Reserve risk for the planned basket now. Layers are not blindly
             # opened together: only L1 executes; each later layer is contingent
             # on fresh thesis confirmation and remaining basket risk.
-            objective_layering_disabled = bool(self._operational_objective) and str(self._operational_objective.get("layering_preference") or "enabled") == "disabled"
+            objective_layering_disabled = self._operational_objective.get("status") == "ACTIVE" and str(self._operational_objective.get("layering_preference") or "enabled") == "disabled"
             layers = self.risk_manager.get_layering_plan(
                 sizing.final_volume,
                 signal.entry_price,
@@ -2299,8 +2318,14 @@ class MarketScheduler:
         capital = await self.capital_state_service.evaluate()
         self.last_capital_state = capital
         self._set_scan_gate("ACCOUNT_EVALUATED", "Fresh broker account and universe evaluation completed.", account_state=str(capital.get("state") or "UNKNOWN"))
-        await self._advance_objective_phase_if_due(capital)
-        await self._finalize_objective_session_if_terminal(capital)
+        active_objective = await db.get_active_objective(self.settings.trading_mode)
+        objective_operational = dict(((active_objective or {}).get("context") or {}).get("operational") or {})
+        objective_scope_disabled = bool(objective_operational.get("scope_disabled"))
+        if not objective_scope_disabled:
+            await self._advance_objective_phase_if_due(capital)
+            await self._finalize_objective_session_if_terminal(capital)
+        else:
+            self._set_scan_gate("STANDALONE_MODE", "Confirmed objective scope is disabled; standalone DEMO scanning continues.", account_state=str(capital.get("state") or "UNKNOWN"))
         self._set_analysis_eligible_symbols(capital.get("broker_metadata") or {})
         if capital.get("changed"):
             await self._notify_capital_state(capital)
@@ -2591,6 +2616,9 @@ class MarketScheduler:
             return {}
         active = await db.get_active_objective("demo")
         if not active:
+            return {}
+        operational = dict((active.get("context") or {}).get("operational") or {})
+        if operational.get("scope_disabled"):
             return {}
         return await db.get_active_objective_phase(int(active["id"])) or {}
 

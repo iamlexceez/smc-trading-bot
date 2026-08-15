@@ -301,6 +301,24 @@ class BotHandlers:
         action = args[0].lower() if args else "show"
         mode = self.settings.trading_mode
         reply = update.callback_query.message if update.callback_query else update.message
+        if action in {"disable", "standalone", "off"}:
+            changed = await db.set_objective_scope_disabled(mode, True)
+            if changed and self.scheduler:
+                self.scheduler._start_background_task("objective_scope_disable_scan", self.scheduler.activate_and_scan_now())
+            await reply.reply_text(
+                "🟡 Objective execution scope disabled. The existing DEMO scanner now operates on the fresh broker-verified Synthetic Index / Gold universe; ranking, broker validation, learning, and active-position protection remain enabled."
+                if changed else "No active objective exists to disable."
+            )
+            return
+        if action in {"enable", "on", "scope_on"}:
+            changed = await db.set_objective_scope_disabled(mode, False)
+            if changed and self.scheduler:
+                self.scheduler._start_background_task("objective_scope_enable_scan", self.scheduler.activate_and_scan_now())
+            await reply.reply_text(
+                "🟢 Objective execution scope re-enabled. The confirmed objective is active again. An immediate refresh and scan has been started."
+                if changed else "The objective could not be re-enabled; it may be terminal or no active objective exists."
+            )
+            return
         if action == "set":
             instruction = " ".join(args[1:]).strip()
             if not instruction:
@@ -451,10 +469,13 @@ class BotHandlers:
         active = await db.get_active_objective(mode)
         if action == "explain" and active:
             context_data = active.get("context") or {}
+            operational_data = context_data.get("operational") or {}
+            scope_disabled = bool(operational_data.get("scope_disabled"))
             await reply.reply_text(
-                f"🧠 **ACTIVE OBJECTIVE — v{active.get('version')}**\n\nPhase: `{context_data.get('phase', 'UNAVAILABLE')}` | operational pause: `{'YES' if active.get('is_paused') else 'NO'}`\n"
-                f"Mode: `FULL AUTO {active.get('account_mode', 'demo').upper()}`\nAllowed instruments: `{', '.join((context_data.get('operational') or {}).get('allowed_symbols') or []) or 'dynamic broker-verified universe'}`\n"
-                "The confirmed objective controls the existing scanner and new-exposure allowlist. Existing SMC, policy, sizing, broker margin, TP/SL, position-management, emergency-stop, and MT5 execution components remain the only mechanisms that decide and submit technically valid orders. Learning continues in the background and does not wait before scanning.",
+                f"🧠 **ACTIVE OBJECTIVE — v{active.get('version')}**\n\nPhase: `{context_data.get('phase', 'UNAVAILABLE')}` | operational pause: `{'YES' if active.get('is_paused') else 'NO'}` | execution scope: `{'DISABLED — STANDALONE DEMO' if scope_disabled else 'ENABLED'}`\n"
+                f"Mode: `FULL AUTO {active.get('account_mode', 'demo').upper()}`\nAllowed instruments: `{', '.join(operational_data.get('allowed_symbols') or []) or 'dynamic broker-verified universe'}`\n"
+                + ("The saved objective is currently disabled as an execution scope; the existing standalone DEMO scanner uses the fresh broker-verified universe. Existing SMC, policy, sizing, broker margin, TP/SL, position-management, emergency-stop, and MT5 execution components remain the only mechanisms that decide and submit technically valid orders. Learning continues in the background."
+                 if scope_disabled else "The confirmed objective controls the existing scanner and new-exposure allowlist. Existing SMC, policy, sizing, broker margin, TP/SL, position-management, emergency-stop, and MT5 execution components remain the only mechanisms that decide and submit technically valid orders. Learning continues in the background and does not wait before scanning."),
                 parse_mode="Markdown",
             )
             return
@@ -483,6 +504,8 @@ class BotHandlers:
                 f"Reason: {terminal.get('reason') or 'Broker-confirmed terminal outcome'}\n"
                 "A one-time evidence review has been recorded. New exposure stays paused, while existing positions continue receiving broker-confirmed protection. After a broker-verified DEMO reset, use `/objective start` to reuse this saved objective for another session."
             )
+        elif bool(operational.get("scope_disabled")):
+            readiness_text = "🟡 **STANDALONE DEMO MODE — OBJECTIVE SCOPE DISABLED**\nThe saved objective remains available for later re-enabling, but it currently does not restrict the scanner or new-exposure universe. The existing broker-verified universe, evidence-aware ranking, broker validation, position management, and DEMO learning remain active. Use `/objective enable` to restore objective scope."
         elif readiness == "READY":
             readiness_text = "🟢 **FULL AUTO DEMO READY**\nScanner and automatic execution use this objective's operational universe, subject to the existing final execution gates."
         else:
@@ -526,7 +549,7 @@ class BotHandlers:
             "`/demo_session [id]` — reset-separated DEMO session report\n"
             "`/demo_auto_resume on|off` — optional verified-reset auto-resume\n"
             "`/backtest <symbol> <tf> <days>` — causal policy backtest with TP/SL replay evidence\n"
-            "`/objective [set|confirm|start|cancel|history|explain|pause]` — saved objective template and explicit DEMO session controls\n"
+            "`/objective [set|confirm|start|cancel|history|explain|pause|disable|enable]` — saved objective template, scope control, and explicit DEMO session controls\n"
             "`/session` — current saved-objective DEMO session\n"
             "`/learned` — plain-language evidence summary across saved objective sessions\n"
             "`/knowledge` — persistent expert methodology hypotheses, tests, decisions, and uncertainties\n"

@@ -1473,6 +1473,29 @@ async def test_phase_zero_recovery_lifecycle() -> None:
         assert_true(float(successor["starting_equity"]) == 50.0, "Phase 1 did not restart from the recovered session starting balance")
 
 
+async def test_objective_scope_disable_persistence() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "objective_scope.db")
+        await db.init_db(path)
+        await db.create_objective_draft(
+            account_mode="demo", raw_instruction="standalone scope fixture",
+            objective={"account_mode": "demo", "starting_capital": 50.0, "target_capital": 100.0},
+            account_snapshot={"equity": 50.0, "state": "ACCOUNT_VERIFIED"},
+            broker_universe=["Boom 100 Index"],
+            context={"operational": {"allowed_symbols": ["Boom 100 Index"], "explicit_symbol_universe": True}},
+            db_path=path,
+        )
+        active = await db.confirm_objective_draft("demo", db_path=path)
+        assert_true(active and active["status"] == "active", "objective fixture was not activated")
+        changed = await db.set_objective_scope_disabled("demo", True, db_path=path)
+        disabled = await db.get_active_objective("demo", db_path=path)
+        assert_true(changed and disabled and disabled["status"] == "active", "disabling scope removed the saved objective")
+        assert_true(bool((disabled.get("context") or {}).get("operational", {}).get("scope_disabled")), "disabled objective scope was not persisted")
+        changed = await db.set_objective_scope_disabled("demo", False, db_path=path)
+        enabled = await db.get_active_objective("demo", db_path=path)
+        assert_true(changed and not bool((enabled.get("context") or {}).get("operational", {}).get("scope_disabled")), "objective scope was not re-enabled")
+
+
 async def test_sl_protection_requires_broker_confirmation() -> None:
     before = Position(ticket=8736588628, symbol="Volatility 10 Index", direction="BUY", volume=0.2, entry_price=4860.0, sl=4857.873, tp=4900.0, profit=2.0)
 
@@ -1924,6 +1947,7 @@ def run() -> None:
     asyncio.run(test_objective_console_safety())
     asyncio.run(test_objective_phase_lifecycle())
     asyncio.run(test_persistent_objective_template_sessions())
+    asyncio.run(test_objective_scope_disable_persistence())
     test_session_local_phase_display_number()
     asyncio.run(test_phase_zero_recovery_lifecycle())
     asyncio.run(test_sl_protection_requires_broker_confirmation())

@@ -1509,6 +1509,28 @@ async def cancel_objective_draft(account_mode: str = "demo", db_path: str = DB_P
         return cursor.rowcount > 0
 
 
+async def set_objective_scope_disabled(account_mode: str = "demo", disabled: bool = True, db_path: str = DB_PATH) -> bool:
+    """Enable or disable the confirmed objective as an execution scope.
+
+    Disabling scope does not pause the bot, close positions, or alter the saved
+    objective. It lets the existing standalone broker-universe scanner operate
+    while preserving the objective and its evidence history for later reuse.
+    """
+    active = await get_active_objective(account_mode, db_path)
+    if not active:
+        return False
+    context = dict(active.get("context") or {})
+    operational = dict(context.get("operational") or {})
+    if not disabled and operational.get("terminal"):
+        return False
+    operational["scope_disabled"] = bool(disabled)
+    operational["scope_disabled_at"] = datetime.utcnow().isoformat()
+    operational["scope_disabled_reason"] = "User disabled objective execution scope" if disabled else "User re-enabled objective execution scope"
+    context["operational"] = operational
+    updated = await update_active_objective_context(int(active["id"]), context, db_path)
+    return bool(updated)
+
+
 async def set_objective_paused(account_mode: str = "demo", paused: bool = True, db_path: str = DB_PATH) -> bool:
     active = await get_active_objective(account_mode, db_path)
     if not active:
