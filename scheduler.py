@@ -815,23 +815,43 @@ class MarketScheduler:
             session_id = result.get("session_id", "?")
             candidate = result.get("best_candidate") or {}
             candidate_text = (
-                f"Selected / closest: `{candidate.get('symbol')}` | volume: `{candidate.get('volume', 'n/a')}` | "
+                f"Best valid action: `{candidate.get('symbol')}` | volume: `{candidate.get('volume', 'n/a')}` | "
                 f"expected reduction: `${float(candidate.get('expected_loss') or 0.0):.2f}`\n"
-                f"Candidate detail: {candidate.get('reason', '')}"
-                if candidate else "Selected / closest: `none`"
+                f"Action detail: {candidate.get('reason', '')}"
+                if candidate else "Best valid action: `none`"
             )
-            state_text = str(result.get("state", "unknown")).upper()
+            state = str(result.get("state", "unknown")).lower()
+            headline = {
+                "completed": "🔥 **CAPITAL REDUCTION COMPLETE**",
+                "blocked": "⚠️ **CAPITAL REDUCTION BLOCKED**",
+                "failed": "❌ **CAPITAL REDUCTION FAILED**",
+                "paused": "⏸ **CAPITAL REDUCTION PAUSED**",
+            }.get(state, "🔥 **CAPITAL REDUCTION**")
+            state_text = "ACTIVE" if state == "blocked" else state.upper()
+            current = float(result.get("current_equity", result.get("equity")) or 0.0)
+            target = float(result.get("target") or 0.0)
+            session_row = await db.get_capital_reduction_session(int(session_id)) if str(session_id).isdigit() else None
+            initial = float((session_row or {}).get("initial_equity") or current)
+            reduction = max(0.0, initial - target)
+            progress = max(0.0, min(100.0, (initial - current) / reduction * 100.0 if reduction > 0 else 100.0))
+            active_positions = "UNKNOWN"
+            if self.executor and callable(getattr(self.executor, "get_open_positions", None)):
+                try:
+                    active_positions = str(len(await self.executor.get_open_positions()))
+                except Exception:
+                    active_positions = "UNAVAILABLE"
             await self._chart_activity(
                 "capital_reduction_state", "SYSTEM",
                 "\n".join([
-                    "🔥 **CAPITAL REDUCTION**",
+                    headline,
                     f"Session: `#{session_id}` | State: `{state_text}` | Mode: `{result.get('mode', 'AGGRESSIVE')}`",
-                    f"Target: `${float(result.get('target') or 0.0):.2f}` | Current: `${float(result.get('current_equity', result.get('equity')) or 0.0):.2f}` | Remaining: `${float(result.get('remaining') or 0.0):.2f}`",
-                    f"Valid candidates: `{result.get('valid_candidate_count', 0)}`",
+                    f"Current equity: `${current:.2f}` | Current balance: `${float(result.get('current_balance') or (session_row or {}).get('current_balance') or 0.0):.2f}`",
+                    f"Target: `${target:.2f}` | Remaining: `${float(result.get('remaining') or max(0.0, current - target)):.2f}` | Tolerance: `${float(result.get('tolerance') or (session_row or {}).get('tolerance') or 0.0):.2f}`",
+                    f"Active positions: `{active_positions}` | Valid broker actions: `{result.get('valid_candidate_count', 0)}` | Progress: `{progress:.2f}%`",
                     candidate_text,
-                    f"Reason: {result.get('reason') or 'Target/tolerance state reached'}",
+                    f"Reason: {result.get('reason') or ('Fresh broker target verification confirmed.' if state == 'completed' else 'Monitoring for the next valid broker action.')}",
                 ]),
-                fingerprint=f"capital:{session_id}:{result.get('state')}:{result.get('reason', '')}",
+                fingerprint=f"capital:{session_id}:{state}:{result.get('reason', '')}",
                 essential=True,
             )
         return result

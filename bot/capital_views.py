@@ -17,22 +17,23 @@ def capital_test_view(*, account: Optional[dict], session: Optional[dict], targe
     if session:
         stored_status = str(session.get("status") or "unknown").upper()
         runtime_status = str(session.get("runtime_state") or stored_status).upper()
-        title = "🎯 CAPITAL TEST READY" if session.get("capital_test_active") else "🔥 CAPITAL REDUCTION"
+        title = "🔥 CAPITAL REDUCTION COMPLETE" if stored_status == "COMPLETED" else ("⚠️ CAPITAL REDUCTION BLOCKED" if runtime_status == "BLOCKED" else ("🎯 CAPITAL TEST READY" if session.get("capital_test_active") else "🔥 CAPITAL REDUCTION"))
+        display_state = "ACTIVE" if stored_status == "ACTIVE" and runtime_status == "BLOCKED" else runtime_status
         effective_tolerance = session.get("effective_tolerance", session.get("tolerance"))
         planning = session.get("last_planning") or {}
         selected = planning.get("best_candidate") or {}
         lines = [
             title,
-            f"Session: #{session.get('id')} | State: {runtime_status}",
+            f"Session: #{session.get('id')} | State: {display_state} | Session status: {stored_status}",
             "Purpose: deliberately reduce actual DEMO equity through broker-valid sequential actions; this activity is excluded from strategy learning.",
             "",
             f"Target: {money(session.get('target_equity'), currency)} | Current: {money(session.get('current_equity'), currency)}",
             f"Remaining: {money(session.get('remaining'), currency)} | Finish tolerance: {money(effective_tolerance, currency)}",
-            f"Mode: {str((session.get('metadata') or {}).get('mode') or 'AGGRESSIVE_TAPERED').upper()} | Valid candidates: {planning.get('valid_candidate_count', 0)}",
+            f"Mode: {str((session.get('metadata') or {}).get('mode') or 'AGGRESSIVE_TAPERED').upper()} | Valid broker actions: {planning.get('valid_candidate_count', 0)} | Active positions: {session.get('active_positions', 'UNKNOWN')}",
             f"Target proximity: {float(planning.get('proximity_ratio') or 0.0) * 100:.1f}% remaining | Action aggression: {float(planning.get('aggression_factor') or 0.0) * 100:.1f}% | Permitted overshoot: {money(planning.get('tapered_overshoot_tolerance'), currency)}",
             f"Selected: {selected.get('symbol') or 'none'} | Volume: {selected.get('volume') if selected.get('volume') is not None else 'n/a'} | Expected reduction: {money(selected.get('expected_loss'), currency) if selected.get('expected_loss') is not None else 'n/a'}",
             f"Reason: {selected.get('reason') or session.get('error_reason') or 'Searching current broker-valid candidates'}",
-            f"Next action: {runtime_status} | Session status: {stored_status} | Progress: {float(session.get('progress_pct') or 0.0):.2f}%",
+            f"Next action: {'RETRY BROKER-VALID ACTION' if runtime_status == 'BLOCKED' and stored_status == 'ACTIVE' else display_state} | Progress: {float(session.get('progress_pct') or 0.0):.2f}%",
         ]
         if session.get("error_reason") and not selected:
             lines.extend(["", f"Detail: {session['error_reason']}"])

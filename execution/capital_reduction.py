@@ -342,6 +342,12 @@ class CapitalReductionEngine:
         terminal_state = {"completed": "COMPLETE", "blocked": "BLOCKED", "failed": "BLOCKED", "cancelled": "CANCELLED"}.get(str(session.get("status") or "").lower())
         session["runtime_state"] = terminal_state or str((session.get("metadata") or {}).get("runtime_state") or "SEARCHING")
         session["last_planning"] = (session.get("metadata") or {}).get("last_planning") or {}
+        session["valid_broker_actions"] = int(session["last_planning"].get("valid_candidate_count") or 0)
+        try:
+            positions = await self.executor.get_open_positions()
+            session["active_positions"] = len(positions or [])
+        except Exception:
+            session["active_positions"] = "UNAVAILABLE"
 
         session["progress_pct"] = max(0.0, min(100.0, (initial - current) / intended * 100 if intended else 100.0))
         session["actions"] = await db.get_capital_reduction_actions(session["id"], limit=20)
@@ -357,8 +363,12 @@ class CapitalReductionEngine:
                 return {"state": session["status"], "session_id": session["id"]}
             account, error = await self._live_account()
             if not account:
-                await db.update_capital_reduction_session(session["id"], status="blocked", error_reason=error)
-                await db.record_capital_reduction_action(session_id=session["id"], action="hard_stop", status="blocked", details={"reason": error})
+                # Broker data may be temporarily unavailable. Keep the reduction
+                # session active so the next scheduled cycle can retry; only the
+                # explicit target check or repeated broker-order integrity failure
+                # is terminal.
+                await db.update_capital_reduction_session(session["id"], status="active", error_reason=error)
+                await db.record_capital_reduction_action(session_id=session["id"], action="broker_state_blocked", status="active", details={"reason": error})
                 return {"state": "blocked", "reason": error, "session_id": session["id"]}
             equity = self._number(account.get("equity"))
             balance = self._number(account.get("balance"))
@@ -396,8 +406,12 @@ class CapitalReductionEngine:
             metadata["aggression_factor"] = diagnostic.get("aggression_factor")
             metadata["tapered_overshoot_tolerance"] = diagnostic.get("tapered_overshoot_tolerance")
             if not plan:
-                await db.update_capital_reduction_session(session["id"], status="blocked", error_reason=reason, metadata=metadata)
-                await db.record_capital_reduction_action(session_id=session["id"], action="planning_blocked", status="blocked", equity_before=equity, details={"reason": reason, **diagnostic})
+                # No currently valid broker action is a recoverable condition,
+                # not completion or terminal failure. Preserve ACTIVE session
+                # state and retry on the next scheduled reduction cycle.
+                metadata["runtime_state"] = "BLOCKED"
+                await db.update_capital_reduction_session(session["id"], status="active", error_reason=reason, metadata=metadata)
+                await db.record_capital_reduction_action(session_id=session["id"], action="planning_blocked", status="active", equity_before=equity, details={"reason": reason, "recoverable": True, **diagnostic})
                 return {"state": "blocked", "reason": reason, "session_id": session["id"], "target": target, "current_equity": equity, "remaining": remaining, "tolerance": tolerance, "overshoot_tolerance": overshoot_tolerance, "mode": "AGGRESSIVE_TAPERED", "valid_candidate_count": diagnostic.get("valid_candidate_count", 0), "best_candidate": diagnostic.get("best_candidate"), "diagnostic": diagnostic}
             metadata["runtime_state"] = "EXECUTING"
             await db.update_capital_reduction_session(session["id"], error_reason="", metadata=metadata)
@@ -485,12 +499,13 @@ class CapitalReductionEngine:
                 waiting_metadata["aggression_factor"] = next_diagnostic.get("aggression_factor")
                 waiting_metadata["tapered_overshoot_tolerance"] = next_diagnostic.get("tapered_overshoot_tolerance")
                 if not next_plan:
+                    waiting_metadata["runtime_state"] = "BLOCKED"
                     await db.update_capital_reduction_session(
-                        session["id"], status="blocked", current_equity=equity_after,
+                        session["id"], status="active", current_equity=equity_after,
                         current_balance=balance_after, error_reason=next_reason, metadata=waiting_metadata,
                     )
                     await db.record_capital_reduction_action(
-                        session_id=session["id"], action="post_close_planning_blocked", status="blocked",
+                        session_id=session["id"], action="post_close_planning_blocked", status="active",
                         equity_before=equity, equity_after=equity_after,
                         details={"reason": next_reason, **next_diagnostic},
                     )

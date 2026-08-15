@@ -54,6 +54,7 @@ from strategy.registry import applicable_strategies, definitions
 from strategy.selection import evaluate_strategies, evidence_class
 import scheduler  # noqa: F401 — validates live-pipeline imports without starting it.
 from bot.handlers import BotHandlers, admin_only  # noqa: F401 — validates Telegram control imports.
+from bot.capital_views import capital_test_view
 from telegram.error import BadRequest
 
 
@@ -868,6 +869,8 @@ async def test_capital_reduction_isolation() -> None:
         )
         active = await db.get_active_capital_reduction_session("demo", path)
         assert_true(active and active["id"] == session_id and active["status"] == "active", "capital reduction session was not isolated and persisted")
+        assert_true(not any("phase" in key.lower() for key in active.keys()), "capital reduction session incorrectly persisted a phase field")
+        assert_true("objective_id" not in active, "capital reduction session incorrectly linked to a growth objective")
         strategy_trade = await db.record_trade("Volatility 75 Index", "BUY", 100.0, 99.0, 102.0, 0.1, 0.0, 2.0, "mt5", "{}", ticket=777, db_path=path)
         await db.close_trade(strategy_trade, -3.0, path)
         await db.record_capital_reduction_action(session_id=session_id, action="order_filled", status="open", ticket=777, symbol="Volatility 75 Index", direction="BUY", volume=0.1, db_path=path)
@@ -876,6 +879,40 @@ async def test_capital_reduction_isolation() -> None:
         await db.update_capital_reduction_session(session_id, status="completed", current_equity=505.0, current_balance=505.0, capital_test_active=True, db_path=path)
         completed = await db.get_capital_reduction_session(session_id, path)
         assert_true(completed and completed["capital_test_active"] and completed["status"] == "completed", "capital-test transition was not persisted")
+
+    class NoActionExecutor:
+        async def get_account_info(self):
+            return {"broker_account_mode": "demo", "equity": 1_000.0, "balance": 1_000.0, "free_margin": 1_000.0, "leverage": 10.0}
+        async def get_symbol_info(self, symbol):
+            raise RuntimeError("temporary broker symbol metadata unavailable")
+        async def get_symbol_price(self, symbol):
+            raise RuntimeError("temporary broker price unavailable")
+
+    no_action_session = {"id": 404, "status": "active", "target_equity": 500.0, "tolerance": 0.0, "metadata": {}}
+    state_updates: list[dict] = []
+    async def capture_update(session_id, **kwargs):
+        state_updates.append(kwargs)
+    with patch.object(capital_reduction_module.db, "get_active_capital_reduction_session", new=AsyncMock(return_value=no_action_session)), \
+         patch.object(capital_reduction_module.db, "update_capital_reduction_session", new=capture_update), \
+         patch.object(capital_reduction_module.db, "record_capital_reduction_action", new=AsyncMock()):
+        blocked = await CapitalReductionEngine(TradeSettings.defaults(), NoActionExecutor()).run_once()
+    assert_true(blocked["state"] == "blocked", "temporary lack of a broker-valid reduction action was not reported as blocked")
+    assert_true(any(update.get("status") == "active" for update in state_updates), "temporary reduction blockage terminalized the session instead of preserving ACTIVE retry state")
+
+
+def test_capital_reduction_view_is_phase_free() -> None:
+    report = capital_test_view(
+        account={"currency": "USD"},
+        session={
+            "id": 9, "status": "active", "runtime_state": "BLOCKED", "target_equity": 500.0,
+            "current_equity": 900.0, "remaining": 400.0, "tolerance": 5.0,
+            "progress_pct": 20.0, "metadata": {"last_planning": {"valid_candidate_count": 0}},
+            "error_reason": "No broker-valid action currently available",
+        }, target=None, tolerance=0.0,
+    )
+    assert_true("CAPITAL REDUCTION" in report and "State: ACTIVE" in report, "reduction view did not preserve an active session during temporary blockage")
+    assert_true("phase" not in report.lower() and "objective complete" not in report.lower(), "reduction Telegram view leaked growth-phase or objective-completion language")
+    assert_true("Valid broker actions" in report and "Progress:" in report, "reduction Telegram view omitted continuous-session diagnostics")
 
 
 async def test_broker_authoritative_capital_state() -> None:
@@ -1538,6 +1575,7 @@ def run() -> None:
     test_broker_stop_normalization()
     asyncio.run(test_engine_scanner_gate_rendering())
     test_pause_resume_command_registration()
+    test_capital_reduction_view_is_phase_free()
     test_scanner_gate_telemetry()
     test_runtime_telemetry()
     test_opportunity_context_and_ranking()
