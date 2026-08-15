@@ -2022,6 +2022,17 @@ class MarketScheduler:
             consecutive_losses = await db.get_consecutive_losses(account_mode=self.settings.trading_mode)
             open_positions = await self.executor.get_open_positions()
             gate = await self._evaluate_objective_trade_gate(signal, account, open_positions)
+            for ranked_item in list(getattr(self, "last_opportunity_ranking", []) or []):
+                if str(ranked_item.get("symbol")) == str(symbol):
+                    details = ranked_item.setdefault("details", {})
+                    details.update({
+                        "research_decision": gate.research_decision,
+                        "final_trading_decision": gate.trading_decision,
+                        "final_trading_reason": gate.reason,
+                        "evidence_classification": gate.evidence_classification,
+                        "confidence_classification": gate.confidence_classification,
+                    })
+                    break
             signal.research_decision = gate.research_decision
             signal.trading_decision = gate.trading_decision
             signal.evidence_classification = gate.evidence_classification
@@ -2714,6 +2725,19 @@ class MarketScheduler:
                 "setup_score": signal.score, "strategy_score": getattr(signal, "strategy_score", 0.0),
                 "historical_evidence": dict(getattr(signal, "strategy_evidence", {}) or {}),
                 "current_confirmation": list(opportunity.rationale), "strategy_assessments": list(getattr(signal, "strategy_assessments", []) or []),
+                "research_decision": opportunity.details.get("research_decision") or getattr(signal, "research_decision", "RESEARCH_ACCEPTED"),
+                "analysis_trading_decision": opportunity.details.get("analysis_trading_decision") or getattr(signal, "trading_decision", "DEFERRED"),
+                "final_trading_decision": "PENDING_FINAL_VALIDATION",
+                "evidence_classification": opportunity.details.get("evidence_classification", "INSUFFICIENT"),
+                "completed_confidence": opportunity.details.get("completed_confidence", "UNKNOWN"),
+                "sample_size": opportunity.details.get("sample_size", 0),
+                "target_source": opportunity.details.get("target_source", "UNKNOWN"),
+                "target_alternatives": list(opportunity.details.get("target_alternatives") or []),
+                "risk_distance": opportunity.details.get("risk_distance", 0.0),
+                "reward_distance": opportunity.details.get("reward_distance", 0.0),
+                "learning_objective": opportunity.details.get("learning_objective", ""),
+                "top_down_context": dict(opportunity.details.get("top_down_context") or {}),
+                "displacement_ratio": opportunity.details.get("displacement_ratio"),
                 "observed_features": list(getattr(signal, "registry_observed_features", []) or []),
                 "layering_suitability": bool(getattr(signal, "layering_suitable", False)),
                 "portfolio_conflict": opportunity.portfolio_conflict, "opportunity_board": dict(opportunity.details),
@@ -2784,9 +2808,24 @@ class MarketScheduler:
             analysis_symbols=len(scan_symbols), candidates=len(candidates), selected_symbol=selected.symbol,
         )
         logger.info("[OPPORTUNITY RANKING] candidates=%s selected=%s score=%.2f regime=%s", len(ranked), best.symbol, best.score, best.context.get("regime"))
+        comparison = " | ".join(
+            f"#{index} {item.symbol} {item.score:.1f} ({item.details.get('confidence_classification', 'UNKNOWN')}/{item.details.get('evidence_classification', 'INSUFFICIENT')})"
+            for index, item in enumerate(ranked[:3], start=1)
+        )
         await self._chart_activity(
             "best_opportunity", selected.symbol,
-            f"🎯 **BEST CURRENT OPPORTUNITY — {selected.symbol}**\nRank: `1/{len(ranked)}` | Opportunity score: `{best.score:.1f}` | Confidence: `{best.details.get('confidence_classification', 'UNKNOWN')}`\nRegime: `{best.context.get('regime', 'UNKNOWN')}` | Strategy: `{getattr(selected, 'selected_strategy', selected.setup_type)}`\nDirection: `{selected.direction}` | Strategy evidence: `{dict(getattr(selected, 'strategy_evidence', {}) or {}).get('confidence', 'UNKNOWN')}`\nThesis: {'; '.join(best.rationale)}\nOnly this strongest capacity-eligible thesis proceeds to final broker and portfolio validation.",
+            f"🎯 **BEST CURRENT OPPORTUNITY — {selected.symbol}**\n"
+            f"Rank: `1/{len(ranked)}` | Opportunity score: `{best.score:.1f}` | Confidence: `{best.details.get('confidence_classification', 'UNKNOWN')}`\n"
+            f"Research decision: `{best.details.get('research_decision', 'RESEARCH_ACCEPTED')}` | Final trading decision: `PENDING_FINAL_VALIDATION`\n"
+            f"Evidence: `{best.details.get('evidence_classification', 'INSUFFICIENT')}` | Completed confidence: `{best.details.get('completed_confidence', 'UNKNOWN')}` | Sample size: `{int(best.details.get('sample_size') or 0)}`\n"
+            f"Regime: `{best.context.get('regime', 'UNKNOWN')}` | Strategy: `{getattr(selected, 'selected_strategy', selected.setup_type)}` | Direction: `{selected.direction}` | Timeframe: `{getattr(selected, 'timeframe', 'UNKNOWN')}`\n"
+            f"Top-down bias: `{', '.join(best.details.get('htf_bias') or []) or 'UNKNOWN'}` | Observed features: `{', '.join(best.details.get('observed_features') or []) or 'UNKNOWN'}` | Displacement ratio: `{float(best.details.get('displacement_ratio') or 0.0):.2f}`\n"
+            f"Entry: `{float(best.details.get('entry') or 0.0):.8g}` | SL: `{float(best.details.get('stop_loss') or 0.0):.8g}` | TP: `{float(best.details.get('take_profit') or 0.0):.8g}` | Risk distance: `{float(best.details.get('risk_distance') or 0.0):.8g}` | Reward distance: `{float(best.details.get('reward_distance') or 0.0):.8g}` | Actual RR: `1:{float(best.details.get('rr') or 0.0):.4f}`\n"
+            f"TP source: `{best.details.get('target_source', 'UNKNOWN')}` | TP alternatives: `{len(best.details.get('target_alternatives') or [])}`\n"
+            f"Top comparison: `{comparison}`\n"
+            f"Thesis: {'; '.join(best.rationale)}\n"
+            f"Learning objective: {best.details.get('learning_objective') or 'Measure forward-DEMO outcome in this exact context.'}\n"
+            "Only this strongest capacity-eligible thesis proceeds to final broker and portfolio validation; the rank and score cannot authorize an order.",
             fingerprint=f"{selected.setup_id}:opportunity:{best.score:.4f}",
         )
         primary_tf = self.settings.timeframes[0] if self.settings.timeframes else "M15"

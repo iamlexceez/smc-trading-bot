@@ -203,11 +203,35 @@ def rank_opportunities(
         target_reach = strategy_evidence.get("target_reach_probability")
         target_reach_fit = max(0.0, min(1.0, _finite(target_reach, 0.5))) if target_reach is not None else 0.5
         profile_expectancy = max(0.0, min(1.0, _finite(getattr(profile, "expectancy_r", 0.0))))
-        geometry_valid = bool(
-            _finite(getattr(signal, "entry_price", 0.0)) > 0
-            and _finite(getattr(signal, "stop_loss", 0.0)) > 0
-            and _finite(getattr(signal, "take_profit", 0.0)) > 0
+        direction = str(getattr(signal, "direction", "") or "").upper()
+        entry_price = _finite(getattr(signal, "entry_price", 0.0))
+        stop_loss = _finite(getattr(signal, "stop_loss", 0.0))
+        take_profit = _finite(getattr(signal, "take_profit", 0.0))
+        geometry_valid = bool(entry_price > 0 and stop_loss > 0 and take_profit > 0)
+        risk_distance = abs(entry_price - stop_loss) if geometry_valid else 0.0
+        reward_distance = abs(take_profit - entry_price) if geometry_valid else 0.0
+        actual_rr = reward_distance / risk_distance if risk_distance > 0 else _finite(getattr(signal, "rr_ratio", 0.0))
+        validation = getattr(signal, "validation", None)
+        target_source = str(
+            getattr(signal, "target_source", "")
+            or getattr(validation, "target_source", "")
+            or "UNKNOWN"
         )
+        target_alternatives = list(
+            getattr(signal, "target_alternatives", None)
+            or getattr(validation, "target_candidates", None)
+            or []
+        )
+        if not target_alternatives and take_profit > 0:
+            target_alternatives = [{"price": take_profit, "rr_ratio": actual_rr, "source": target_source, "selected": True}]
+        evidence_classification = str(
+            strategy_evidence.get("evidence_classification")
+            or strategy_evidence.get("evidence_strength")
+            or ("INSUFFICIENT" if sample < 3 else "UNCLASSIFIED")
+        ).upper()
+        completed_confidence = str(strategy_evidence.get("confidence") or "UNKNOWN").upper()
+        analysis_trading_decision = str(getattr(signal, "trading_decision", "") or "DEFERRED")
+        research_decision = str(getattr(signal, "research_decision", "") or "RESEARCH_ACCEPTED")
         geometry_fit = 1.0 if geometry_valid else 0.0
         conflict = 1.0 if symbol in open_set else 0.0
         uncertainty = uncertainty_label(sample, conservative_ev, conflict=bool(conflict))
@@ -268,25 +292,45 @@ def rank_opportunities(
             "instrument": symbol,
             "regime": context.get("regime", "UNKNOWN"),
             "strategy": selected_strategy,
-            "direction": getattr(signal, "direction", ""),
+            "direction": direction,
             "timeframe": getattr(signal, "timeframe", ""),
             "htf_bias": list(getattr(signal, "htf_bias", []) or []),
-            "entry": _finite(getattr(signal, "entry_price", None)),
-            "stop_loss": _finite(getattr(signal, "stop_loss", None)),
-            "take_profit": _finite(getattr(signal, "take_profit", None)),
-            "rr": _finite(getattr(signal, "rr_ratio", None)),
+            "top_down_context": {
+                "htf_bias": list(getattr(signal, "htf_bias", []) or []),
+                "required_features": list(getattr(signal, "registry_observed_features", []) or []),
+                "regime": context.get("regime", "UNKNOWN"),
+                "regime_transition": getattr(signal, "regime_transition", context.get("regime", "UNKNOWN")),
+            },
+            "observed_features": list(getattr(signal, "registry_observed_features", []) or []),
+            "displacement_ratio": _finite(context.get("displacement_ratio")),
+            "entry": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "risk_distance": risk_distance,
+            "reward_distance": reward_distance,
+            "rr": actual_rr,
             "setup_score": quality,
             "strategy_score": strategy_score,
             "historical_expectancy_r": strategy_evidence.get("expectancy_r"),
             "recent_expectancy_r": strategy_evidence.get("recent_expectancy_r"),
+            "evidence_classification": evidence_classification,
+            "completed_confidence": completed_confidence,
+            "sample_size": sample,
             "conservative_expected_value_r": conservative_ev,
             "expectancy_ci95_low_r": strategy_evidence.get("expectancy_ci95_low_r"),
             "expectancy_ci95_high_r": strategy_evidence.get("expectancy_ci95_high_r"),
             "target_reach_probability": target_reach,
-            "confidence": strategy_evidence.get("confidence", "UNKNOWN"),
+            "confidence": completed_confidence,
             "uncertainty": uncertainty,
             "confidence_classification": confidence_class,
-            "evidence_classification": strategy_evidence.get("evidence_classification") or strategy_evidence.get("evidence_strength") or ("INSUFFICIENT" if sample <= 0 else "UNCLASSIFIED"),
+            "research_decision": research_decision,
+            "analysis_trading_decision": analysis_trading_decision,
+            "final_trading_decision": "PENDING_FINAL_VALIDATION",
+            "final_trading_reason": "Ranking is descriptive; final broker, portfolio, sizing, stop, and execution gates run after revalidation.",
+            "evidence_classification": evidence_classification,
+            "target_source": target_source,
+            "target_alternatives": target_alternatives,
+            "learning_objective": str(getattr(signal, "learning_objective", "") or "Measure forward-DEMO outcome across this strategy, instrument, regime, and target model."),
             "score_is_non_authoritative": True,
             "capacity_allowed": capacity_allowed,
             "capacity_reasons": list(capacity_reasons),
@@ -298,7 +342,6 @@ def rank_opportunities(
             "maximum_peer_correlation": max_peer_correlation,
             "correlation_observation": "closed-candle candidate correlation" if max_peer_correlation is not None else "not available",
             "evidence_stage": strategy_evidence.get("evidence_stage", "exploration"),
-            "sample_size": strategy_evidence.get("sample_size", 0),
             "average_mae_r": strategy_evidence.get("average_mae_r"),
             "average_mfe_r": strategy_evidence.get("average_mfe_r"),
             "layering_suitability": bool(getattr(signal, "layering_suitable", False)),

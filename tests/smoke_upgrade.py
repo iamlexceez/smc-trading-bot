@@ -135,6 +135,11 @@ def test_opportunity_context_and_ranking() -> None:
     assert_true(ranked[0].symbol == "Boom 100 Index" and ranked[0].classification == "BEST_OPPORTUNITY", "portfolio-aware ranking did not penalize duplicate same-instrument exposure")
     assert_true("existing same-instrument exposure" in ranked[-1].rationale, "portfolio conflict was not retained in the opportunity thesis rationale")
     assert_true("strategy" in ranked[0].details and "confidence" in ranked[0].details and "thesis" in ranked[0].details, "opportunity board did not retain complete strategy thesis details")
+    assert_true(ranked[0].details["research_decision"] == "RESEARCH_ACCEPTED", "ranked candidate was not explicitly research-accepted")
+    assert_true(ranked[0].details["final_trading_decision"] == "PENDING_FINAL_VALIDATION", "ranking incorrectly authorized objective trading")
+    assert_true(ranked[0].details["evidence_classification"] in {"INSUFFICIENT", "UNCLASSIFIED"}, "missing evidence was not classified conservatively")
+    assert_true(ranked[0].details["risk_distance"] == 0.0 and ranked[0].details["reward_distance"] == 0.0, "incomplete geometry produced fabricated distances")
+    assert_true(ranked[0].details["target_source"] == "UNKNOWN" and ranked[0].details["learning_objective"], "target provenance or learning objective was not retained")
 
 
 def test_capacity_aware_opportunity_selection() -> None:
