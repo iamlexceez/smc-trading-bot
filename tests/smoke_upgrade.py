@@ -125,6 +125,17 @@ def test_strategy_registry_and_selection() -> None:
     assert_true(evidence_class(20, 0.2) == "PROMISING" and evidence_class(60, -0.2) == "VALIDATED", "confidence bands did not use the documented completed-outcome sample sizes")
 
 
+def test_forward_demo_evaluation_provenance() -> None:
+    rows = [
+        {"pnl_r": 1.0, "symbol": "Boom 100 Index", "regime": "TRENDING"},
+        {"pnl_r": -0.5, "symbol": "Boom 100 Index", "regime": "TRENDING"},
+        {"pnl_r": 0.8, "symbol": "XAUUSD", "regime": "RANGING"},
+    ]
+    evaluation = SelfOptimizer._realized_forward_evaluation(rows)
+    assert_true(evaluation["basis"] == "broker_realized_forward_demo_R_outcomes" and evaluation["provenance"] == "FORWARD_DEMO", "forward-DEMO evaluation did not retain realized-data provenance")
+    assert_true(set(evaluation["instrument_partitions"]) == {"Boom 100 Index", "XAUUSD"} and set(evaluation["regime_partitions"]) == {"TRENDING", "RANGING"}, "forward-DEMO evaluation did not retain instrument/regime partitions")
+
+
 def test_expert_hypothesis_evidence_classifier() -> None:
     assert_true(evidence_strength(0) == "UNKNOWN" and evidence_strength(3) == "EARLY" and evidence_strength(50) == "VALIDATED", "expert hypothesis evidence-depth bands are incorrect")
     early = evaluate_hypothesis_evidence(sample_size=5, expectancy_r=0.8, ci_low_r=-0.5, ci_high_r=1.5, historical_sample_size=5, forward_sample_size=5)
@@ -1642,6 +1653,7 @@ def run() -> None:
     asyncio.run(test_deriv_market_universe())
     asyncio.run(test_basket_persistence())
     asyncio.run(test_learning_telemetry_persistence())
+    test_forward_demo_evaluation_provenance()
     test_expert_hypothesis_evidence_classifier()
     asyncio.run(test_expert_knowledge_journal_persistence())
     asyncio.run(test_strategy_evidence_persistence())

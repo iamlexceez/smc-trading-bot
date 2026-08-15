@@ -87,6 +87,27 @@ class SelfOptimizer:
         return eligible
 
     @staticmethod
+    def _realized_forward_evaluation(rows: list[dict]) -> dict:
+        """Evaluate actual forward-DEMO outcomes without hypothetical rescaling."""
+        evaluation = PolicyEvaluator.evaluate(rows).to_dict()
+        evaluation["basis"] = "broker_realized_forward_demo_R_outcomes"
+        evaluation["provenance"] = "FORWARD_DEMO"
+        by_symbol: dict[str, list[dict]] = {}
+        by_regime: dict[str, list[dict]] = {}
+        for row in rows:
+            symbol = str(row.get("symbol") or "UNKNOWN")
+            regime = str(row.get("regime") or "UNKNOWN")
+            by_symbol.setdefault(symbol, []).append(row)
+            by_regime.setdefault(regime, []).append(row)
+        evaluation["instrument_partitions"] = {
+            key: PolicyEvaluator.evaluate(bucket).to_dict() for key, bucket in by_symbol.items()
+        }
+        evaluation["regime_partitions"] = {
+            key: PolicyEvaluator.evaluate(bucket).to_dict() for key, bucket in by_regime.items()
+        }
+        return evaluation
+
+    @staticmethod
     def _historical_simulation(rows: list[dict], policy: ExperimentalPolicy) -> dict:
         """Report a clearly hypothetical risk-sizing simulation from actual R outcomes.
 
@@ -182,21 +203,36 @@ class SelfOptimizer:
                 "reason": "Forward DEMO evidence is still accumulating from broker-realized trade outcomes.",
             }
         experiment_policy = ExperimentalPolicy.from_dict(experiment.get("policy") or {})
-        realized = self._historical_simulation(rows, experiment_policy)
+        # These rows are already broker-realized outcomes from the isolated
+        # forward-DEMO challenger. Do not rescale them and call that ML evidence.
+        realized = self._realized_forward_evaluation(rows)
         historical = experiment.get("evaluation") or {}
-        champion_performance = champion.get("performance") or {}
-        benchmark = float(
-            champion_performance.get("forward_demo", {}).get(
-                "objective",
-                champion_performance.get("out_of_sample_hypothetical_risk_simulation", {}).get("objective", float("-inf")),
-            )
+        # Compare like with like: a realized challenger must not beat a
+        # hypothetical OOS simulation and be called a promotion. Require
+        # broker-realized champion evidence from the same forward interval.
+        champion_rows = await db.get_policy_trade_outcomes(
+            account_mode="demo", policy_version=champion["version"], days=365
         )
-        if not math.isfinite(benchmark):
-            benchmark = float("-inf")
+        forward_started = str(experiment.get("forward_started_at") or "")
+        if forward_started:
+            champion_rows = [row for row in champion_rows if str(row.get("timestamp") or "") >= forward_started]
+        if len(champion_rows) < minimum:
+            return {
+                "decision": "forward_demo_benchmark_collecting",
+                "champion": champion["version"],
+                "challenger": experiment.get("model_version"),
+                "experiment_id": experiment["id"],
+                "challenger_observations": len(rows),
+                "champion_observations": len(champion_rows),
+                "required": minimum,
+                "reason": "Promotion is deferred until a broker-realized champion forward-DEMO benchmark exists; hypothetical OOS results cannot serve as the comparator.",
+            }
+        champion_realized = self._realized_forward_evaluation(champion_rows)
+        benchmark = self._finite_objective(champion_realized)
         candidate_objective = self._finite_objective(realized)
         promoted = candidate_objective >= benchmark + self.settings.optimization_min_improvement and realized["expectancy_r"] > 0
         if promoted:
-            performance = {**historical, "forward_demo": realized}
+            performance = {**historical, "forward_demo": realized, "champion_forward_demo": champion_realized}
             await db.activate_model_version(experiment["model_version"], account_mode="demo", previous_version=champion["version"])
             await db.update_policy_experiment(
                 int(experiment["id"]), status="promoted", evaluation=performance,
@@ -211,6 +247,7 @@ class SelfOptimizer:
                 "challenger": experiment["model_version"],
                 "experiment_id": experiment["id"],
                 "forward_demo": realized,
+                "champion_forward_demo": champion_realized,
                 "reason": "Challenger promotion follows sufficient positive broker-realized DEMO evidence.",
             }
         else:
@@ -224,6 +261,7 @@ class SelfOptimizer:
                 "challenger": experiment["model_version"],
                 "experiment_id": experiment["id"],
                 "forward_demo": realized,
+                "champion_forward_demo": champion_realized,
                 "reason": "Challenger was rejected after actual forward-DEMO evidence, not because it looked aggressive or unfamiliar.",
             }
         await db.log_optimization_run(
@@ -272,12 +310,21 @@ class SelfOptimizer:
         train, validation, oos, windows = split
         champion_policy = ExperimentalPolicy.from_dict(champion["parameters"])
         baseline = self._evaluate_policy(champion_policy, train, validation, oos)
-        candidates = self.generator.generate([hypothesis for hypothesis, _ in hypotheses])
+        research_budget = {
+            "candidate_limit": 24,
+            "minimum_total_samples": max(self.settings.optimization_min_sample_size, self.settings.optimization_min_split_size * 3),
+            "minimum_split_size": self.settings.optimization_min_split_size,
+            "chronological_windows": {"training": 0.60, "validation": 0.20, "locked_out_of_sample": 0.20},
+            "random_cross_validation": False,
+        }
+        candidates = self.generator.generate([hypothesis for hypothesis, _ in hypotheses], limit=research_budget["candidate_limit"])
         min_split = self.settings.optimization_min_split_size
         best: Optional[dict] = None
+        policies_evaluated = 0
         for policy in candidates:
             if policy.fingerprint == champion_policy.fingerprint:
                 continue
+            policies_evaluated += 1
             evidence = self._evaluate_policy(policy, train, validation, oos)
             if min(evidence[name]["sample_size"] for name in ("training", "validation", "out_of_sample")) < min_split:
                 continue
@@ -292,6 +339,7 @@ class SelfOptimizer:
                 "champion": champion["version"],
                 "baseline": baseline,
                 "reason": "No independently specified policy had sufficient positive validation evidence across all chronological windows.",
+                "research_budget": {**research_budget, "policies_generated": len(candidates), "policies_evaluated": policies_evaluated},
             }
             await db.log_optimization_run(account_mode="demo", decision=result["decision"], details=result, champion_version=champion["version"])
             return result
@@ -305,6 +353,7 @@ class SelfOptimizer:
                 "challenger": best["evidence"],
                 "improvement": improvement,
                 "reason": "Candidate did not improve the unseen historical objective enough to justify forward-DEMO allocation.",
+                "research_budget": {**research_budget, "policies_generated": len(candidates), "policies_evaluated": policies_evaluated},
             }
             await db.log_optimization_run(account_mode="demo", decision=result["decision"], details=result, champion_version=champion["version"])
             return result
@@ -335,6 +384,7 @@ class SelfOptimizer:
             "challenger_evidence": best["evidence"],
             "improvement": improvement,
             "reason": "The challenger passed chronological historical evidence and is now isolated for DEMO forward testing; it is not a champion yet.",
+            "research_budget": {**research_budget, "policies_generated": len(candidates), "policies_evaluated": policies_evaluated},
         }
         await db.log_optimization_run(
             account_mode="demo", decision=result["decision"], details=result,
