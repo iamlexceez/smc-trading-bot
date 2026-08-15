@@ -286,6 +286,8 @@ def rank_opportunities(
             "confidence": strategy_evidence.get("confidence", "UNKNOWN"),
             "uncertainty": uncertainty,
             "confidence_classification": confidence_class,
+            "evidence_classification": strategy_evidence.get("evidence_classification") or strategy_evidence.get("evidence_strength") or ("INSUFFICIENT" if sample <= 0 else "UNCLASSIFIED"),
+            "score_is_non_authoritative": True,
             "capacity_allowed": capacity_allowed,
             "capacity_reasons": list(capacity_reasons),
             "account_state": account_state,

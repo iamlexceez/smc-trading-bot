@@ -49,6 +49,7 @@ from execution import capital_reduction as capital_reduction_module
 from analysis.capital_state import AccountCapitalState, CapitalStateService
 from analysis.capital_protection import calculate_capital_protection
 from analysis.opportunity import market_context, rank_opportunities
+from analysis.decision_gates import classify_confidence, classify_evidence, evaluate_trading_gate
 from analysis.runtime_telemetry import RuntimeTelemetry
 from strategy.setup_validator import calculate_rr, rr_filter_passes
 from strategy.registry import applicable_strategies, definitions
@@ -62,6 +63,34 @@ from telegram.error import BadRequest
 def assert_true(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def test_two_gate_decision_architecture() -> None:
+    weak = {"sample_size": 0, "evidence_stage": "exploration", "confidence": "UNKNOWN"}
+    decision = evaluate_trading_gate(
+        setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
+        objective_permits_exposure=True, evidence=weak, champion_governed=True,
+    )
+    assert_true(decision.research_decision == "RESEARCH_ACCEPTED", "research gate did not accept a measurable candidate")
+    assert_true(decision.trading_decision == "INSUFFICIENT_EVIDENCE", "under-evidenced candidate was allowed objective trading")
+    assert_true(decision.evidence_classification == "INSUFFICIENT" and decision.confidence_classification == "UNVALIDATED", "evidence and confidence were not tracked independently")
+
+    strong = {"sample_size": 80, "evidence_strength": "STRONG_EVIDENCE", "evidence_stage": "forward_demo", "confidence": "VALIDATED"}
+    challenger = evaluate_trading_gate(
+        setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
+        objective_permits_exposure=True, evidence=strong, champion_governed=False,
+    )
+    assert_true(challenger.trading_decision == "OBJECTIVE_INELIGIBLE", "challenger policy bypassed champion governance")
+
+    score_only = evaluate_trading_gate(
+        setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
+        objective_permits_exposure=True,
+        evidence={"sample_size": 0, "evidence_stage": "exploration", "confidence": "UNKNOWN", "feature_score": 99.9},
+        champion_governed=True,
+    )
+    assert_true(score_only.trading_decision != "TRADE_APPROVED", "feature score alone authorized objective trading")
+    assert_true(classify_evidence({"evidence_strength": "PROMISING"}) == "MODERATE", "existing evidence label was not normalized")
+    assert_true(classify_confidence({"confidence": "UNKNOWN"}) == "UNVALIDATED", "unknown confidence was fabricated into a validated state")
 
 
 def test_broker_stop_normalization() -> None:
@@ -1902,6 +1931,7 @@ async def test_strategy_transition_evidence_persistence() -> None:
 
 
 def run() -> None:
+    test_two_gate_decision_architecture()
     test_broker_stop_normalization()
     asyncio.run(test_engine_scanner_gate_rendering())
     test_pause_resume_command_registration()

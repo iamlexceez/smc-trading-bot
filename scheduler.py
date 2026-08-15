@@ -29,6 +29,7 @@ from analysis.indicators import pip_value, atr
 from strategy.setup_scorer import score_setup_quality
 from strategy.setup_validator import EntryMode, SetupValidator
 from strategy.selection import evaluate_strategies
+from strategy.registry import get_strategy
 from analysis.sessions import check_trading_session
 from analysis.confirmation import get_confirmation
 from analysis.liquidity import build_liquidity_pools, select_market_target
@@ -47,6 +48,7 @@ from analysis.runtime_telemetry import RuntimeTelemetry
 from analysis.objectives import phase_for_equity
 from analysis.objective_phases import plan_objective_phases
 from analysis.opportunity import market_context, rank_opportunities
+from analysis.decision_gates import GateDecision, classify_confidence, classify_evidence, evaluate_trading_gate
 from data.provider import DataProvider
 from data.universe import DerivMarketUniverse
 
@@ -1708,9 +1710,33 @@ class MarketScheduler:
             )
             return await record_analysis_outcome("NO_SETUP", policy_reason, details={"regime": regime, "bias": direction, "strategy": selected_strategy, "actual_rr": validation.rr_ratio},)
 
+        evidence_classification = classify_evidence(strategy_evidence)
+        confidence_classification = classify_confidence(strategy_evidence)
+        target_alternatives = [
+            {
+                **dict(candidate),
+                "selected": bool(
+                    validation.target_pool is not None
+                    and abs(float(candidate.get("level") or 0.0) - float(validation.target_pool.level)) <= 1e-12
+                ),
+            }
+            for candidate in list(getattr(validation, "target_candidates", []) or [])
+        ]
+        if not target_alternatives:
+            target_alternatives = [{
+                "source": validation.target_source or (validation.target_pool.kind.value if validation.target_pool else "unknown"),
+                "price": validation.take_profit,
+                "rr": validation.rr_ratio,
+                "selected": True,
+            }]
+        learning_objective = (
+            f"Measure the broker-realized and counterfactual performance of {selected_strategy} "
+            f"for {symbol} in regime {regime} on {primary_tf} using target source "
+            f"{validation.target_source or 'unknown'}."
+        )
         await self._chart_activity(
             "setup_validated", symbol,
-            f"✅ **EXPERIMENT CANDIDATE ACCEPTED — {symbol}**\nPolicy: `{policy_version or self.settings.active_model_version}` | Direction: `{direction}` | Timeframe: `{primary_tf}`\nTP source: `{validation.target_source or 'none'}` | TP price: `{validation.take_profit:.5f}`\nEntry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}`\nRisk distance: `{abs(validation.entry_price - validation.stop_loss):.5f}` | Reward distance: `{abs(validation.take_profit - validation.entry_price):.5f}`\nActual RR: `1:{validation.rr_ratio:.8f}` | Configured minimum RR: `1:{required_rr:.8f}`\nFinal decision: `ACCEPTED` | Feature rank: `{quality.score:.1f}/100`\nTP detail: {validation.target_reason or 'No target detail recorded'}",
+            f"✅ **EXPERIMENT CANDIDATE ACCEPTED — {symbol}**\nPolicy: `{policy_version or self.settings.active_model_version}` | Direction: `{direction}` | Timeframe: `{primary_tf}`\nTP source: `{validation.target_source or 'none'}` | TP price: `{validation.take_profit:.5f}`\nEntry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}`\nRisk distance: `{abs(validation.entry_price - validation.stop_loss):.5f}` | Reward distance: `{abs(validation.take_profit - validation.entry_price):.5f}`\nActual RR: `1:{validation.rr_ratio:.8f}` | Configured minimum RR: `1:{required_rr:.8f}`\nResearch decision: `RESEARCH_ACCEPTED` | Objective trading: `PENDING`\nEvidence: `{evidence_classification}` | Confidence: `{confidence_classification}` | Feature rank: `{quality.score:.1f}/100`\nWhy tested: candidate is measurable for research; objective exposure requires independent evidence and governance.\nTP detail: {validation.target_reason or 'No target detail recorded'}",
             fingerprint=f"{bar_time}:{direction}:{policy.fingerprint}:{validation.entry_price}:{validation.stop_loss}:{validation.take_profit}",
         )
 
@@ -1761,6 +1787,23 @@ class MarketScheduler:
                 "structure_event_available_index": getattr(structure.last_event, "available_index", None),
                 "confirmation_available_index": getattr(validation.confirmation, "available_index", None),
             },
+            research_decision="RESEARCH_ACCEPTED",
+            trading_decision="DEFERRED",
+            evidence_classification=evidence_classification,
+            confidence_classification=confidence_classification,
+            research_reason="Candidate is sufficiently measurable to retain as a research observation.",
+            trading_reason="Objective-trading gate has not yet approved exposure.",
+            learning_objective=learning_objective,
+            target_alternatives=target_alternatives,
+            setup_quality_components={
+                "quality_factors": [
+                    {"name": factor.name, "points": factor.points, "maximum": factor.maximum, "detail": factor.detail}
+                    for factor in quality.factors
+                ],
+                "overall_feature_score": quality.score,
+                "evidence": evidence_classification,
+                "confidence": confidence_classification,
+            },
         )
         signal.policy_version = policy_version or self.settings.active_model_version
         signal.experiment_id = experiment_id
@@ -1780,8 +1823,18 @@ class MarketScheduler:
             and str(strategy_evidence.get("confidence") or "UNKNOWN") in {"PROMISING", "VALIDATED", "STRONG_EVIDENCE"}
         )
         return await record_analysis_outcome(
-            "SETUP_FOUND", "Candidate passed analysis and policy validation",
-            details={"regime": regime, "bias": direction, "strategy": selected_strategy, "uncertainty": strategy_evidence.get("confidence"), "setups_detected": 1},
+            "SETUP_FOUND", "Research candidate accepted; objective-trading approval remains independent",
+            details={
+                "regime": regime, "bias": direction, "strategy": selected_strategy,
+                "uncertainty": strategy_evidence.get("confidence"), "setups_detected": 1,
+                "research_decision": signal.research_decision,
+                "trading_decision": signal.trading_decision,
+                "evidence_classification": signal.evidence_classification,
+                "confidence_classification": signal.confidence_classification,
+                "learning_objective": signal.learning_objective,
+                "target_alternatives": signal.target_alternatives,
+                "score_is_non_authoritative": True,
+            },
             signal=signal,
         )
 
@@ -1808,6 +1861,44 @@ class MarketScheduler:
             raise
         self.telemetry.component_succeeded("execution_engine", waiting=True)
         return result
+
+    async def _evaluate_objective_trade_gate(self, signal: TradeSignal, account: dict, open_positions: list) -> GateDecision:
+        """Evaluate objective exposure separately from research acceptance.
+
+        This gate is intentionally upstream of sizing/order submission but downstream
+        of research analysis. It never replaces broker, margin, stop, or duplicate
+        order validation and it never turns a single feature score into authority.
+        """
+        active = await db.get_active_objective(self.settings.trading_mode)
+        operational = dict(((active or {}).get("context") or {}).get("operational") or {})
+        capital_state = str((self.last_capital_state or {}).get("state") or "ACCOUNT_STATE_UNKNOWN")
+        free_margin = float(account.get("free_margin") or 0.0)
+        objective_permits = bool(
+            self.settings.auto_trade and not self.settings.is_paused
+            and capital_state not in AccountCapitalState.BLOCKING
+            and free_margin > 0.0
+            and not bool(operational.get("terminal"))
+        )
+        policy = dict(signal.experimental_policy or {})
+        required_timeframes = list(policy.get("required_timeframes") or [])
+        strategy_definition = get_strategy(str(getattr(signal, "selected_strategy", "") or signal.setup_type))
+        registry_requires_htf = bool(strategy_definition and "htf_alignment" in strategy_definition.required_features)
+        required_htf = bool(policy.get("requires_htf_context")) or bool(required_timeframes) or registry_requires_htf
+        htf_available = bool(signal.htf_bias) if required_htf else True
+        evidence = dict(signal.strategy_evidence or signal.evidence_summary or {})
+        champion_governed = signal.experiment_id is None
+        portfolio_approved = not any(str(getattr(position, "symbol", "")) == str(signal.symbol) for position in open_positions)
+        return evaluate_trading_gate(
+            setup_valid=bool(signal.validation and signal.validation.valid),
+            broker_symbol_valid=self._analysis_symbol_is_eligible(signal.symbol),
+            valid_market_data=bool(signal.causality.get("decision_index") is not None),
+            objective_permits_exposure=objective_permits,
+            evidence=evidence,
+            champion_governed=champion_governed,
+            portfolio_approved=portfolio_approved,
+            structural_conflict=str(evidence.get("decision") or "").upper() in {"REJECTED", "CONFLICTED"},
+            required_htf_context_available=htf_available,
+        )
 
     async def _execute_signal(self, signal: TradeSignal, df: pd.DataFrame = None) -> bool:
         """Run risk checks and submit a broker order only if the candidate remains valid."""
@@ -1873,6 +1964,33 @@ class MarketScheduler:
             today_count = await db.get_today_trade_count(self.settings.trading_mode)
             consecutive_losses = await db.get_consecutive_losses(account_mode=self.settings.trading_mode)
             open_positions = await self.executor.get_open_positions()
+            gate = await self._evaluate_objective_trade_gate(signal, account, open_positions)
+            signal.research_decision = gate.research_decision
+            signal.trading_decision = gate.trading_decision
+            signal.evidence_classification = gate.evidence_classification
+            signal.confidence_classification = gate.confidence_classification
+            signal.trading_reason = gate.reason
+            if gate.trading_decision != "TRADE_APPROVED":
+                self.telemetry.increment("no_trade_decisions")
+                self.telemetry.record_rejection(f"TRADING_GATE: {gate.reason}")
+                if setup_id is not None:
+                    await db.update_setup_record(setup_id, status="objective_trade_rejected", rejection_reason=gate.reason)
+                    await db.record_execution_event(
+                        account_mode=self.settings.trading_mode, symbol=symbol, setup_id=setup_id,
+                        status="objective_trade_rejected", requested_price=signal.entry_price,
+                        reason=gate.reason, details={"decision": gate.to_dict(), "score_is_non_authoritative": True},
+                    )
+                await self._chart_activity(
+                    "execution_rejected", symbol,
+                    f"⛔ **OBJECTIVE TRADING GATE — {symbol}**\nResearch: `{gate.research_decision}`\nTrading: `{gate.trading_decision}`\nEvidence: `{gate.evidence_classification}` | Confidence: `{gate.confidence_classification}`\nWhy not traded: {gate.reason}\nThe candidate remains available for research and counterfactual learning. No order was submitted.",
+                    fingerprint=f"{setup_id}:objective-gate:{gate.trading_decision}:{gate.reason}", essential=True,
+                )
+                return False
+            await db.record_execution_event(
+                account_mode=self.settings.trading_mode, symbol=symbol, setup_id=setup_id,
+                status="objective_trade_approved", requested_price=signal.entry_price,
+                reason=gate.reason, details={"decision": gate.to_dict(), "score_is_non_authoritative": True},
+            )
             sym_info = await self._execution_symbol_spec(symbol, signal.direction)
             stop_preflight = await self.executor.validate_market_order_stops(
                 symbol, signal.direction, signal.stop_loss, signal.take_profit
@@ -2127,6 +2245,15 @@ class MarketScheduler:
                     "policy_version": signal.policy_version,
                     "experiment_id": signal.experiment_id,
                     "experimental_policy": signal.experimental_policy,
+                    "research_decision": signal.research_decision,
+                    "trading_decision": signal.trading_decision,
+                    "evidence_classification": signal.evidence_classification,
+                    "confidence_classification": signal.confidence_classification,
+                    "research_reason": signal.research_reason,
+                    "trading_reason": signal.trading_reason,
+                    "learning_objective": signal.learning_objective,
+                    "target_alternatives": signal.target_alternatives,
+                    "setup_quality_components": signal.setup_quality_components,
                     "quality_factors": [
                         {"name": factor.name, "points": factor.points, "maximum": factor.maximum, "detail": factor.detail}
                         for factor in signal.quality_factors
@@ -2165,7 +2292,14 @@ class MarketScheduler:
                     executed_price=result.entry_price,
                     execution_delay_ms=(perf_counter() - execution_started) * 1000,
                     status="filled",
-                    details={"lot_size": result.lot_size, "entry_mode": signal.entry_mode, "sizing": sizing.evidence()},
+                    details={
+                        "lot_size": result.lot_size, "entry_mode": signal.entry_mode, "sizing": sizing.evidence(),
+                        "research_decision": signal.research_decision,
+                        "trading_decision": signal.trading_decision,
+                        "evidence_classification": signal.evidence_classification,
+                        "confidence_classification": signal.confidence_classification,
+                        "score_is_non_authoritative": True,
+                    },
                 )
                 basket_id = await db.create_trade_basket(
                     symbol=symbol,

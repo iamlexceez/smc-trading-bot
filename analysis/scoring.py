@@ -59,6 +59,16 @@ class TradeSignal:
     invalidation_reason: str = ""
     management_plan: dict[str, Any] = field(default_factory=dict)
     causality: dict[str, Any] = field(default_factory=dict)
+    # Research acceptance and objective-trading approval are deliberately separate.
+    research_decision: str = "RESEARCH_REJECTED"
+    trading_decision: str = "DEFERRED"
+    evidence_classification: str = "INSUFFICIENT"
+    confidence_classification: str = "UNVALIDATED"
+    research_reason: str = ""
+    trading_reason: str = ""
+    learning_objective: str = ""
+    target_alternatives: list[dict[str, Any]] = field(default_factory=list)
+    setup_quality_components: dict[str, Any] = field(default_factory=dict)
 
     @property
     def passed_gates(self) -> bool:
@@ -71,6 +81,8 @@ def format_signal_report(signal: TradeSignal) -> str:
         f"📊 **{signal.symbol}** — `{signal.direction}` ({signal.timeframe})",
         f"Setup: `{signal.setup_type}` | Entry model: `{signal.entry_mode}`",
         f"Quality rank: `{signal.score:.1f}/100` | Market-derived RR: `1:{signal.rr_ratio:.2f}`",
+        f"Research: `{signal.research_decision}` | Objective trading: `{signal.trading_decision}`",
+        f"Evidence: `{signal.evidence_classification}` | Confidence: `{signal.confidence_classification}`",
         "",
         f"Entry: `{signal.entry_price:.5f}` | SL: `{signal.stop_loss:.5f}` | TP: `{signal.take_profit:.5f}`",
     ]
@@ -90,7 +102,9 @@ def format_signal_report(signal: TradeSignal) -> str:
             else:
                 header.append(f"• {factor.name}: `{factor.score:.1f}` — {factor.detail}")
 
-    header.extend(["", ("✅ **VALIDATED — execution still subject to portfolio and broker checks**" if signal.passed else f"❌ **NOT EXECUTABLE**: {signal.rejection_reason or 'Hard validity or safety check failed'}")])
+    if signal.trading_reason:
+        header.extend([f"Trading-gate reason: {signal.trading_reason}"])
+    header.extend(["", ("✅ **RESEARCH ACCEPTED — objective trading remains independently gated**" if signal.research_decision == "RESEARCH_ACCEPTED" else f"❌ **RESEARCH REJECTED**: {signal.rejection_reason or 'Research gate failed'}")])
     return "\n".join(header)
 
 
