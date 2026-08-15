@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
-from itertools import product
 from statistics import mean, pstdev
 from typing import Any, Iterable, Optional
 

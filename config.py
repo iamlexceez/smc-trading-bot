@@ -121,6 +121,12 @@ class TradeSettings:
     # universe and all risk checks are verified; LIVE remains separately gated.
     autonomous_learning_mode: bool = True
     auto_trade: bool = True
+    # Controlled DEMO exploration is explicit policy configuration. It never
+    # authorizes LIVE exposure and never bypasses downstream broker/risk gates.
+    exploration_enabled: bool = True
+    exploration_min_setup_score: float = 80.0
+    exploration_min_strategy_score: float = 80.0
+    exploration_risk_multiplier: float = 0.5
     is_paused: bool = False
     # Explains why bot-wide automation is paused. This prevents verified
     # broker recovery or standalone-scope activation from overriding a

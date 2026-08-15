@@ -14,15 +14,20 @@ from typing import Any, Mapping
 _EVIDENCE_ALIASES = {
     "STRONG": "STRONG",
     "STRONG_EVIDENCE": "STRONG",
-    "VALIDATED": "STRONG",
-    "MODERATE": "MODERATE",
-    "PROMISING": "MODERATE",
-    "OBSERVED": "MODERATE",
-    "WEAK": "WEAK",
-    "EARLY": "WEAK",
+    "VALIDATED": "VALIDATED",
+    "SUPPORTED": "VALIDATED",
+    "MODERATE": "PRELIMINARY",
+    "PROMISING": "PRELIMINARY",
+    "OBSERVED": "PRELIMINARY",
+    "PRELIMINARY": "PRELIMINARY",
+    "EMERGING": "EMERGING",
+    "WEAK": "INSUFFICIENT",
+    "EARLY": "EMERGING",
     "UNKNOWN": "INSUFFICIENT",
     "INSUFFICIENT": "INSUFFICIENT",
     "INSUFFICIENT_EVIDENCE": "INSUFFICIENT",
+    "NEGATIVE": "NEGATIVE",
+    "INVALIDATED": "INVALIDATED",
     "CONFLICTED": "CONFLICTED",
 }
 
@@ -54,12 +59,23 @@ class GateDecision:
 def classify_evidence(evidence: Mapping[str, Any] | None) -> str:
     """Classify only from explicitly recorded evidence; missing data is insufficient."""
     data = dict(evidence or {})
+    decision = str(data.get("decision") or "").strip().upper()
+    if decision in {"REJECTED", "NEGATIVE"}:
+        return "NEGATIVE"
+    if decision in {"INVALIDATED", "UNRELIABLE"}:
+        return "INVALIDATED"
+    if decision in {"CONFLICTED", "MATERIAL_CONFLICT"}:
+        return "CONFLICTED"
     explicit = str(data.get("evidence_classification") or data.get("evidence_strength") or data.get("confidence") or "").strip().upper()
     if explicit in _EVIDENCE_ALIASES:
         return _EVIDENCE_ALIASES[explicit]
     stage = str(data.get("evidence_stage") or "").strip().lower()
-    if stage in {"forward_demo", "validated", "champion"}:
-        return "MODERATE"
+    if stage in {"champion", "validated"}:
+        return "VALIDATED"
+    if stage == "forward_demo":
+        return "PRELIMINARY"
+    if stage in {"emerging", "early"}:
+        return "EMERGING"
     if stage in {"exploration", "insufficient_evidence", ""}:
         return "INSUFFICIENT"
     return "INSUFFICIENT"
@@ -94,6 +110,9 @@ def evaluate_trading_gate(
     exploratory_threshold: float | None = None,
     demo_mode: bool = False,
     experiment_id: int | None = None,
+    exploration_authorized: bool = False,
+    strategy_quality: float | None = None,
+    strategy_threshold: float | None = None,
     risk_valid: bool = True,
 ) -> GateDecision:
     """Evaluate objective eligibility without using a single score as authority.
@@ -113,13 +132,16 @@ def evaluate_trading_gate(
         failures.append("Valid setup geometry")
     if not objective_permits_exposure:
         failures.append("Objective/account permits new exposure")
-    if evidence_classification in {"INSUFFICIENT", "WEAK"}:
+    evidence_gap = evidence_classification in {"INSUFFICIENT", "EMERGING", "PRELIMINARY"} or confidence_classification in {"LOW", "UNVALIDATED"}
+    if evidence_gap:
         failures.append(f"Sufficient evidence ({evidence_classification})")
+    if evidence_classification in {"NEGATIVE", "INVALIDATED"}:
+        failures.append(f"Negative or invalidated evidence ({evidence_classification})")
     if evidence_classification == "CONFLICTED" or structural_conflict:
         failures.append("Unresolved structural conflict")
     if confidence_classification in {"LOW", "UNVALIDATED"}:
         failures.append(f"Validated confidence ({confidence_classification})")
-    if not champion_governed and not forward_demo_experiment_allowed:
+    if not champion_governed and not forward_demo_experiment_allowed and not exploration_authorized:
         failures.append("Champion/challenger governance")
     if not portfolio_approved:
         failures.append("Portfolio context")
@@ -133,18 +155,28 @@ def evaluate_trading_gate(
         "Objective/account permits new exposure", "Portfolio context", "Risk policy validity",
     }
     hard_blocked = any(item in hard_failures for item in failures)
-    evidence_gap = evidence_classification in {"INSUFFICIENT", "WEAK"} or confidence_classification in {"LOW", "UNVALIDATED"}
+    evidence_gap = evidence_classification in {"INSUFFICIENT", "EMERGING", "PRELIMINARY"} or confidence_classification in {"LOW", "UNVALIDATED"}
     threshold = float(exploratory_threshold) if exploratory_threshold is not None else None
+    exploration_quality_failures: list[str] = []
+    if exploration_authorized and evidence_gap:
+        if threshold is None:
+            exploration_quality_failures.append("Exploration setup threshold is not configured")
+        elif float(setup_quality or 0.0) < threshold:
+            exploration_quality_failures.append(f"Setup quality {float(setup_quality or 0.0):.1f} below exploration threshold {threshold:.1f}")
+        if strategy_threshold is not None and float(strategy_quality or 0.0) < float(strategy_threshold):
+            exploration_quality_failures.append(f"Strategy match {float(strategy_quality or 0.0):.1f} below exploration threshold {float(strategy_threshold):.1f}")
+    failures.extend(exploration_quality_failures)
     controlled_exploration = bool(
         demo_mode
-        and experiment_id is not None
-        and forward_demo_experiment_allowed
+        and exploration_authorized
+        and (forward_demo_experiment_allowed or champion_governed or experiment_id is None)
         and evidence_gap
         and not hard_blocked
         and not structural_conflict
         and required_htf_context_available
         and threshold is not None
         and float(setup_quality or 0.0) >= threshold
+        and (strategy_threshold is None or float(strategy_quality or 0.0) >= float(strategy_threshold))
     )
 
     if controlled_exploration:
@@ -154,7 +186,7 @@ def evaluate_trading_gate(
             evidence_classification=evidence_classification,
             confidence_classification=confidence_classification,
             final_state="EXPLORATORY_DEMO",
-            reason="Insufficient completed evidence is being handled as an isolated forward-DEMO exploration; broker, objective, portfolio, and downstream sizing/order safeguards remain mandatory.",
+            reason="Insufficient completed evidence is being handled as controlled DEMO exploration; champion/challenger status governs promotion, not the ability to collect evidence. Broker, objective, portfolio, and downstream sizing/order safeguards remain mandatory.",
             failures=tuple(failures),
         )
 
@@ -163,6 +195,10 @@ def evaluate_trading_gate(
             decision, final_state = "DEFERRED", "WAITING_FOR_CONFIRMATION"
         elif any(item.startswith("Objective") or item.startswith("Champion") for item in failures):
             decision, final_state = "OBJECTIVE_INELIGIBLE", "EXECUTION_BLOCKED"
+        elif any(item.startswith("Negative") for item in failures):
+            decision, final_state = "TRADE_REJECTED", "REJECTED"
+        elif any(item.startswith("Setup quality") or item.startswith("Strategy match") or item.startswith("Exploration") for item in failures):
+            decision, final_state = "TRADE_REJECTED", "REJECTED"
         elif any(item.startswith("Sufficient") or item.startswith("Validated") or item.startswith("Required") for item in failures):
             decision, final_state = "INSUFFICIENT_EVIDENCE", "WAITING_FOR_CONFIRMATION"
         else:

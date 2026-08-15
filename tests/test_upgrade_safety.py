@@ -92,11 +92,54 @@ def test_insufficient_evidence_can_be_controlled_forward_demo_exploration() -> N
         setup_quality=84.5,
         exploratory_threshold=80.0,
         demo_mode=True,
-        experiment_id=17,
+        experiment_id=None,
+        exploration_authorized=True,
     )
     assert decision.trading_decision == "CONTROLLED_FORWARD_DEMO"
     assert decision.final_state == "EXPLORATORY_DEMO"
     assert decision.evidence_classification == "INSUFFICIENT"
+
+
+def test_negative_evidence_is_rejected_even_when_setup_is_strong() -> None:
+    from analysis.decision_gates import evaluate_trading_gate
+
+    decision = evaluate_trading_gate(
+        setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
+        objective_permits_exposure=True,
+        evidence={"evidence_classification": "NEGATIVE", "confidence_classification": "HIGH"},
+        champion_governed=True, portfolio_approved=True,
+        required_htf_context_available=True,
+    )
+    assert decision.evidence_classification == "NEGATIVE"
+    assert decision.trading_decision == "TRADE_REJECTED"
+    assert decision.final_state == "REJECTED"
+
+
+def test_evidence_states_do_not_collapse_unknown_into_negative() -> None:
+    from analysis.decision_gates import classify_evidence
+
+    assert classify_evidence({"evidence_classification": "INSUFFICIENT"}) == "INSUFFICIENT"
+    assert classify_evidence({"evidence_classification": "EMERGING"}) == "EMERGING"
+    assert classify_evidence({"evidence_classification": "VALIDATED"}) == "VALIDATED"
+    assert classify_evidence({"evidence_classification": "INVALIDATED"}) == "INVALIDATED"
+
+
+def test_weak_setup_with_insufficient_evidence_is_rejected() -> None:
+    from analysis.decision_gates import evaluate_trading_gate
+
+    decision = evaluate_trading_gate(
+        setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
+        objective_permits_exposure=True,
+        evidence={"evidence_classification": "INSUFFICIENT"},
+        champion_governed=False, portfolio_approved=True,
+        required_htf_context_available=True,
+        setup_quality=61.0, exploratory_threshold=80.0,
+        strategy_quality=84.0, strategy_threshold=80.0,
+        demo_mode=True, exploration_authorized=True,
+    )
+    assert decision.trading_decision == "TRADE_REJECTED"
+    assert decision.final_state == "REJECTED"
+    assert "below exploration threshold" in decision.reason
 
 
 def test_insufficient_evidence_does_not_override_hard_gate() -> None:
@@ -116,7 +159,8 @@ def test_insufficient_evidence_does_not_override_hard_gate() -> None:
         setup_quality=95.0,
         exploratory_threshold=80.0,
         demo_mode=True,
-        experiment_id=17,
+        experiment_id=None,
+        exploration_authorized=True,
     )
     assert decision.final_state == "EXECUTION_BLOCKED"
     assert decision.trading_decision == "OBJECTIVE_INELIGIBLE"
@@ -137,6 +181,7 @@ def test_conflicted_top_down_context_is_explicitly_waiting() -> None:
         structural_conflict=True,
         required_htf_context_available=True,
         setup_quality=90.0,
+        exploration_authorized=True,
         exploratory_threshold=80.0,
         demo_mode=True,
         experiment_id=17,

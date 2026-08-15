@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import math
 from typing import Any, Iterable
 
-from strategy.registry import StrategyDefinition, applicable_strategies
+from strategy.registry import applicable_strategies
 
 
 @dataclass(frozen=True)
@@ -37,25 +37,17 @@ def _finite(value: Any, default: float = 0.0) -> float:
 
 
 def evidence_class(sample_size: int, expectancy_r: float | None) -> str:
-    """Documented confidence labels; sample count prevents overclaiming.
-
-    UNKNOWN=<3 completed outcomes; EARLY=3–9; OBSERVED=10–19;
-    PROMISING=20–49; VALIDATED=50–99; STRONG_EVIDENCE=100+. Confidence
-    measures sample depth only; displayed expectancy remains the separate,
-    potentially negative outcome estimate.
-    """
+    """Return explicit evidence states; depth is not a profitability claim."""
     del expectancy_r
     if sample_size < 3:
-        return "UNKNOWN"
+        return "INSUFFICIENT"
     if sample_size < 10:
-        return "EARLY"
+        return "EMERGING"
     if sample_size < 20:
-        return "OBSERVED"
+        return "PRELIMINARY"
     if sample_size < 50:
-        return "PROMISING"
-    if sample_size < 100:
         return "VALIDATED"
-    return "STRONG_EVIDENCE"
+    return "STRONG"
 
 
 def evaluate_strategies(

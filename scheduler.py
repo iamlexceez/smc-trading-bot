@@ -1537,11 +1537,17 @@ class MarketScheduler:
 
         # Fetch HTF structures for confluence
         htf_structures = []
+        htf_context = []
         for htf in self.settings.htf_timeframes[:2]:
             htf_df = await self.fetch_candles(symbol, htf, 200, purpose="analysis")
             if not htf_df.empty and len(htf_df) >= 20:
                 htf_struct = analyze_structure(htf_df, lookback=3)
                 htf_structures.append(htf_struct)
+                htf_context.append({
+                    "timeframe": htf,
+                    "bias": htf_struct.trend.value.upper(),
+                    "event": htf_struct.last_event.event_type.value,
+                })
 
         # Determine trade direction from the current closed-candle structure.
         event_name = structure.last_event.event_type.value.replace("_", " ").upper()
@@ -1864,10 +1870,7 @@ class MarketScheduler:
         signal.market_context = regime_context
         signal.symbol_profile = profile
         signal.htf_bias = [item.trend.value for item in htf_structures]
-        signal.htf_context = [
-            {"timeframe": timeframe, "bias": structure.trend.value.upper()}
-            for timeframe, structure in zip(self.settings.htf_timeframes, htf_structures)
-        ]
+        signal.htf_context = htf_context
         htf_biases = {item["bias"] for item in signal.htf_context}
         signal.htf_bias_status = "CONFLICTED" if {"BULLISH", "BEARISH"}.issubset(htf_biases) else (next(iter(htf_biases), "UNKNOWN"))
         signal.selected_strategy = selected_strategy
@@ -1944,16 +1947,27 @@ class MarketScheduler:
         htf_available = bool(signal.htf_bias) if required_htf else True
         evidence = dict(signal.strategy_evidence or signal.evidence_summary or {})
         setup_quality = float((signal.setup_quality_components or {}).get("overall_feature_score", signal.score) or signal.score or 0.0)
+        strategy_quality = float(getattr(signal, "strategy_score", 0.0) or 0.0)
         exploratory_threshold = policy.get("exploratory_setup_threshold")
+        if exploratory_threshold is None:
+            exploratory_threshold = self.settings.exploration_min_setup_score
+        strategy_threshold = self.settings.exploration_min_strategy_score
         structural_conflict = (
             str(evidence.get("decision") or "").upper() in {"REJECTED", "CONFLICTED"}
             or str(getattr(signal, "htf_bias_status", "")).upper() == "CONFLICTED"
         )
-        champion_governed = signal.experiment_id is None
+        champion_governed = signal.experiment_id is None and not bool(signal.policy_version and signal.policy_version != self.settings.active_model_version)
         forward_demo_experiment_allowed = bool(
             signal.experiment_id is not None
             and self.settings.trading_mode == "demo"
             and not bool(operational.get("terminal"))
+        )
+        exploration_authorized = bool(
+            self.settings.exploration_enabled
+            and self.settings.trading_mode == "demo"
+            and not self.settings.is_paused
+            and not bool(operational.get("terminal"))
+            and capital_state not in AccountCapitalState.BLOCKING
         )
         portfolio_approved = not any(str(getattr(position, "symbol", "")) == str(signal.symbol) for position in open_positions)
         return evaluate_trading_gate(
@@ -1971,7 +1985,13 @@ class MarketScheduler:
             exploratory_threshold=float(exploratory_threshold) if exploratory_threshold is not None else None,
             demo_mode=self.settings.trading_mode == "demo",
             experiment_id=signal.experiment_id,
-            risk_valid=bool(signal.experimental_policy.get("risk_model") or signal.experimental_policy.get("fixed_volume")),
+            exploration_authorized=exploration_authorized,
+            strategy_quality=strategy_quality,
+            strategy_threshold=strategy_threshold,
+            risk_valid=(
+                str(signal.experimental_policy.get("risk_model", "fixed_pct")) != "fixed_volume"
+                or not exploration_authorized
+            ),
         )
 
     async def _execute_signal(self, signal: TradeSignal, df: pd.DataFrame = None) -> bool:
@@ -2057,6 +2077,26 @@ class MarketScheduler:
             signal.evidence_classification = gate.evidence_classification
             signal.confidence_classification = gate.confidence_classification
             signal.trading_reason = gate.reason
+            exploration_active = gate.final_state == "EXPLORATORY_DEMO"
+            exploration_setup_quality = float((signal.setup_quality_components or {}).get("overall_feature_score", signal.score) or signal.score or 0.0)
+            exploration_strategy_quality = float(getattr(signal, "strategy_score", 0.0) or 0.0)
+            policy_for_risk = dict(signal.experimental_policy or {})
+            if exploration_active:
+                exploration_multiplier = min(1.0, max(0.0, float(self.settings.exploration_risk_multiplier)))
+                policy_for_risk["exploration_mode"] = "CONTROLLED_DEMO"
+                policy_for_risk["exploration_risk_multiplier"] = exploration_multiplier
+                policy_for_risk["exploration_thresholds"] = {
+                    "setup_quality": float(self.settings.exploration_min_setup_score),
+                    "strategy_match": float(self.settings.exploration_min_strategy_score),
+                }
+                policy_for_risk["exploration_evidence_state"] = gate.evidence_classification
+                signal.experimental_policy = policy_for_risk
+            if exploration_active:
+                await self._chart_activity(
+                    "controlled_demo_exploration", symbol,
+                    f"🧪 **EXPLORATORY DEMO OPPORTUNITY — {symbol}**\nEvidence: `{gate.evidence_classification}` | Confidence: `{gate.confidence_classification}`\nSetup quality: `{exploration_setup_quality:.1f}/100` | Strategy match: `{exploration_strategy_quality:.1f}/100`\nRisk mode: `CONTROLLED_DEMO` | Risk multiplier: `{min(1.0, max(0.0, float(self.settings.exploration_risk_multiplier))):.2f}`\nReason: {gate.reason}\nThe candidate must still pass broker stops, sizing, margin, portfolio, duplicate-order, and final MT5 validation.",
+                    fingerprint=f"{setup_id}:controlled-demo:{gate.evidence_classification}:{exploration_setup_quality:.2f}", essential=True,
+                )
             if gate.trading_decision not in {"TRADE_APPROVED", "CONTROLLED_FORWARD_DEMO"}:
                 self.telemetry.increment("no_trade_decisions")
                 self.telemetry.record_rejection(f"TRADING_GATE: {gate.reason}")
@@ -2136,6 +2176,9 @@ class MarketScheduler:
 
             self.telemetry.increment("sizing_checked")
             self.telemetry.increment("margin_checked")
+            base_risk_pct = float(signal.experimental_policy.get("risk_pct", signal.suggested_risk))
+            exploration_multiplier = min(1.0, max(0.0, float(self.settings.exploration_risk_multiplier))) if exploration_active else 1.0
+            effective_risk_pct = base_risk_pct * exploration_multiplier if exploration_active else base_risk_pct
             sizing = self.risk_manager.calculate_position_sizing(
                 account_equity=equity,
                 free_margin=free_margin,
@@ -2143,7 +2186,7 @@ class MarketScheduler:
                 stop_loss=signal.stop_loss,
                 symbol_info=sym_info,
                 leverage=leverage,
-                risk_pct=float(signal.experimental_policy.get("risk_pct", signal.suggested_risk)),
+                risk_pct=effective_risk_pct,
                 risk_model=str(signal.experimental_policy.get("risk_model", "fixed_pct")),
                 fixed_volume=signal.experimental_policy.get("fixed_volume"),
             )
@@ -2178,7 +2221,9 @@ class MarketScheduler:
                                 "stop_loss": signal.stop_loss,
                                 "take_profit": signal.take_profit,
                                 "direction": signal.direction,
-                                "risk_pct": float(signal.experimental_policy.get("risk_pct", signal.suggested_risk)),
+                                "risk_pct": effective_risk_pct,
+                                "base_risk_pct": base_risk_pct,
+                                "exploration_risk_multiplier": exploration_multiplier,
                                 "risk_model": str(signal.experimental_policy.get("risk_model", "fixed_pct")),
                                 "fixed_volume": signal.experimental_policy.get("fixed_volume"),
                                 "experimental_policy": dict(signal.experimental_policy),

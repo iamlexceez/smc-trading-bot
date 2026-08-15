@@ -89,7 +89,7 @@ def test_two_gate_decision_architecture() -> None:
         champion_governed=True,
     )
     assert_true(score_only.trading_decision != "TRADE_APPROVED", "feature score alone authorized objective trading")
-    assert_true(classify_evidence({"evidence_strength": "PROMISING"}) == "MODERATE", "existing evidence label was not normalized")
+    assert_true(classify_evidence({"evidence_strength": "PROMISING"}) == "PRELIMINARY", "existing evidence label was not normalized")
     assert_true(classify_confidence({"confidence": "UNKNOWN"}) == "UNVALIDATED", "unknown confidence was fabricated into a validated state")
 
 
@@ -190,8 +190,8 @@ def test_strategy_registry_and_selection() -> None:
         },
     )
     assert_true(assessments and assessments[0].identifier == "bos_choch_continuation", "strategy selection did not prefer stronger matching completed evidence")
-    assert_true(evidence_class(0, None) == "UNKNOWN" and evidence_class(4, 0.2) == "EARLY", "evidence confidence misclassified small samples")
-    assert_true(evidence_class(20, 0.2) == "PROMISING" and evidence_class(60, -0.2) == "VALIDATED", "confidence bands did not use the documented completed-outcome sample sizes")
+    assert_true(evidence_class(0, None) == "INSUFFICIENT" and evidence_class(4, 0.2) == "EMERGING", "evidence confidence misclassified small samples")
+    assert_true(evidence_class(20, 0.2) == "VALIDATED" and evidence_class(60, -0.2) == "STRONG", "confidence bands did not use the documented completed-outcome sample sizes")
 
 
 def test_forward_demo_evaluation_provenance() -> None:
@@ -206,7 +206,7 @@ def test_forward_demo_evaluation_provenance() -> None:
 
 
 def test_expert_hypothesis_evidence_classifier() -> None:
-    assert_true(evidence_strength(0) == "UNKNOWN" and evidence_strength(3) == "EARLY" and evidence_strength(50) == "VALIDATED", "expert hypothesis evidence-depth bands are incorrect")
+    assert_true(evidence_strength(0) == "INSUFFICIENT" and evidence_strength(3) == "EMERGING" and evidence_strength(50) == "STRONG", "expert hypothesis evidence-depth bands are incorrect")
     early = evaluate_hypothesis_evidence(sample_size=5, expectancy_r=0.8, ci_low_r=-0.5, ci_high_r=1.5, historical_sample_size=5, forward_sample_size=5)
     assert_true(early["decision"] == "INCONCLUSIVE" and not early["promotion_eligible"] and not early["live_promotion_allowed"], "small expert hypothesis samples were overstated")
     robust = evaluate_hypothesis_evidence(sample_size=60, expectancy_r=0.4, ci_low_r=0.1, ci_high_r=0.7, historical_sample_size=40, forward_sample_size=55)
@@ -227,7 +227,7 @@ async def test_expert_knowledge_journal_persistence() -> None:
             historical_sample_size=40, forward_sample_size=55, expectancy_r=0.4,
             ci_low_r=0.1, ci_high_r=0.7, result="Positive result in the tested context.", db_path=path,
         )
-        assert_true(updated["decision"] == "SUPPORTED" and updated["evidence_strength"] == "VALIDATED" and not updated["live_promotion_allowed"], "expert hypothesis test result was not persisted with provenance and LIVE prohibition")
+        assert_true(updated["decision"] == "SUPPORTED" and updated["evidence_strength"] == "STRONG" and not updated["live_promotion_allowed"], "expert hypothesis test result was not persisted with provenance and LIVE prohibition")
 
 
 async def test_strategy_evidence_persistence() -> None:

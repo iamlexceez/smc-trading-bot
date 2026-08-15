@@ -12,6 +12,8 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from analysis.decision_gates import classify_evidence
+
 
 def _finite(value: Any, default: float = 0.0) -> float:
     try:
@@ -235,11 +237,7 @@ def rank_opportunities(
             else "COUNTER_TREND" if htf_biases else "UNAVAILABLE"
         )
         target_conflict = bool(getattr(validation, "target_conflict", False))
-        evidence_classification = str(
-            strategy_evidence.get("evidence_classification")
-            or strategy_evidence.get("evidence_strength")
-            or ("INSUFFICIENT" if sample < 3 else "UNCLASSIFIED")
-        ).upper()
+        evidence_classification = classify_evidence(strategy_evidence or evidence)
         completed_confidence = str(strategy_evidence.get("confidence") or "UNKNOWN").upper()
         analysis_trading_decision = str(getattr(signal, "trading_decision", "") or "DEFERRED")
         research_decision = str(getattr(signal, "research_decision", "") or "RESEARCH_ACCEPTED")

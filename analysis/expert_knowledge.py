@@ -48,18 +48,17 @@ DEFAULT_EXPERT_HYPOTHESES: tuple[ExpertHypothesis, ...] = (
 
 
 def evidence_strength(sample_size: int) -> str:
+    """Return an explicit evidence state; insufficient means unknown, not bad."""
     n = max(0, int(sample_size or 0))
     if n < 3:
-        return "UNKNOWN"
+        return "INSUFFICIENT"
     if n < 10:
-        return "EARLY"
+        return "EMERGING"
     if n < 20:
-        return "OBSERVED"
+        return "PRELIMINARY"
     if n < 50:
-        return "PROMISING"
-    if n < 100:
         return "VALIDATED"
-    return "STRONG_EVIDENCE"
+    return "STRONG"
 
 
 def evaluate_hypothesis_evidence(

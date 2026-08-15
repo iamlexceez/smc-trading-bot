@@ -22,10 +22,9 @@ from analysis.liquidity import (
     LiquiditySweep,
     build_liquidity_pools,
     detect_latest_sweep,
-    select_market_target,
     select_market_targets,
 )
-from analysis.structure import FairValueGap, MarketStructure, OrderBlock, StructureEventType, Trend
+from analysis.structure import MarketStructure, StructureEventType, Trend
 from analysis.supply_demand import SupplyDemandZone, ZoneType
 
 
@@ -76,6 +75,7 @@ class SetupValidationResult:
     target_source: str = ""
     target_reason: str = ""
     target_candidates: list[dict] = field(default_factory=list)
+    target_conflict: bool = False
 
     @property
     def rejection_reason(self) -> str:
@@ -286,7 +286,7 @@ class SetupValidator:
         result.checks.append(ValidationCheck("Meaningful liquidity", has_liquidity, f"Looking for {required_side} liquidity"))
         sweep = detect_latest_sweep(df, pools, requested_direction, min_penetration_atr=self.min_sweep_penetration_atr)
         result.sweep = sweep
-        result.checks.append(ValidationCheck("Liquidity sweep", sweep is not None, f"Sweep found" if sweep else "No closed-candle sweep found"))
+        result.checks.append(ValidationCheck("Liquidity sweep", sweep is not None, "Sweep found" if sweep else "No closed-candle sweep found"))
         displacement = detect_displacement(
             df, requested_direction,
             body_ratio_min=self.displacement_body_ratio,
@@ -354,13 +354,17 @@ class SetupValidator:
             for pool in target_candidates
         ]
         target_pool = None
+        result.target_conflict = bool(target_candidates and target_model not in {"liquidity", "structure", "dynamic", "adaptive"} and target_rr is not None)
         if target_model in {"liquidity", "structure", "dynamic", "adaptive"} and target_candidates:
             target_pool = target_candidates[0]
             result.target_source = f"liquidity:{target_pool.kind.value}"
             result.target_reason = f"Selected nearest opposing unswept {target_pool.kind.value} liquidity at {target_pool.level:.5f}"
         elif risk > 0 and target_rr is not None:
             result.target_source = "policy_rr_target"
-            result.target_reason = f"Policy target model requested {target_rr:.8f}R"
+            result.target_reason = (
+                f"Policy target model requested {target_rr:.8f}R; structural/liquidity alternatives were retained for comparison"
+                if result.target_conflict else f"Policy target model requested {target_rr:.8f}R"
+            )
         result.target_pool = target_pool
         if target_pool is not None:
             take_profit = float(target_pool.level)
@@ -503,8 +507,18 @@ class SetupValidator:
                 atr_value,
                 self.stop_atr_buffer,
             )
-            target_pool = select_market_target(pools, requested_direction, entry)
+            target_candidates = select_market_targets(pools, requested_direction, entry)
+            result.target_candidates = [
+                {
+                    "level": float(pool.level), "kind": pool.kind.value, "timeframe": pool.timeframe,
+                    "rr_ratio": abs(float(pool.level) - entry) / abs(entry - stop_loss) if abs(entry - stop_loss) > 0 else 0.0,
+                }
+                for pool in target_candidates
+            ]
+            target_pool = target_candidates[0] if target_candidates else None
             result.target_pool = target_pool
+            result.target_source = f"liquidity:{target_pool.kind.value}" if target_pool else "UNKNOWN"
+            result.target_reason = f"Selected nearest opposing unswept {target_pool.kind.value} liquidity at {target_pool.level:.5f}" if target_pool else "No opposing liquidity target available"
             result.stop_loss = stop_loss
             result.take_profit = target_pool.level if target_pool else 0.0
 
