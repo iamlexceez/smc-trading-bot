@@ -176,6 +176,13 @@ class CapitalReductionEngine:
             "maximum_permitted_reduction": remaining + tapered_overshoot,
             "candidates": [], "valid_candidate_count": 0,
         }
+        try:
+            open_positions = await self.executor.get_open_positions()
+            diagnostics["active_positions"] = len(open_positions or [])
+            diagnostics["open_position_tickets"] = [getattr(position, "ticket", None) for position in (open_positions or [])]
+        except Exception:
+            diagnostics["active_positions"] = "UNAVAILABLE"
+            diagnostics["open_position_tickets"] = []
         if remaining <= tolerance:
             return None, "Target tolerance reached", diagnostics
         leverage = max(1.0, self._number(account.get("leverage"), 1.0))
@@ -216,14 +223,28 @@ class CapitalReductionEngine:
                 continue
             margin_capacity = self._floor_volume(free_margin / margin_per_lot, minimum, maximum, step)
             minimum_loss = minimum * loss_per_lot
-            diagnostic.update({"minimum_volume": minimum, "volume_step": step, "minimum_loss": minimum_loss, "minimum_margin": minimum * margin_per_lot, "maximum_margin_valid_volume": margin_capacity})
+            diagnostic.update({
+                "minimum_volume": minimum, "volume_step": step, "minimum_loss": minimum_loss,
+                "minimum_margin": minimum * margin_per_lot,
+                "maximum_margin_valid_volume": margin_capacity,
+                "stops_level": self._number(info.get("stops_level") or info.get("trade_stops_level")),
+                "freeze_level": self._number(info.get("freeze_level") or info.get("trade_freeze_level")),
+                "tick_size": tick_size, "tick_value": tick_value, "contract_size": contract_size,
+            })
             if margin_capacity <= 0:
                 diagnostic.update({"status": "rejected", "reason": "insufficient free margin for broker minimum volume"})
                 inspected.append(diagnostic)
                 continue
             permitted_loss = remaining + tapered_overshoot
             if minimum_loss > permitted_loss + 1e-8:
-                diagnostic.update({"status": "rejected", "reason": "broker minimum-volume loss exceeds configured overshoot envelope", "overshoot": minimum_loss - remaining})
+                diagnostic.update({
+                    "status": "rejected", "reason": "broker minimum-volume loss exceeds configured overshoot envelope",
+                    "overshoot": minimum_loss - remaining, "closest_volume": minimum,
+                    "closest_reduction": minimum_loss,
+                    "projected_equity": self._number(account.get("equity")) - minimum_loss,
+                    "distance_to_target": abs(minimum_loss - remaining),
+                    "would_overshoot": True,
+                })
                 inspected.append(diagnostic)
                 continue
             volume = self._floor_volume(min(margin_capacity, maximum, permitted_loss / loss_per_lot), minimum, maximum, step)
@@ -241,18 +262,37 @@ class CapitalReductionEngine:
                 diagnostic.update({"status": "rejected", "reason": "broker-calculated margin exceeds current free margin", "required_margin": required_margin})
                 inspected.append(diagnostic)
                 continue
-            diagnostic.update({"status": "eligible", "volume": volume, "expected_loss": expected_loss, "required_margin": required_margin, "margin_source": margin_source, "maximum_reduction": margin_capacity * loss_per_lot})
+            diagnostic.update({
+                "status": "eligible", "volume": volume, "expected_loss": expected_loss,
+                "required_margin": required_margin, "margin_source": margin_source,
+                "maximum_reduction": margin_capacity * loss_per_lot,
+                "projected_equity": self._number(account.get("equity")) - expected_loss,
+                "distance_to_target": abs(expected_loss - remaining), "would_overshoot": False,
+            })
             inspected.append(diagnostic)
             candidates.append(ReductionPlan(symbol=symbol, direction="BUY", volume=volume, entry_price=ask, expected_loss=expected_loss, loss_per_lot=loss_per_lot, required_margin=required_margin, minimum_loss=minimum_loss, maximum_reduction=margin_capacity * loss_per_lot))
         diagnostics["candidates"] = inspected
         diagnostics["valid_candidate_count"] = len(candidates)
         if not candidates:
-            best = min(inspected, key=lambda item: float(item.get("overshoot") or float("inf"))) if inspected else None
+            best = min(
+                inspected,
+                key=lambda item: (
+                    float(item.get("distance_to_target") if item.get("distance_to_target") is not None else float("inf")),
+                    float(item.get("required_margin") if item.get("required_margin") is not None else float("inf")),
+                    str(item.get("symbol") or ""),
+                ),
+            ) if inspected else None
             diagnostics["best_candidate"] = best
+            if best and best.get("closest_reduction") is not None:
+                projected = float(best.get("projected_equity") or 0.0)
+                return None, (
+                    "No broker-valid action fits the configured tolerance; closest executable candidate "
+                    f"would reduce ${float(best['closest_reduction']):.2f} and project equity to ${projected:.2f}"
+                ), diagnostics
             return None, "No executable broker-valid reduction action is available", diagnostics
-        candidates.sort(key=lambda item: (-item.expected_loss, item.symbol))
+        candidates.sort(key=lambda item: (abs(remaining - item.expected_loss), item.required_margin, item.symbol))
         chosen = candidates[0]
-        diagnostics["best_candidate"] = {"symbol": chosen.symbol, "volume": chosen.volume, "expected_loss": chosen.expected_loss, "required_margin": chosen.required_margin, "minimum_loss": chosen.minimum_loss, "maximum_reduction": chosen.maximum_reduction, "proximity_ratio": proximity_ratio, "aggression_factor": aggression_factor, "tapered_overshoot_tolerance": tapered_overshoot, "reason": "Largest valid reduction candidate under target-proximity taper"}
+        diagnostics["best_candidate"] = {"symbol": chosen.symbol, "volume": chosen.volume, "expected_loss": chosen.expected_loss, "required_margin": chosen.required_margin, "minimum_loss": chosen.minimum_loss, "maximum_reduction": chosen.maximum_reduction, "distance_to_target": abs(remaining - chosen.expected_loss), "proximity_ratio": proximity_ratio, "aggression_factor": aggression_factor, "tapered_overshoot_tolerance": tapered_overshoot, "reason": "Closest valid reduction candidate to the target under broker and tolerance constraints"}
         return chosen, "", diagnostics
 
     async def start(

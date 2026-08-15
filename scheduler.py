@@ -583,6 +583,17 @@ class MarketScheduler:
             if verified.get("resume_verified"):
                 self.settings.is_paused = False
                 await db.save_settings(self.settings)
+                # The saved objective remains authoritative. When the previous
+                # session was terminal, explicitly enabled reset auto-resume may
+                # create exactly one fresh session from that unchanged template.
+                started = await self.start_saved_objective_session()
+                if started.get("started"):
+                    await self._notify(
+                        "🚀 **SAVED OBJECTIVE SESSION AUTO-STARTED**\n"
+                        f"Session: `#{started.get('session_id')}` | Objective v{(started.get('objective') or {}).get('version', '?')}\n"
+                        f"Fresh DEMO equity: `${float(((started.get('capital') or {}).get('account') or {}).get('equity') or 0.0):.2f}`\n"
+                        "The confirmed target and broker-resolved instrument scope were preserved."
+                    )
         elif (
             self.settings.is_paused and self.settings.auto_trade
             and str((capital.get("previous") or {}).get("state") or "") in {

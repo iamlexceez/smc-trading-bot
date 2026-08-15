@@ -675,7 +675,7 @@ async def test_sequential_capital_reduction_planning() -> None:
     overshoot_plan, overshoot_reason, overshoot_diagnostic = await planner._plan_round_trip(
         {"free_margin": 1_000.0, "leverage": 10.0}, remaining=0.5, tolerance=0.1,
     )
-    assert_true(overshoot_plan is None and "No executable broker-valid" in overshoot_reason, "minimum-loss action outside a zero overshoot envelope was not blocked")
+    assert_true(overshoot_plan is None and ("No executable broker-valid" in overshoot_reason or "closest executable candidate" in overshoot_reason), "minimum-loss action outside a zero overshoot envelope was not blocked")
 
     settings.enabled_symbols = []
     none_engine = CapitalReductionEngine(settings, BrokerFixture())
@@ -706,7 +706,7 @@ async def test_sequential_capital_reduction_planning() -> None:
         {"free_margin": 1_000.0, "leverage": 10.0}, remaining=25.0, tolerance=0.0, overshoot_tolerance=0.0,
     )
     assert_true(fastest is not None and fastest.symbol == "Fast Index" and fastest.expected_loss == 25.0, "aggressive planner did not choose the largest valid reduction candidate")
-    assert_true(fastest_diagnostic["valid_candidate_count"] == 2 and "target-proximity taper" in fastest_diagnostic["best_candidate"]["reason"], "aggressive diagnostics did not retain candidate ranking evidence")
+    assert_true(fastest_diagnostic["valid_candidate_count"] == 2 and ("target-proximity taper" in fastest_diagnostic["best_candidate"]["reason"] or "Closest valid reduction candidate" in fastest_diagnostic["best_candidate"]["reason"]), "aggressive diagnostics did not retain candidate ranking evidence")
     overshoot_allowed, _, overshoot_allowed_diagnostic = await aggressive._plan_round_trip(
         {"free_margin": 1_000.0, "leverage": 10.0}, remaining=8.0, tolerance=0.0, overshoot_tolerance=2.0,
     )
@@ -898,6 +898,25 @@ async def test_capital_reduction_isolation() -> None:
         blocked = await CapitalReductionEngine(TradeSettings.defaults(), NoActionExecutor()).run_once()
     assert_true(blocked["state"] == "blocked", "temporary lack of a broker-valid reduction action was not reported as blocked")
     assert_true(any(update.get("status") == "active" for update in state_updates), "temporary reduction blockage terminalized the session instead of preserving ACTIVE retry state")
+
+
+async def test_capital_reduction_closest_action() -> None:
+    class CandidateExecutor:
+        async def get_symbol_info(self, symbol):
+            return {"last_tick_time": time.time(), "tick_size": 0.01, "tick_value": 0.01, "contract_size": 1.0, "min_lot": 1.0, "max_lot": 10.0, "step_lot": 1.0}
+        async def get_symbol_price(self, symbol):
+            return (100.0, 104.0 if symbol == "near" else 108.0)
+        async def get_broker_margin_for_volume(self, symbol, direction, volume, price):
+            return {"margin": volume, "margin_source": "fixture"}
+
+    engine = CapitalReductionEngine(TradeSettings.defaults(), CandidateExecutor())
+    engine.broker_usable_symbols = ("near", "far")
+    plan, reason, diagnostics = await engine._plan_round_trip(
+        {"equity": 100.0, "free_margin": 100.0, "leverage": 10.0},
+        remaining=4.0, tolerance=0.0, overshoot_tolerance=0.0, initial_required_reduction=4.0,
+    )
+    assert_true(plan is not None and plan.symbol == "near", "capital reduction did not choose the closest valid broker action")
+    assert_true(diagnostics["best_candidate"]["distance_to_target"] == 0.0 and not reason, "closest-action evidence was not persisted in the reduction planner")
 
 
 def test_capital_reduction_view_is_phase_free() -> None:
@@ -1575,6 +1594,7 @@ def run() -> None:
     test_broker_stop_normalization()
     asyncio.run(test_engine_scanner_gate_rendering())
     test_pause_resume_command_registration()
+    asyncio.run(test_capital_reduction_closest_action())
     test_capital_reduction_view_is_phase_free()
     test_scanner_gate_telemetry()
     test_runtime_telemetry()
