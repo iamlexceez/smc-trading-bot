@@ -289,6 +289,32 @@ def test_pause_resume_command_registration() -> None:
     assert_true(any("knowledge" in commands for commands in command_sets), "implemented /knowledge handler is absent from Telegram command registration")
 
 
+def test_pause_recovery_policy() -> None:
+    settings = TradeSettings.defaults()
+    settings.auto_trade = True
+    settings.is_paused = True
+    verified = {"state": AccountCapitalState.ACCOUNT_VERIFIED}
+    standalone = {"context": {"operational": {"scope_disabled": True}}}
+
+    settings.automation_pause_reason = "LEGACY_STALE"
+    assert_true(scheduler.MarketScheduler._pause_recovery_allowed(settings, verified, standalone), "legacy stale pause was not recoverable in standalone DEMO mode")
+
+    settings.automation_pause_reason = "ACCOUNT_SAFETY"
+    assert_true(scheduler.MarketScheduler._pause_recovery_allowed(settings, verified, None), "broker-safety pause was not recoverable after verified account recovery")
+
+    settings.automation_pause_reason = "MANUAL"
+    assert_true(not scheduler.MarketScheduler._pause_recovery_allowed(settings, verified, standalone), "manual pause was overridden automatically")
+
+    settings.automation_pause_reason = "EMERGENCY_STOP"
+    assert_true(not scheduler.MarketScheduler._pause_recovery_allowed(settings, verified, standalone), "emergency pause was overridden automatically")
+
+    settings.automation_pause_reason = "LEGACY_STALE"
+    assert_true(not scheduler.MarketScheduler._pause_recovery_allowed(settings, {"state": AccountCapitalState.ACCOUNT_STATE_UNKNOWN}, standalone), "unknown broker state cleared a pause")
+
+    settings.automation_pause_reason = "OBJECTIVE_AWAITING_START"
+    assert_true(not scheduler.MarketScheduler._pause_recovery_allowed(settings, verified, None), "objective awaiting explicit start was bypassed")
+
+
 def test_scanner_gate_telemetry() -> None:
     probe = object.__new__(scheduler.MarketScheduler)
     probe.last_scan_gate = {}
@@ -1935,6 +1961,7 @@ def run() -> None:
     test_broker_stop_normalization()
     asyncio.run(test_engine_scanner_gate_rendering())
     test_pause_resume_command_registration()
+    test_pause_recovery_policy()
     asyncio.run(test_capital_reduction_closest_action())
     test_capital_reduction_view_is_phase_free()
     test_scanner_gate_telemetry()

@@ -168,6 +168,38 @@ class MarketScheduler:
     def _execution_symbol_is_selected(self, symbol: str) -> bool:
         return str(symbol) in self._execution_selected_symbols
 
+    @staticmethod
+    def _pause_recovery_allowed(settings, capital: dict, active_objective: Optional[dict] = None) -> bool:
+        """Return whether a stale bot-wide pause may be cleared safely.
+
+        Only a fresh broker-verified DEMO account can recover a pause. Manual
+        and emergency pauses are never overridden. A scope-disabled objective
+        explicitly requests standalone scanning, so its old objective-start or
+        legacy pause may be cleared without changing the objective evidence.
+        """
+        if not getattr(settings, "is_paused", False) or not getattr(settings, "auto_trade", False):
+            return False
+        state = str((capital or {}).get("state") or "ACCOUNT_STATE_UNKNOWN")
+        if state not in {AccountCapitalState.ACCOUNT_VERIFIED, AccountCapitalState.LOW_CAPITAL}:
+            return False
+        reason = str(getattr(settings, "automation_pause_reason", "") or "").upper()
+        if reason in {"MANUAL", "EMERGENCY_STOP"}:
+            return False
+        operational = dict(((active_objective or {}).get("context") or {}).get("operational") or {})
+        if bool(operational.get("scope_disabled")):
+            return True
+        return reason in {"ACCOUNT_SAFETY", "LEGACY_STALE"}
+
+    async def _recover_stale_automation_pause(self, capital: dict, active_objective: Optional[dict] = None) -> bool:
+        if not self._pause_recovery_allowed(self.settings, capital, active_objective):
+            return False
+        previous_reason = str(getattr(self.settings, "automation_pause_reason", "") or "LEGACY_STALE")
+        self.settings.is_paused = False
+        self.settings.automation_pause_reason = ""
+        await db.save_settings(self.settings)
+        logger.info("Cleared stale bot-wide pause after broker verification (previous reason=%s)", previous_reason)
+        return True
+
     async def start_saved_objective_session(self) -> dict:
         """Start one explicit fresh DEMO attempt from the saved objective template.
 
@@ -248,6 +280,7 @@ class MarketScheduler:
         )
         self.settings.auto_trade = True
         self.settings.is_paused = False
+        self.settings.automation_pause_reason = ""
         await db.save_settings(self.settings)
         self.risk_manager.settings = self.settings
         self._set_execution_selected_symbols(instruments)
@@ -630,6 +663,7 @@ class MarketScheduler:
         blocking = state in AccountCapitalState.BLOCKING
         if blocking and not self.settings.is_paused:
             self.settings.is_paused = True
+            self.settings.automation_pause_reason = "ACCOUNT_SAFETY"
             await db.save_settings(self.settings)
             logger.warning("New trading halted by authoritative account state: %s (%s)", state, capital.get("reason"))
         elif capital.get("reset_detected") and self.settings.demo_auto_resume_after_reset:
@@ -637,6 +671,7 @@ class MarketScheduler:
             self.last_capital_state = verified
             if verified.get("resume_verified"):
                 self.settings.is_paused = False
+                self.settings.automation_pause_reason = ""
                 await db.save_settings(self.settings)
                 # The saved objective remains authoritative. When the previous
                 # session was terminal, explicitly enabled reset auto-resume may
@@ -662,8 +697,10 @@ class MarketScheduler:
             # metadata/connection unknown state after current MT5 facts prove an
             # executable target. Reset transitions remain separately controlled.
             self.settings.is_paused = False
+            self.settings.automation_pause_reason = ""
             await db.save_settings(self.settings)
             logger.info("Autonomous DEMO scanning resumed after broker metadata verification")
+
         elif (
             self.settings.is_paused and self.settings.auto_trade
             and str((capital.get("previous") or {}).get("state") or "") in {
@@ -674,8 +711,11 @@ class MarketScheduler:
             # Margin pressure is not terminal. Fresh broker margin recovery may
             # reopen new-exposure eligibility after position protection has run.
             self.settings.is_paused = False
+            self.settings.automation_pause_reason = ""
             await db.save_settings(self.settings)
             logger.info("Autonomous DEMO scanning resumed after broker-confirmed margin recovery")
+        elif not blocking:
+            await self._recover_stale_automation_pause(capital, await db.get_active_objective(self.settings.trading_mode))
 
         if capital.get("changed"):
             audit = capital.get("broker_metadata")
@@ -2459,6 +2499,7 @@ class MarketScheduler:
         self.last_capital_state = capital
         self._set_scan_gate("ACCOUNT_EVALUATED", "Fresh broker account and universe evaluation completed.", account_state=str(capital.get("state") or "UNKNOWN"))
         active_objective = await db.get_active_objective(self.settings.trading_mode)
+        await self._recover_stale_automation_pause(capital, active_objective)
         objective_operational = dict(((active_objective or {}).get("context") or {}).get("operational") or {})
         objective_scope_disabled = bool(objective_operational.get("scope_disabled"))
         if not objective_scope_disabled:
@@ -2480,6 +2521,7 @@ class MarketScheduler:
         if capital.get("state") in AccountCapitalState.BLOCKING:
             if not self.settings.is_paused:
                 self.settings.is_paused = True
+                self.settings.automation_pause_reason = "ACCOUNT_SAFETY"
                 await db.save_settings(self.settings)
             reason = str(capital.get("reason") or "Authoritative broker account state blocks new exposure.")
             self._set_scan_gate("ACCOUNT_BLOCKED", reason, account_state=str(capital.get("state") or "UNKNOWN"), analysis_symbols=0)

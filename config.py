@@ -122,6 +122,11 @@ class TradeSettings:
     autonomous_learning_mode: bool = True
     auto_trade: bool = True
     is_paused: bool = False
+    # Explains why bot-wide automation is paused. This prevents verified
+    # broker recovery or standalone-scope activation from overriding a
+    # deliberate manual or emergency pause, while allowing stale safety pauses
+    # from older sessions to recover deterministically.
+    automation_pause_reason: str = ""
     # A verified external DEMO reset remains paused unless this explicit
     # operational opt-in is enabled.
     demo_auto_resume_after_reset: bool = False
@@ -324,6 +329,7 @@ class TradeSettings:
             # retain their saved setting.
             auto_trade=(parse_bool(d.get("auto_trade", "true"), True) if "autonomous_learning_mode" in d else True),
             is_paused=parse_bool(d.get("is_paused", "false")),
+            automation_pause_reason=str(d.get("automation_pause_reason") or ""),
             demo_auto_resume_after_reset=parse_bool(d.get("demo_auto_resume_after_reset", "false")),
             live_trading_confirmed_at=d.get("live_trading_confirmed_at"),
             chart_activity_notifications=parse_bool(d.get("chart_activity_notifications", "true"), True),

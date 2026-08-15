@@ -389,6 +389,7 @@ class BotHandlers:
             )
             await db.set_objective_paused(mode, True)
             self.settings.is_paused = True
+            self.settings.automation_pause_reason = "OBJECTIVE_AWAITING_START"
             self.settings.self_optimization_enabled = bool(objective.adaptive_learning)
             await db.save_settings(self.settings)
             active_text = self._format_objective_preview(preview, heading=f"✅ **OBJECTIVE v{active['version']} SAVED**")
@@ -1206,6 +1207,7 @@ class BotHandlers:
     async def cmd_emergency(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Immediately halt new execution, then require confirmation to close positions."""
         self.settings.is_paused = True
+        self.settings.automation_pause_reason = "EMERGENCY_STOP"
         self.settings.auto_trade = False
         await db.save_settings(self.settings)
         text = "🚨 **EMERGENCY STOP ACTIVE**\n\nNew trade execution has been paused and autonomous execution is OFF. Existing positions remain open until you explicitly confirm closing them below."
@@ -1756,6 +1758,7 @@ class BotHandlers:
     async def cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Pause auto-trading."""
         self.settings.is_paused = True
+        self.settings.automation_pause_reason = "MANUAL"
         await db.save_settings(self.settings)
         msg = "⏸ Auto-trading paused. Use /resume to continue."
         if update.callback_query:
@@ -1772,6 +1775,7 @@ class BotHandlers:
             msg = f"Trading remains HALTED. Broker account state is not viable for resumption: {result.get('reason', result.get('state', 'unknown'))}."
         else:
             self.settings.is_paused = False
+            self.settings.automation_pause_reason = ""
             await db.save_settings(self.settings)
             if self.scheduler:
                 self.scheduler._start_background_task("resume_scan", self.scheduler.activate_and_scan_now())
