@@ -1400,6 +1400,32 @@ def test_session_local_phase_display_number() -> None:
     assert_true(scheduler.MarketScheduler._phase_display_number({"phase_number": 20, "session_phase_number": 2}) == 2, "session-local successor phase number was not selected")
 
 
+async def test_sl_protection_requires_broker_confirmation() -> None:
+    before = Position(ticket=8736588628, symbol="Volatility 10 Index", direction="BUY", volume=0.2, entry_price=4860.0, sl=4857.873, tp=4900.0, profit=2.0)
+
+    class ModifyExecutor:
+        def __init__(self, apply_change: bool):
+            self.apply_change = apply_change
+            self.position = before
+
+        async def get_open_positions(self):
+            return [self.position]
+
+    engine = object.__new__(scheduler.MarketScheduler)
+    engine.executor = ModifyExecutor(False)
+    live, reason = await engine._confirm_position_sl(before, 4867.68854, attempts=2)
+    assert_true(live is None and "does not protect profit" in reason, "unchanged broker SL was incorrectly treated as confirmed protection")
+
+    class ApplyingExecutor(ModifyExecutor):
+        async def get_open_positions(self):
+            return [self.position]
+
+    engine.executor = ApplyingExecutor(True)
+    engine.executor.position = Position(ticket=before.ticket, symbol=before.symbol, direction=before.direction, volume=before.volume, entry_price=before.entry_price, sl=4867.68854, tp=before.tp, profit=before.profit)
+    live, reason = await engine._confirm_position_sl(before, 4867.68854, attempts=1)
+    assert_true(live is not None and float(live.sl) == 4867.68854 and reason == "broker-confirmed", "broker-refreshed improved SL was not accepted as confirmed protection")
+
+
 async def test_phase_boundary_closes_unprotected_position() -> None:
     class BoundaryExecutor:
         def __init__(self):
@@ -1769,6 +1795,7 @@ def run() -> None:
     asyncio.run(test_objective_phase_lifecycle())
     asyncio.run(test_persistent_objective_template_sessions())
     test_session_local_phase_display_number()
+    asyncio.run(test_sl_protection_requires_broker_confirmation())
     asyncio.run(test_phase_boundary_closes_unprotected_position())
     asyncio.run(test_legacy_objective_phase_migration())
     test_causal_replay_safety()

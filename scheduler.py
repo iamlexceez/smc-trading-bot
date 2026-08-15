@@ -2350,6 +2350,65 @@ class MarketScheduler:
             return False
         return (direction == "BUY" and level > entry) or (direction == "SELL" and level < entry)
 
+    @classmethod
+    def _sl_is_non_widening_improvement(cls, before, after) -> bool:
+        """Accept only a broker-confirmed SL that improves or preserves protection."""
+        if str(getattr(before, "symbol", "")) != str(getattr(after, "symbol", "")):
+            return False
+        if str(getattr(before, "direction", "")).upper() != str(getattr(after, "direction", "")).upper():
+            return False
+        old_sl = float(getattr(before, "sl", 0.0) or 0.0)
+        new_sl = float(getattr(after, "sl", 0.0) or 0.0)
+        direction = str(getattr(before, "direction", "")).upper()
+        if not cls._sl_protects_profit(after):
+            return False
+        if direction == "BUY":
+            return old_sl <= 0 or new_sl > old_sl
+        return old_sl <= 0 or new_sl < old_sl
+
+    async def _confirm_position_sl(self, position, requested_sl: float, *, attempts: int = 3):
+        """Refresh MT5 and return the matching position only after SL confirmation.
+
+        A successful `order_send`/executor boolean is not sufficient for a user-
+        facing protection claim. The ticket and symbol must reappear in fresh
+        broker data, the SL must protect profit, and it must not be wider than
+        the pre-modification SL. Broker-normalized levels are accepted and the
+        broker-returned value is the only value shown to the user.
+        """
+        ticket = int(getattr(position, "ticket", 0) or 0)
+        symbol = str(getattr(position, "symbol", "") or "")
+        requested = float(requested_sl or 0.0)
+        last_reason = "broker refresh did not return a matching position"
+        for attempt in range(max(1, int(attempts))):
+            if attempt:
+                await asyncio.sleep(0.20)
+            try:
+                refreshed = await self.executor.get_open_positions()
+            except Exception as exc:
+                last_reason = f"broker refresh failed: {type(exc).__name__}: {exc}"
+                continue
+            live = next(
+                (
+                    item for item in refreshed
+                    if int(getattr(item, "ticket", 0) or 0) == ticket
+                    and str(getattr(item, "symbol", "") or "") == symbol
+                ),
+                None,
+            )
+            if live is None:
+                last_reason = f"ticket #{ticket} / {symbol} was not returned by fresh broker positions"
+                continue
+            if self._sl_is_non_widening_improvement(position, live):
+                return live, "broker-confirmed"
+            live_sl = float(getattr(live, "sl", 0.0) or 0.0)
+            if not self._sl_protects_profit(live):
+                last_reason = f"broker returned SL {live_sl:.8g}, which does not protect profit"
+            elif not self._sl_is_non_widening_improvement(position, live):
+                last_reason = f"broker returned SL {live_sl:.8g}, but it did not improve the previous SL"
+            else:
+                last_reason = f"broker returned SL {live_sl:.8g}, not the requested {requested:.8g}"
+        return None, last_reason
+
     async def _phase_boundary_protect_positions(self, *, phase: dict) -> dict:
         """Protect or close live positions before a successor phase is activated.
 
@@ -2987,20 +3046,30 @@ class MarketScheduler:
 
                 if action.action == "move_sl" and action.new_sl is not None:
                     success = await self.executor.modify_position(position.ticket, sl=action.new_sl, tp=position.tp)
+                    live, confirmation_reason = (None, "executor rejected the SL modification")
                     if success:
+                        live, confirmation_reason = await self._confirm_position_sl(position, action.new_sl)
+                    if live is not None:
+                        broker_sl = float(getattr(live, "sl", 0.0) or 0.0)
                         self.telemetry.increment("positions_modified")
                         if basket:
                             await db.update_basket_state(basket["id"], state=action.state.value)
-                            await db.update_trade_layer(basket["layer_id"], stop_loss=action.new_sl)
+                            await db.update_trade_layer(basket["layer_id"], stop_loss=broker_sl)
                             await db.log_basket_action(
                                 basket_id=basket["id"],
                                 ticket=position.ticket,
                                 action="SL Protected",
-                                details={"old_sl": position.sl, "new_sl": action.new_sl, "current_r": manager.current_r(position.direction, position.entry_price, initial_stop, current_price), "reason": action.reason},
+                                details={"old_sl": position.sl, "requested_sl": action.new_sl, "broker_confirmed_sl": broker_sl, "current_r": manager.current_r(position.direction, position.entry_price, initial_stop, current_price), "reason": action.reason, "confirmation": confirmation_reason},
                             )
                         else:
-                            await db.log_trade_action(position.ticket, "SL Protected", action.reason)
-                        await self._notify(f"🛡 **SL PROTECTED — {position.symbol}**\nTicket: `#{position.ticket}`\nOld SL: `{position.sl:.5f}`\nNew SL: `{action.new_sl:.5f}`\nReason: _{action.reason}_")
+                            await db.log_trade_action(position.ticket, "SL Protected", json.dumps({"old_sl": position.sl, "requested_sl": action.new_sl, "broker_confirmed_sl": broker_sl, "reason": action.reason, "confirmation": confirmation_reason}, sort_keys=True))
+                        await self._notify(f"🛡 **SL PROTECTED — {position.symbol}**\nTicket: `#{position.ticket}`\nOld SL: `{position.sl:.5f}`\nBroker-confirmed SL: `{broker_sl:.5f}`\nReason: _{action.reason}_")
+                    else:
+                        await self._chart_activity(
+                            "sl_protection_unconfirmed", position.symbol,
+                            f"⚠️ **SL PROTECTION NOT CONFIRMED — {position.symbol}**\nTicket: `#{position.ticket}`\nRequested SL: `{action.new_sl:.5f}`\nReason: `{confirmation_reason}`\nThe existing broker SL was not reported as changed; no protection success was recorded.",
+                            fingerprint=f"{position.ticket}:{position.sl}:{action.new_sl}:{confirmation_reason}", essential=True,
+                        )
 
                 elif action.action == "move_tp" and action.new_tp is not None:
                     success = await self.executor.modify_position(position.ticket, sl=position.sl, tp=action.new_tp)
