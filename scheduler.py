@@ -1935,6 +1935,7 @@ class MarketScheduler:
         free_margin = float(account.get("free_margin") or 0.0)
         objective_permits = bool(
             self.settings.auto_trade and not self.settings.is_paused
+            and capital_state not in AccountCapitalState.BLOCKING
             and capital_state not in AccountCapitalState.EXPOSURE_BLOCKING
             and free_margin > 0.0
             and not bool(operational.get("terminal"))
@@ -1988,6 +1989,11 @@ class MarketScheduler:
             exploration_authorized=exploration_authorized,
             strategy_quality=strategy_quality,
             strategy_threshold=strategy_threshold,
+            setup_confidence=str(getattr(signal, "setup_confidence", "") or "") or None,
+            strategy_status=(
+                str(policy.get("strategy_status") or "")
+                or ("CHAMPION" if champion_governed else "CHALLENGER" if forward_demo_experiment_allowed else "UNVALIDATED")
+            ),
             risk_valid=(
                 str(signal.experimental_policy.get("risk_model", "fixed_pct")) != "fixed_volume"
                 or not exploration_authorized
@@ -2069,6 +2075,20 @@ class MarketScheduler:
                         "final_trading_reason": gate.reason,
                         "evidence_classification": gate.evidence_classification,
                         "confidence_classification": gate.confidence_classification,
+                        "evidence_confidence": gate.evidence_confidence,
+                        "sample_size": gate.sample_size,
+                        "setup_quality": gate.setup_quality,
+                        "setup_confidence": gate.setup_confidence,
+                        "strategy_status": gate.strategy_status,
+                        "execution_eligibility": gate.execution_eligibility,
+                        "objective_status": gate.objective_status,
+                        "exploration_status": gate.exploration_status,
+                        "broker_status": gate.broker_status,
+                        "portfolio_status": gate.portfolio_status,
+                        "risk_status": gate.risk_status,
+                        "hard_gate_results": dict(gate.hard_gate_results),
+                        "reason_codes": list(gate.reason_codes),
+                        "advisories": list(gate.advisories),
                     })
                     break
             signal.research_decision = gate.research_decision
@@ -2765,6 +2785,12 @@ class MarketScheduler:
         capacity_context = {
             "account_state": account_state,
             "low_capital": low_capital,
+            "exploration_enabled": bool(
+                self.settings.exploration_enabled
+                and self.settings.trading_mode == "demo"
+                and not self.settings.is_paused
+                and account_state not in AccountCapitalState.BLOCKING
+            ),
             "new_exposure_allowed": new_exposure_allowed,
             "open_position_count": len(positions),
             "protected_position_count": protected_count,

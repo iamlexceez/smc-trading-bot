@@ -69,18 +69,23 @@ def test_two_gate_decision_architecture() -> None:
     weak = {"sample_size": 0, "evidence_stage": "exploration", "confidence": "UNKNOWN"}
     decision = evaluate_trading_gate(
         setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
-        objective_permits_exposure=True, evidence=weak, champion_governed=True,
+        objective_permits_exposure=True, evidence=weak, champion_governed=False,
+        demo_mode=True, exploration_authorized=True, setup_quality=84.0,
+        exploratory_threshold=80.0, strategy_quality=84.0, strategy_threshold=80.0,
     )
     assert_true(decision.research_decision == "RESEARCH_ACCEPTED", "research gate did not accept a measurable candidate")
-    assert_true(decision.trading_decision == "INSUFFICIENT_EVIDENCE", "under-evidenced candidate was allowed objective trading")
+    assert_true(decision.trading_decision == "CONTROLLED_FORWARD_DEMO", "strong under-evidenced DEMO candidate was not admitted to controlled exploration")
+    assert_true(decision.final_state == "EXPLORATORY_DEMO", "controlled exploration did not remain the final decision")
     assert_true(decision.evidence_classification == "INSUFFICIENT" and decision.confidence_classification == "UNVALIDATED", "evidence and confidence were not tracked independently")
 
     strong = {"sample_size": 80, "evidence_strength": "STRONG_EVIDENCE", "evidence_stage": "forward_demo", "confidence": "VALIDATED"}
     challenger = evaluate_trading_gate(
         setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
         objective_permits_exposure=True, evidence=strong, champion_governed=False,
+        strategy_status="CHALLENGER",
     )
-    assert_true(challenger.trading_decision == "OBJECTIVE_INELIGIBLE", "challenger policy bypassed champion governance")
+    assert_true(challenger.trading_decision == "TRADE_APPROVED", "validated challenger was incorrectly blocked by promotion governance")
+    assert_true(challenger.strategy_status == "CHALLENGER", "strategy governance status was not preserved as metadata")
 
     score_only = evaluate_trading_gate(
         setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
@@ -89,6 +94,7 @@ def test_two_gate_decision_architecture() -> None:
         champion_governed=True,
     )
     assert_true(score_only.trading_decision != "TRADE_APPROVED", "feature score alone authorized objective trading")
+    assert_true(score_only.final_state == "EXECUTION_BLOCKED", "non-DEMO under-evidenced candidate did not remain blocked outside exploration")
     assert_true(classify_evidence({"evidence_strength": "PROMISING"}) == "PRELIMINARY", "existing evidence label was not normalized")
     assert_true(classify_confidence({"confidence": "UNKNOWN"}) == "UNVALIDATED", "unknown confidence was fabricated into a validated state")
 
@@ -168,6 +174,13 @@ def test_capacity_aware_opportunity_selection() -> None:
     by_symbol = {item.symbol: item for item in ranked}
     assert_true(by_symbol["Strong Evidence"].details["capacity_allowed"], "low-capital selection rejected an A+ evidence-supported opportunity")
     assert_true(not by_symbol["Weak Evidence"].details["capacity_allowed"] and "A+ / high-confidence" in " ".join(by_symbol["Weak Evidence"].details["capacity_reasons"]), "low-capital selection admitted an under-evidenced candidate")
+    exploring = rank_opportunities(
+        [candidate("Exploration Candidate", {"sample_size": 0})], profiles={},
+        contexts={"Exploration Candidate": contexts["Strong Evidence"]}, historical={},
+        capacity_context={"account_state": "LOW_CAPITAL", "low_capital": True, "exploration_enabled": True, "new_exposure_allowed": True, "open_position_count": 0, "minimum_evidence_sample": 10},
+    )
+    assert_true(exploring[0].details["capacity_allowed"], "controlled DEMO exploration was discarded by low-capital evidence selectivity")
+    assert_true("defers evidence selectivity" in " ".join(exploring[0].rationale), "exploration deferral was not explained in the opportunity thesis")
     assert_true(by_symbol["Strong Evidence"].details["maximum_peer_correlation"] is not None, "closed-candle peer correlation was not reported")
     blocked = rank_opportunities(
         [candidate("Blocked", {"sample_size": 50, "expectancy_r": 0.5})], profiles={},

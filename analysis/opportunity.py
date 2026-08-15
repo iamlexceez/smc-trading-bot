@@ -177,6 +177,7 @@ def rank_opportunities(
     capacity = dict(capacity_context or {})
     account_state = str(capacity.get("account_state") or "ACCOUNT_STATE_UNKNOWN")
     low_capital = bool(capacity.get("low_capital"))
+    exploration_enabled = bool(capacity.get("exploration_enabled"))
     minimum_evidence_sample = max(0, int(_finite(capacity.get("minimum_evidence_sample"), 0)))
     new_exposure_allowed = bool(capacity.get("new_exposure_allowed", True))
     open_position_count = max(0, int(_finite(capacity.get("open_position_count"), 0)))
@@ -267,7 +268,12 @@ def rank_opportunities(
             except (TypeError, ValueError):
                 capacity_reasons.append("invalid policy position capacity")
         low_capital_entry_model = str(policy.get("low_capital_entry_model") or "high_confidence_only")
-        if low_capital and low_capital_entry_model == "high_confidence_only" and confidence_class != "A_PLUS_HIGH_CONFIDENCE":
+        if (
+            low_capital
+            and low_capital_entry_model == "high_confidence_only"
+            and confidence_class != "A_PLUS_HIGH_CONFIDENCE"
+            and not exploration_enabled
+        ):
             capacity_reasons.append("low-capital policy requires A+ / high-confidence evidence")
         capacity_allowed = not capacity_reasons
         peer_correlations = []
@@ -294,6 +300,8 @@ def rank_opportunities(
             rationale.append(f"maximum peer return correlation {max_peer_correlation:.2f}")
         if low_capital:
             rationale.append("low-capital account state increases selectivity and protection priority")
+            if exploration_enabled and low_capital_entry_model == "high_confidence_only" and confidence_class != "A_PLUS_HIGH_CONFIDENCE":
+                rationale.append("controlled DEMO exploration defers evidence selectivity to the final exploration gate")
         if capacity_reasons:
             rationale.append("capacity decision: " + "; ".join(capacity_reasons))
         classification = "BEST_OPPORTUNITY" if score >= 65.0 else ("GOOD_OPPORTUNITY" if score >= 45.0 else "WATCHLIST")

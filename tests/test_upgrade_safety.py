@@ -83,21 +83,31 @@ def test_insufficient_evidence_can_be_controlled_forward_demo_exploration() -> N
         broker_symbol_valid=True,
         valid_market_data=True,
         objective_permits_exposure=True,
-        evidence={"sample_size": 0, "evidence_classification": "INSUFFICIENT", "confidence_classification": "UNVALIDATED"},
+        evidence={"sample_size": 0, "evidence_classification": "INSUFFICIENT", "confidence_classification": "LOW"},
         champion_governed=False,
-        forward_demo_experiment_allowed=True,
+        forward_demo_experiment_allowed=False,
         portfolio_approved=True,
         structural_conflict=False,
         required_htf_context_available=True,
         setup_quality=84.5,
         exploratory_threshold=80.0,
+        strategy_quality=84.0,
+        strategy_threshold=80.0,
         demo_mode=True,
         experiment_id=None,
         exploration_authorized=True,
+        strategy_status="UNVALIDATED",
     )
     assert decision.trading_decision == "CONTROLLED_FORWARD_DEMO"
     assert decision.final_state == "EXPLORATORY_DEMO"
     assert decision.evidence_classification == "INSUFFICIENT"
+    assert decision.confidence_classification == "LOW"
+    assert decision.strategy_status == "UNVALIDATED"
+    assert decision.hard_gate_results == {
+        "broker_symbol": True, "market_data": True, "setup_geometry": True,
+        "objective": True, "portfolio": True, "required_htf_context": True,
+        "risk_policy": True,
+    }
 
 
 def test_negative_evidence_is_rejected_even_when_setup_is_strong() -> None:
@@ -137,8 +147,8 @@ def test_weak_setup_with_insufficient_evidence_is_rejected() -> None:
         strategy_quality=84.0, strategy_threshold=80.0,
         demo_mode=True, exploration_authorized=True,
     )
-    assert decision.trading_decision == "TRADE_REJECTED"
-    assert decision.final_state == "REJECTED"
+    assert decision.trading_decision == "NO_TRADE"
+    assert decision.final_state == "NO_TRADE"
     assert "below exploration threshold" in decision.reason
 
 
@@ -163,7 +173,8 @@ def test_insufficient_evidence_does_not_override_hard_gate() -> None:
         exploration_authorized=True,
     )
     assert decision.final_state == "EXECUTION_BLOCKED"
-    assert decision.trading_decision == "OBJECTIVE_INELIGIBLE"
+    assert decision.trading_decision == "EXECUTION_BLOCKED"
+    assert "OBJECTIVE_INCOMPATIBLE" in decision.reason_codes
 
 
 def test_conflicted_top_down_context_is_explicitly_waiting() -> None:
@@ -209,7 +220,7 @@ def test_forward_demo_challenger_is_allowed_to_trade_in_isolated_demo() -> None:
     assert decision.final_state == "EXECUTION_APPROVED"
 
 
-def test_challenger_without_isolated_demo_authority_is_rejected() -> None:
+def test_challenger_without_isolated_demo_authority_is_not_a_hidden_execution_block() -> None:
     from analysis.decision_gates import evaluate_trading_gate
 
     decision = evaluate_trading_gate(
@@ -220,9 +231,12 @@ def test_challenger_without_isolated_demo_authority_is_rejected() -> None:
         evidence={"evidence_classification": "STRONG", "confidence_classification": "HIGH"},
         champion_governed=False,
         forward_demo_experiment_allowed=False,
+        strategy_status="CHALLENGER",
         portfolio_approved=True,
         structural_conflict=False,
         required_htf_context_available=True,
     )
-    assert decision.trading_decision == "OBJECTIVE_INELIGIBLE"
-    assert "Champion/challenger governance" in decision.failures
+    assert decision.trading_decision == "TRADE_APPROVED"
+    assert decision.final_state == "EXECUTION_APPROVED"
+    assert decision.strategy_status == "CHALLENGER"
+    assert not decision.failures

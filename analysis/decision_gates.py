@@ -1,9 +1,17 @@
-"""Separate research-candidate and objective-trading decisions.
+"""Single-source decision architecture for research and DEMO execution.
 
-The research gate answers whether an opportunity is measurable enough to retain as
-an experiment. The trading gate answers whether the same opportunity has enough
-governed evidence to receive new exposure. Neither gate replaces broker,
-sizing, margin, order, or software-integrity validation.
+The decision returned by this module is the final *policy* decision before the
+broker/sizing/order pipeline.  It deliberately separates:
+
+* current setup quality and validity;
+* completed broker-realized evidence and its statistical confidence;
+* strategy governance and promotion status; and
+* immediate execution eligibility.
+
+Historical evidence and champion/challenger status govern confidence, ranking,
+and promotion.  They do not, by themselves, prohibit a controlled DEMO
+experiment.  Broker, account, objective, portfolio, risk, market-data, and
+software-integrity checks remain authoritative hard gates downstream.
 """
 from __future__ import annotations
 
@@ -34,7 +42,12 @@ _EVIDENCE_ALIASES = {
 
 @dataclass(frozen=True)
 class GateDecision:
-    """A serializable decision with independent research and trading fields."""
+    """Auditable final decision consumed by the execution handoff.
+
+    The first fields retain the historical public shape for compatibility.  The
+    additional fields are intentionally explicit so no downstream component has
+    to reinterpret evidence or governance and silently reverse the decision.
+    """
 
     research_decision: str
     trading_decision: str
@@ -43,6 +56,20 @@ class GateDecision:
     reason: str
     final_state: str = "PENDING_FINAL_VALIDATION"
     failures: tuple[str, ...] = field(default_factory=tuple)
+    reason_codes: tuple[str, ...] = field(default_factory=tuple)
+    hard_gate_results: dict[str, bool] = field(default_factory=dict)
+    setup_quality: float | None = None
+    setup_confidence: str = "UNKNOWN"
+    evidence_confidence: str = "UNVALIDATED"
+    sample_size: int = 0
+    strategy_status: str = "UNVALIDATED"
+    execution_eligibility: str = "PENDING"
+    objective_status: str = "UNKNOWN"
+    exploration_status: str = "NOT_ELIGIBLE"
+    broker_status: str = "UNKNOWN"
+    portfolio_status: str = "UNKNOWN"
+    risk_status: str = "UNKNOWN"
+    advisories: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,14 +77,28 @@ class GateDecision:
             "trading_decision": self.trading_decision,
             "evidence_classification": self.evidence_classification,
             "confidence_classification": self.confidence_classification,
+            "evidence_confidence": self.evidence_confidence,
+            "sample_size": self.sample_size,
+            "setup_quality": self.setup_quality,
+            "setup_confidence": self.setup_confidence,
+            "strategy_status": self.strategy_status,
+            "execution_eligibility": self.execution_eligibility,
+            "objective_status": self.objective_status,
+            "exploration_status": self.exploration_status,
+            "broker_status": self.broker_status,
+            "portfolio_status": self.portfolio_status,
+            "risk_status": self.risk_status,
+            "hard_gate_results": dict(self.hard_gate_results),
             "final_state": self.final_state,
             "reason": self.reason,
+            "reason_codes": list(self.reason_codes),
             "failures": list(self.failures),
+            "advisories": list(self.advisories),
         }
 
 
 def classify_evidence(evidence: Mapping[str, Any] | None) -> str:
-    """Classify only from explicitly recorded evidence; missing data is insufficient."""
+    """Classify recorded evidence; missing evidence means unknown, not bad."""
     data = dict(evidence or {})
     decision = str(data.get("decision") or "").strip().upper()
     if decision in {"REJECTED", "NEGATIVE"}:
@@ -66,7 +107,12 @@ def classify_evidence(evidence: Mapping[str, Any] | None) -> str:
         return "INVALIDATED"
     if decision in {"CONFLICTED", "MATERIAL_CONFLICT"}:
         return "CONFLICTED"
-    explicit = str(data.get("evidence_classification") or data.get("evidence_strength") or data.get("confidence") or "").strip().upper()
+    explicit = str(
+        data.get("evidence_classification")
+        or data.get("evidence_strength")
+        or data.get("confidence")
+        or ""
+    ).strip().upper()
     if explicit in _EVIDENCE_ALIASES:
         return _EVIDENCE_ALIASES[explicit]
     stage = str(data.get("evidence_stage") or "").strip().lower()
@@ -82,9 +128,11 @@ def classify_evidence(evidence: Mapping[str, Any] | None) -> str:
 
 
 def classify_confidence(evidence: Mapping[str, Any] | None) -> str:
-    """Keep confidence independent; never manufacture a numeric confidence value."""
+    """Keep statistical confidence independent from current setup confidence."""
     data = dict(evidence or {})
-    raw = str(data.get("confidence_classification") or data.get("confidence") or "").strip().upper()
+    raw = str(
+        data.get("confidence_classification") or data.get("confidence") or ""
+    ).strip().upper()
     if not raw or raw in {"UNKNOWN", "UNAVAILABLE", "NONE"}:
         return "UNVALIDATED"
     if raw in {"CONFLICTED", "LOW", "INSUFFICIENT", "INSUFFICIENT_EVIDENCE"}:
@@ -92,6 +140,65 @@ def classify_confidence(evidence: Mapping[str, Any] | None) -> str:
     if raw in {"HIGH", "VALIDATED", "STRONG_EVIDENCE", "PROMISING"}:
         return raw
     return "UNVALIDATED"
+
+
+def _setup_confidence(setup_quality: float | None, supplied: str | None) -> str:
+    if supplied:
+        return str(supplied).upper()
+    if setup_quality is None:
+        return "UNKNOWN"
+    quality = float(setup_quality)
+    if quality >= 80.0:
+        return "HIGH"
+    if quality >= 60.0:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _decision(
+    *,
+    trading_decision: str,
+    final_state: str,
+    reason: str,
+    reason_codes: list[str],
+    failures: list[str],
+    advisories: list[str],
+    evidence_classification: str,
+    confidence_classification: str,
+    sample_size: int,
+    setup_quality: float | None,
+    setup_confidence: str,
+    strategy_status: str,
+    hard_gate_results: dict[str, bool],
+    objective_status: str,
+    exploration_status: str,
+    broker_status: str,
+    portfolio_status: str,
+    risk_status: str,
+) -> GateDecision:
+    return GateDecision(
+        research_decision="RESEARCH_ACCEPTED",
+        trading_decision=trading_decision,
+        evidence_classification=evidence_classification,
+        confidence_classification=confidence_classification,
+        evidence_confidence=confidence_classification,
+        sample_size=sample_size,
+        setup_quality=setup_quality,
+        setup_confidence=setup_confidence,
+        strategy_status=strategy_status,
+        execution_eligibility=final_state,
+        objective_status=objective_status,
+        exploration_status=exploration_status,
+        broker_status=broker_status,
+        portfolio_status=portfolio_status,
+        risk_status=risk_status,
+        final_state=final_state,
+        reason=reason,
+        reason_codes=tuple(reason_codes),
+        failures=tuple(failures),
+        hard_gate_results=dict(hard_gate_results),
+        advisories=tuple(advisories),
+    )
 
 
 def evaluate_trading_gate(
@@ -114,113 +221,239 @@ def evaluate_trading_gate(
     strategy_quality: float | None = None,
     strategy_threshold: float | None = None,
     risk_valid: bool = True,
+    setup_confidence: str | None = None,
+    strategy_status: str | None = None,
 ) -> GateDecision:
-    """Evaluate objective eligibility without using a single score as authority.
+    """Return the one authoritative pre-order policy decision.
 
-    Broker sizing, margin, stop-distance, duplicate-order, and order-submit checks
-    remain downstream hard safeguards and are intentionally not duplicated here.
+    Evidence and governance are *not* hard gates.  They are used as follows:
+
+    * negative/invalidated evidence rejects the hypothesis;
+    * conflicted evidence defers it for confirmation;
+    * insufficient evidence in DEMO can become controlled exploration when the
+      current setup and strategy-match thresholds pass;
+    * validated positive evidence may proceed without champion status; and
+    * broker/account/objective/portfolio/risk/data/setup gates remain hard.
+
+    The executor still performs the final broker stop, volume, margin, duplicate,
+    order-check, and submit validation after this decision.
     """
     data = dict(evidence or {})
     evidence_classification = classify_evidence(data)
     confidence_classification = classify_confidence(data)
-    failures: list[str] = []
-    if not broker_symbol_valid:
-        failures.append("Broker-valid symbol")
-    if not valid_market_data:
-        failures.append("Valid market data")
-    if not setup_valid:
-        failures.append("Valid setup geometry")
-    if not objective_permits_exposure:
-        failures.append("Objective/account permits new exposure")
-    evidence_gap = evidence_classification in {"INSUFFICIENT", "EMERGING", "PRELIMINARY"} or confidence_classification in {"LOW", "UNVALIDATED"}
-    if evidence_gap:
-        failures.append(f"Sufficient evidence ({evidence_classification})")
-    if evidence_classification in {"NEGATIVE", "INVALIDATED"}:
-        failures.append(f"Negative or invalidated evidence ({evidence_classification})")
-    if evidence_classification == "CONFLICTED" or structural_conflict:
-        failures.append("Unresolved structural conflict")
-    if confidence_classification in {"LOW", "UNVALIDATED"}:
-        failures.append(f"Validated confidence ({confidence_classification})")
-    if not champion_governed and not forward_demo_experiment_allowed and not exploration_authorized:
-        failures.append("Champion/challenger governance")
-    if not portfolio_approved:
-        failures.append("Portfolio context")
-    if not required_htf_context_available:
-        failures.append("Required top-down context")
-    if not risk_valid:
-        failures.append("Risk policy validity")
+    sample_size = max(0, int(data.get("sample_size") or 0))
+    current_setup_confidence = _setup_confidence(setup_quality, setup_confidence)
+    current_strategy_status = str(
+        strategy_status
+        or ("CHAMPION" if champion_governed else "CHALLENGER" if forward_demo_experiment_allowed else "UNVALIDATED")
+    ).upper()
 
-    hard_failures = {
-        "Broker-valid symbol", "Valid market data", "Valid setup geometry",
-        "Objective/account permits new exposure", "Portfolio context", "Risk policy validity",
+    hard_gate_results = {
+        "broker_symbol": bool(broker_symbol_valid),
+        "market_data": bool(valid_market_data),
+        "setup_geometry": bool(setup_valid),
+        "objective": bool(objective_permits_exposure),
+        "portfolio": bool(portfolio_approved),
+        "required_htf_context": bool(required_htf_context_available),
+        "risk_policy": bool(risk_valid),
     }
-    hard_blocked = any(item in hard_failures for item in failures)
-    evidence_gap = evidence_classification in {"INSUFFICIENT", "EMERGING", "PRELIMINARY"} or confidence_classification in {"LOW", "UNVALIDATED"}
-    threshold = float(exploratory_threshold) if exploratory_threshold is not None else None
-    exploration_quality_failures: list[str] = []
-    if exploration_authorized and evidence_gap:
-        if threshold is None:
-            exploration_quality_failures.append("Exploration setup threshold is not configured")
-        elif float(setup_quality or 0.0) < threshold:
-            exploration_quality_failures.append(f"Setup quality {float(setup_quality or 0.0):.1f} below exploration threshold {threshold:.1f}")
-        if strategy_threshold is not None and float(strategy_quality or 0.0) < float(strategy_threshold):
-            exploration_quality_failures.append(f"Strategy match {float(strategy_quality or 0.0):.1f} below exploration threshold {float(strategy_threshold):.1f}")
-    failures.extend(exploration_quality_failures)
-    controlled_exploration = bool(
-        demo_mode
-        and exploration_authorized
-        and (forward_demo_experiment_allowed or champion_governed or experiment_id is None)
-        and evidence_gap
-        and not hard_blocked
-        and not structural_conflict
-        and required_htf_context_available
-        and threshold is not None
-        and float(setup_quality or 0.0) >= threshold
-        and (strategy_threshold is None or float(strategy_quality or 0.0) >= float(strategy_threshold))
-    )
+    hard_failures = [name for name, passed in hard_gate_results.items() if not passed]
+    hard_labels = {
+        "broker_symbol": "Broker-valid symbol",
+        "market_data": "Valid market data",
+        "setup_geometry": "Valid setup geometry",
+        "objective": "Objective/account permits new exposure",
+        "portfolio": "Portfolio context",
+        "required_htf_context": "Required top-down context",
+        "risk_policy": "Risk policy validity",
+    }
+    failures = [hard_labels[name] for name in hard_failures]
+    reason_codes = [
+        {
+            "broker_symbol": "BROKER_INVALID",
+            "market_data": "STALE_MARKET_DATA",
+            "setup_geometry": "SETUP_INVALID",
+            "objective": "OBJECTIVE_INCOMPATIBLE",
+            "portfolio": "PORTFOLIO_LIMIT",
+            "required_htf_context": "HTF_CONTEXT_UNAVAILABLE",
+            "risk_policy": "RISK_POLICY_INVALID",
+        }[name]
+        for name in hard_failures
+    ]
+    objective_status = "PASS" if objective_permits_exposure else "BLOCKED"
+    broker_status = "PASS" if broker_symbol_valid and valid_market_data else "BLOCKED"
+    portfolio_status = "PASS" if portfolio_approved else "BLOCKED"
+    risk_status = "PASS" if risk_valid else "BLOCKED"
 
-    if controlled_exploration:
-        return GateDecision(
-            research_decision="RESEARCH_ACCEPTED",
-            trading_decision="CONTROLLED_FORWARD_DEMO",
-            evidence_classification=evidence_classification,
-            confidence_classification=confidence_classification,
-            final_state="EXPLORATORY_DEMO",
-            reason="Insufficient completed evidence is being handled as controlled DEMO exploration; champion/challenger status governs promotion, not the ability to collect evidence. Broker, objective, portfolio, and downstream sizing/order safeguards remain mandatory.",
-            failures=tuple(failures),
-        )
-
-    if failures:
-        if any("conflict" in item.lower() for item in failures):
-            decision, final_state = "DEFERRED", "WAITING_FOR_CONFIRMATION"
-        elif any(item.startswith("Objective") or item.startswith("Champion") for item in failures):
-            decision, final_state = "OBJECTIVE_INELIGIBLE", "EXECUTION_BLOCKED"
-        elif any(item.startswith("Negative") for item in failures):
-            decision, final_state = "TRADE_REJECTED", "REJECTED"
-        elif any(item.startswith("Setup quality") or item.startswith("Strategy match") or item.startswith("Exploration") for item in failures):
-            decision, final_state = "TRADE_REJECTED", "REJECTED"
-        elif any(item.startswith("Sufficient") or item.startswith("Validated") or item.startswith("Required") for item in failures):
-            decision, final_state = "INSUFFICIENT_EVIDENCE", "WAITING_FOR_CONFIRMATION"
-        else:
-            decision, final_state = "TRADE_REJECTED", "REJECTED"
-        return GateDecision(
-            research_decision="RESEARCH_ACCEPTED",
-            trading_decision=decision,
-            evidence_classification=evidence_classification,
-            confidence_classification=confidence_classification,
-            final_state=final_state,
+    # Hard safety and current-setup gates always win over evidence or governance.
+    if hard_failures:
+        return _decision(
+            trading_decision="EXECUTION_BLOCKED",
+            final_state="EXECUTION_BLOCKED",
             reason="; ".join(failures),
-            failures=tuple(failures),
+            reason_codes=reason_codes,
+            failures=failures,
+            advisories=[],
+            evidence_classification=evidence_classification,
+            confidence_classification=confidence_classification,
+            sample_size=sample_size,
+            setup_quality=setup_quality,
+            setup_confidence=current_setup_confidence,
+            strategy_status=current_strategy_status,
+            hard_gate_results=hard_gate_results,
+            objective_status=objective_status,
+            exploration_status="BLOCKED_BY_HARD_GATE",
+            broker_status=broker_status,
+            portfolio_status=portfolio_status,
+            risk_status=risk_status,
         )
-    return GateDecision(
-        research_decision="RESEARCH_ACCEPTED",
+
+    # Negative or invalidated evidence is evidence of a bad hypothesis, not a
+    # lack of evidence.  Structural conflict remains explicitly deferred.
+    if evidence_classification in {"NEGATIVE", "INVALIDATED"}:
+        label = f"Negative or invalidated evidence ({evidence_classification})"
+        return _decision(
+            trading_decision="TRADE_REJECTED",
+            final_state="REJECTED",
+            reason=label,
+            reason_codes=["NEGATIVE_EVIDENCE" if evidence_classification == "NEGATIVE" else "INVALIDATED_STRATEGY"],
+            failures=[label],
+            advisories=[],
+            evidence_classification=evidence_classification,
+            confidence_classification=confidence_classification,
+            sample_size=sample_size,
+            setup_quality=setup_quality,
+            setup_confidence=current_setup_confidence,
+            strategy_status=current_strategy_status,
+            hard_gate_results=hard_gate_results,
+            objective_status=objective_status,
+            exploration_status="NOT_ELIGIBLE",
+            broker_status=broker_status,
+            portfolio_status=portfolio_status,
+            risk_status=risk_status,
+        )
+
+    if evidence_classification == "CONFLICTED" or structural_conflict:
+        label = "Unresolved structural or historical conflict"
+        return _decision(
+            trading_decision="DEFERRED",
+            final_state="WAITING_FOR_CONFIRMATION",
+            reason=label,
+            reason_codes=["STRUCTURE_CONFLICT"],
+            failures=[label],
+            advisories=[],
+            evidence_classification=evidence_classification,
+            confidence_classification=confidence_classification,
+            sample_size=sample_size,
+            setup_quality=setup_quality,
+            setup_confidence=current_setup_confidence,
+            strategy_status=current_strategy_status,
+            hard_gate_results=hard_gate_results,
+            objective_status=objective_status,
+            exploration_status="DEFERRED",
+            broker_status=broker_status,
+            portfolio_status=portfolio_status,
+            risk_status=risk_status,
+        )
+
+    evidence_gap = evidence_classification in {"INSUFFICIENT", "EMERGING", "PRELIMINARY"} or confidence_classification in {"LOW", "UNVALIDATED"}
+    advisories: list[str] = []
+    if evidence_gap:
+        advisories.append(f"EVIDENCE_COLLECTION_REQUIRED:{evidence_classification}")
+        advisories.append(f"EVIDENCE_CONFIDENCE:{confidence_classification}")
+        advisories.append(f"STRATEGY_GOVERNANCE:{current_strategy_status}")
+
+    # A positive but under-evidenced hypothesis must either qualify for a
+    # controlled DEMO experiment or be rejected for a concrete current-setup/
+    # configuration reason.  It must never be labelled objective-ineligible
+    # merely because evidence or promotion status is missing.
+    if evidence_gap:
+        threshold = float(exploratory_threshold) if exploratory_threshold is not None else None
+        exploration_failures: list[str] = []
+        exploration_codes: list[str] = []
+        if not demo_mode:
+            exploration_failures.append("Controlled exploration requires DEMO mode")
+            exploration_codes.append("DEMO_ONLY_EXPLORATION")
+        if not exploration_authorized:
+            exploration_failures.append("Controlled DEMO exploration is not authorized")
+            exploration_codes.append("EXPLORATION_NOT_AUTHORIZED")
+        if threshold is None:
+            exploration_failures.append("Exploration setup threshold is not configured")
+            exploration_codes.append("EXPLORATION_THRESHOLD_UNCONFIGURED")
+        elif float(setup_quality or 0.0) < threshold:
+            exploration_failures.append(
+                f"Setup quality {float(setup_quality or 0.0):.1f} below exploration threshold {threshold:.1f}"
+            )
+            exploration_codes.append("SETUP_TOO_WEAK")
+        if strategy_threshold is not None and float(strategy_quality or 0.0) < float(strategy_threshold):
+            exploration_failures.append(
+                f"Strategy match {float(strategy_quality or 0.0):.1f} below exploration threshold {float(strategy_threshold):.1f}"
+            )
+            exploration_codes.append("STRATEGY_MATCH_TOO_WEAK")
+        if not exploration_failures:
+            return _decision(
+                trading_decision="CONTROLLED_FORWARD_DEMO",
+                final_state="EXPLORATORY_DEMO",
+                reason="Current setup passed all hard gates and the controlled DEMO exploration standard; insufficient evidence and strategy governance remain informational and will be updated from the broker-realized outcome.",
+                reason_codes=["CONTROLLED_DEMO_EXPLORATION", "EVIDENCE_COLLECTION_REQUIRED"],
+                failures=[],
+                advisories=advisories,
+                evidence_classification=evidence_classification,
+                confidence_classification=confidence_classification,
+                sample_size=sample_size,
+                setup_quality=setup_quality,
+                setup_confidence=current_setup_confidence,
+                strategy_status=current_strategy_status,
+                hard_gate_results=hard_gate_results,
+                objective_status=objective_status,
+                exploration_status="PASS",
+                broker_status=broker_status,
+                portfolio_status=portfolio_status,
+                risk_status=risk_status,
+            )
+        return _decision(
+            trading_decision="NO_TRADE" if "SETUP_TOO_WEAK" in exploration_codes or "STRATEGY_MATCH_TOO_WEAK" in exploration_codes else "EXECUTION_BLOCKED",
+            final_state="NO_TRADE" if "SETUP_TOO_WEAK" in exploration_codes or "STRATEGY_MATCH_TOO_WEAK" in exploration_codes else "EXECUTION_BLOCKED",
+            reason="; ".join(exploration_failures),
+            reason_codes=exploration_codes,
+            failures=exploration_failures,
+            advisories=advisories,
+            evidence_classification=evidence_classification,
+            confidence_classification=confidence_classification,
+            sample_size=sample_size,
+            setup_quality=setup_quality,
+            setup_confidence=current_setup_confidence,
+            strategy_status=current_strategy_status,
+            hard_gate_results=hard_gate_results,
+            objective_status=objective_status,
+            exploration_status="FAIL",
+            broker_status=broker_status,
+            portfolio_status=portfolio_status,
+            risk_status=risk_status,
+        )
+
+    # Positive completed evidence can authorize normal execution.  Champion /
+    # challenger status is deliberately reported, never used as a hidden block.
+    return _decision(
         trading_decision="TRADE_APPROVED",
+        final_state="EXECUTION_APPROVED",
+        reason="All hard gates passed and the hypothesis has positive completed evidence; strategy governance remains promotion metadata rather than an execution prerequisite.",
+        reason_codes=["EXECUTION_APPROVED"],
+        failures=[],
+        advisories=advisories,
         evidence_classification=evidence_classification,
         confidence_classification=confidence_classification,
-        final_state="EXECUTION_APPROVED",
-        reason="Research candidate passed the independent evidence, confidence, governance, portfolio, and objective-context gate.",
+        sample_size=sample_size,
+        setup_quality=setup_quality,
+        setup_confidence=current_setup_confidence,
+        strategy_status=current_strategy_status,
+        hard_gate_results=hard_gate_results,
+        objective_status=objective_status,
+        exploration_status="NOT_REQUIRED",
+        broker_status=broker_status,
+        portfolio_status=portfolio_status,
+        risk_status=risk_status,
     )
 
 
 __all__ = ["GateDecision", "classify_confidence", "classify_evidence", "evaluate_trading_gate"]
-
