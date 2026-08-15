@@ -1359,6 +1359,66 @@ async def test_persistent_objective_template_sessions() -> None:
         assert_true(len(sessions) == 2 and sessions[-1]["start_equity"] == 10.0 and sessions[0]["start_equity"] == 50.0, "prior session history was not immutable across a new session")
 
 
+def test_session_local_phase_display_number() -> None:
+    assert_true(scheduler.MarketScheduler._phase_display_number({"phase_number": 19, "session_phase_number": 1}) == 1, "phase display still uses the cumulative global phase number")
+    assert_true(scheduler.MarketScheduler._phase_display_number({"phase_number": 20, "session_phase_number": 2}) == 2, "session-local successor phase number was not selected")
+
+
+async def test_phase_boundary_closes_unprotected_position() -> None:
+    class BoundaryExecutor:
+        def __init__(self):
+            self.positions = [
+                Position(ticket=91, symbol="Boom 100 Index", direction="BUY", volume=0.2, entry_price=100.0, sl=99.0, tp=103.0, profit=-1.0),
+                Position(ticket=92, symbol="Boom 500 Index", direction="BUY", volume=0.2, entry_price=100.0, sl=100.5, tp=103.0, profit=1.0),
+            ]
+            self.closed = []
+
+        async def get_open_positions(self):
+            return list(self.positions)
+
+        async def close_position(self, ticket):
+            self.closed.append(int(ticket))
+            self.positions = [position for position in self.positions if int(position.ticket) != int(ticket)]
+            return True
+
+        async def modify_position(self, ticket, sl=None, tp=None):
+            return False
+
+    engine = object.__new__(scheduler.MarketScheduler)
+    engine.settings = TradeSettings.defaults()
+    engine.settings.trading_mode = "demo"
+    engine.executor = BoundaryExecutor()
+    engine._position_management_lock = asyncio.Lock()
+    engine.telemetry = RuntimeTelemetry()
+    engine.last_capital_state = {"account": {"equity": 100.0, "balance": 100.0, "free_margin": 100.0}}
+    engine._management_protection_context = AsyncMock(return_value={})
+    original_basket = db.get_basket_for_ticket
+    original_logs = db.log_trade_action
+    original_baskets = db.get_open_baskets
+    original_flat = db.close_basket_if_flat
+    async def _no_basket(*args, **kwargs):
+        return None
+    async def _no_log(*args, **kwargs):
+        return None
+    async def _no_baskets(*args, **kwargs):
+        return []
+    async def _no_flat(*args, **kwargs):
+        return True
+    db.get_basket_for_ticket = _no_basket
+    db.log_trade_action = _no_log
+    db.get_open_baskets = _no_baskets
+    db.close_basket_if_flat = _no_flat
+    try:
+        result = await engine._phase_boundary_protect_positions(phase={"id": 7, "session_phase_number": 1, "phase_number": 19})
+    finally:
+        db.get_basket_for_ticket = original_basket
+        db.log_trade_action = original_logs
+        db.get_open_baskets = original_baskets
+        db.close_basket_if_flat = original_flat
+    assert_true(result["attempted"] == 2 and result["closed"] == 1 and result["protected"] == 1 and result["failed"] == 0, "phase boundary did not prefer protection and close the unprotected position")
+    assert_true(engine.executor.closed == [91] and [position.ticket for position in engine.executor.positions] == [92], "phase boundary did not confirm close/protection outcomes before returning")
+
+
 async def test_legacy_objective_phase_migration() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "legacy_objective.db")
@@ -1671,6 +1731,8 @@ def run() -> None:
     asyncio.run(test_objective_console_safety())
     asyncio.run(test_objective_phase_lifecycle())
     asyncio.run(test_persistent_objective_template_sessions())
+    test_session_local_phase_display_number()
+    asyncio.run(test_phase_boundary_closes_unprotected_position())
     asyncio.run(test_legacy_objective_phase_migration())
     test_causal_replay_safety()
     asyncio.run(test_adaptive_management_learning_evidence())

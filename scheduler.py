@@ -220,6 +220,7 @@ class MarketScheduler:
             "starting_capital": equity, "phase_id": phase["id"],
             "phase_number": phase.get("session_phase_number") or 1,
             "phase_target_equity": phase["target_equity"], "phase_status": phase["status"],
+            "phase_boundary_pending": False, "phase_boundary_action": "protect_then_close",
             "session_status": "ACTIVE",
         })
         started = await db.reactivate_objective_template_session(
@@ -272,8 +273,9 @@ class MarketScheduler:
         active_phase = phases[0]
         operational.update({
             "phase_plan": plan.to_dict(), "phase_id": active_phase["id"],
-            "phase_number": active_phase["phase_number"], "phase_target_equity": active_phase["target_equity"],
-            "phase_status": active_phase["status"],
+            "phase_number": self._phase_display_number(active_phase), "phase_target_equity": active_phase["target_equity"],
+            "phase_status": active_phase["status"], "phase_boundary_pending": False,
+            "phase_boundary_action": "protect_then_close",
         })
         context["operational"] = operational
         migrated = await db.update_active_objective_context(int(active["id"]), context)
@@ -310,6 +312,18 @@ class MarketScheduler:
         if not operational:
             self._operational_objective = {}
             return list(snapshot["market_selection"]["selected_symbols"])
+        if operational.get("phase_boundary_pending"):
+            reason = "Phase-boundary position protection/closure is pending broker confirmation. New exposure is paused; existing positions remain under the independent protection manager."
+            self._operational_objective = {
+                **operational, "id": active.get("id"), "version": active.get("version"),
+                "status": "PHASE_BOUNDARY_PENDING",
+            }
+            snapshot["market_selection"] = {
+                **snapshot["market_selection"], "state": "phase_boundary_pending",
+                "selected_symbols": [], "disabled_symbols": sorted({str(symbol) for symbol in broker_usable_symbols}),
+            }
+            self._set_scan_gate("PHASE_BOUNDARY_PENDING", reason, analysis_symbols=0)
+            return []
         usable = {str(symbol) for symbol in broker_usable_symbols}
         resolved = [str(symbol) for symbol in operational.get("allowed_symbols") or []]
         explicit = bool(operational.get("explicit_symbol_universe"))
@@ -344,7 +358,7 @@ class MarketScheduler:
         operational_phase = phase_for_equity(operational.get("starting_capital"), current_equity)
         phase_context = {
             "phase_id": active_phase.get("id") if active_phase else operational.get("phase_id"),
-            "phase_number": active_phase.get("phase_number") if active_phase else operational.get("phase_number"),
+            "phase_number": self._phase_display_number(active_phase) if active_phase else operational.get("phase_number"),
             "phase_target_equity": active_phase.get("target_equity") if active_phase else operational.get("phase_target_equity"),
             "phase_status": active_phase.get("status") if active_phase else operational.get("phase_status"),
         }
@@ -2230,6 +2244,134 @@ class MarketScheduler:
         df = await self.fetch_candles(selected.symbol, primary_tf, 500)
         await self.execute_signal(selected, df)
 
+    @staticmethod
+    def _phase_display_number(phase: dict | None) -> int:
+        """Return the phase number users see within the current DEMO session."""
+        item = dict(phase or {})
+        try:
+            return int(item.get("session_phase_number") or item.get("phase_number") or 1)
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
+    def _sl_protects_profit(position, sl: float | None = None) -> bool:
+        """Return whether a position's broker SL is already beyond entry in profit."""
+        level = float(sl if sl is not None else getattr(position, "sl", 0.0) or 0.0)
+        entry = float(getattr(position, "entry_price", 0.0) or 0.0)
+        direction = str(getattr(position, "direction", "")).upper()
+        if level <= 0 or entry <= 0:
+            return False
+        return (direction == "BUY" and level > entry) or (direction == "SELL" and level < entry)
+
+    async def _phase_boundary_protect_positions(self, *, phase: dict) -> dict:
+        """Protect or close live positions before a successor phase is activated.
+
+        This is a lifecycle boundary, not a second management engine. It first
+        gives the currently selected experimental management policy one broker-
+        validated opportunity to improve a profitable stop. A modification is
+        accepted only after fresh MT5 position data confirms the SL is on the
+        profitable side of entry. Positions that cannot be confirmed protected,
+        including losing positions that cannot have profit protected, are closed
+        through the executor's existing broker-validation path.
+        """
+        summary = {"attempted": 0, "protected": 0, "closed": 0, "failed": 0, "details": []}
+        async with self._position_management_lock:
+            positions = await self.executor.get_open_positions()
+            self.telemetry.increment("positions_checked", len(positions))
+            if not positions:
+                return summary
+            protection_context = await self._management_protection_context(positions)
+            for position in positions:
+                summary["attempted"] += 1
+                ticket = int(position.ticket)
+                basket = await db.get_basket_for_ticket(ticket, self.settings.trading_mode)
+                initial_stop = float(basket["initial_stop"]) if basket else float(position.sl or 0.0)
+                policy_data = dict((basket or {}).get("metadata", {}).get("experimental_policy") or {})
+                candidate_sl = None
+                candidate_reason = ""
+                if self._sl_protects_profit(position):
+                    summary["protected"] += 1
+                    summary["details"].append({"ticket": ticket, "action": "already_protected"})
+                    continue
+                if float(getattr(position, "profit", 0.0) or 0.0) > 0 and initial_stop > 0:
+                    try:
+                        if not policy_data:
+                            active_policy, _, _ = await self.optimizer.active_policy(self.settings.trading_mode)
+                            policy_data = active_policy.to_dict()
+                        df = await self.fetch_candles(position.symbol, "M5", 200)
+                        if not df.empty and len(df) >= 30:
+                            current_price = float(df.iloc[-1]["close"])
+                            atr_value = float(atr(df, 14).iloc[-1])
+                            if atr_value > 0:
+                                structure = analyze_structure(df, lookback=3)
+                                try:
+                                    state = ManagementState((basket or {}).get("state", ManagementState.INITIAL.value))
+                                except ValueError:
+                                    state = ManagementState.INITIAL
+                                action = TradeManager(
+                                    policy=policy_data,
+                                    min_sl_update_distance=self.settings.min_sl_update_distance_atr,
+                                    min_tp_update_distance=self.settings.min_tp_update_distance_atr,
+                                ).evaluate(
+                                    direction=position.direction,
+                                    entry_price=position.entry_price,
+                                    initial_stop=initial_stop,
+                                    current_sl=position.sl,
+                                    current_tp=position.tp,
+                                    current_price=current_price,
+                                    atr_value=atr_value,
+                                    structure=structure,
+                                    state=state,
+                                    partial_exit_done=True,
+                                    structural_target=None,
+                                    costs_buffer=atr_value * 0.02,
+                                    protection_context=protection_context,
+                                )
+                                if action.action == "move_sl" and action.new_sl is not None and self._sl_protects_profit(position, action.new_sl):
+                                    candidate_sl = float(action.new_sl)
+                                    candidate_reason = action.reason or "Selected experimental management policy"
+                    except Exception as exc:
+                        logger.warning("Phase-boundary policy protection failed for #%s: %s", ticket, exc)
+                if candidate_sl is not None and self._sl_protects_profit(position, candidate_sl):
+                    modified = await self.executor.modify_position(ticket, sl=candidate_sl, tp=position.tp)
+                    refreshed = await self.executor.get_open_positions()
+                    live = next((item for item in refreshed if int(item.ticket) == ticket), None)
+                    if modified and live is not None and self._sl_protects_profit(live):
+                        summary["protected"] += 1
+                        self.telemetry.increment("positions_modified")
+                        if basket:
+                            await db.update_basket_state(basket["id"], state=ManagementState.PROFIT_PROTECTED.value)
+                            await db.update_trade_layer(basket["layer_id"], stop_loss=float(live.sl or candidate_sl))
+                            await db.log_basket_action(
+                                basket_id=basket["id"], ticket=ticket, action="Phase Boundary SL Protected",
+                                details={"old_sl": position.sl, "new_sl": live.sl, "phase_id": phase["id"], "reason": candidate_reason},
+                            )
+                        else:
+                            await db.log_trade_action(ticket, "Phase Boundary SL Protected", json.dumps({"old_sl": position.sl, "new_sl": live.sl, "phase_id": phase["id"], "reason": candidate_reason}, sort_keys=True))
+                        summary["details"].append({"ticket": ticket, "action": "protected", "sl": live.sl})
+                        continue
+                closed = await self.executor.close_position(ticket)
+                refreshed = await self.executor.get_open_positions()
+                still_open = any(int(item.ticket) == ticket for item in refreshed)
+                if closed and not still_open:
+                    summary["closed"] += 1
+                    self.telemetry.increment("positions_closed")
+                    if basket:
+                        await db.update_basket_state(basket["id"], state=ManagementState.CLOSED.value, status="closed")
+                        await db.log_basket_action(
+                            basket_id=basket["id"], ticket=ticket, action="Phase Boundary Close",
+                            details={"phase_id": phase["id"], "reason": "Position was not broker-confirmed protected before phase transition"},
+                        )
+                    else:
+                        await db.log_trade_action(ticket, "Phase Boundary Close", json.dumps({"phase_id": phase["id"], "reason": "Position was not broker-confirmed protected before phase transition"}, sort_keys=True))
+                    summary["details"].append({"ticket": ticket, "action": "closed"})
+                else:
+                    summary["failed"] += 1
+                    summary["details"].append({"ticket": ticket, "action": "failed", "broker_close_returned": bool(closed), "still_open": still_open})
+            for basket_row in await db.get_open_baskets(self.settings.trading_mode):
+                await db.close_basket_if_flat(basket_row["id"], {int(item.ticket) for item in await self.executor.get_open_positions()})
+        return summary
+
     async def _advance_objective_phase_if_due(self, capital: dict) -> Optional[dict]:
         """Advance or fail one active phase from fresh broker equity only.
 
@@ -2267,7 +2409,7 @@ class MarketScheduler:
                 await db.update_active_objective_context(int(active["id"]), context)
                 await self._notify(
                     "❌ **PHASE FAILED**\n"
-                    f"Objective v{active.get('version')} | Phase `{phase['phase_number']}`: `${float(phase.get('starting_equity') or phase['planned_start_equity']):.2f}` → `${float(phase['target_equity']):.2f}`\n"
+                    f"Objective v{active.get('version')} | Phase `{self._phase_display_number(phase)}`: `${float(phase.get('starting_equity') or phase['planned_start_equity']):.2f}` → `${float(phase['target_equity']):.2f}`\n"
                     f"Ending equity: `${equity:.2f}` | Reason: `{state}`\n"
                     f"Trades: `{metrics['trades_taken']}` | Expectancy: `{metrics['expectancy_r'] if metrics['expectancy_r'] is not None else 'N/A'}` R\n"
                     "New exposure is being stopped by the terminal objective flow; existing positions remain under broker-confirmed protection."
@@ -2275,6 +2417,37 @@ class MarketScheduler:
                 return {"outcome": "phase_failed", "phase": failed, "metrics": metrics}
             if equity < float(phase["target_equity"]):
                 return None
+
+            # Freeze new objective exposure while the boundary action is in
+            # progress. Existing positions are handled through the same broker-
+            # validated modify/close APIs used by the independent manager.
+            context = dict(active.get("context") or {})
+            operational["phase_boundary_pending"] = True
+            operational["phase_boundary_status"] = {
+                "phase_id": phase["id"],
+                "session_phase_number": self._phase_display_number(phase),
+                "action": "protect_then_close",
+            }
+            context["operational"] = operational
+            await db.update_active_objective_context(int(active["id"]), context)
+            try:
+                boundary = await self._phase_boundary_protect_positions(phase=phase)
+            except Exception as exc:
+                logger.error("Phase-boundary position handling failed: %s", exc, exc_info=True)
+                boundary = {"attempted": 0, "protected": 0, "closed": 0, "failed": 1, "details": [{"action": "exception", "reason": str(exc)}]}
+            if boundary.get("failed", 0):
+                operational["phase_boundary_status"] = {
+                    **operational["phase_boundary_status"], "result": boundary,
+                }
+                context["operational"] = operational
+                await db.update_active_objective_context(int(active["id"]), context)
+                await self._notify(
+                    "⚠️ **PHASE BOUNDARY PENDING**\n"
+                    f"Phase `{self._phase_display_number(phase)}` reached its target, but `{boundary.get('failed')}` position action(s) are not broker-confirmed complete.\n"
+                    f"Protected: `{boundary.get('protected', 0)}` | Closed: `{boundary.get('closed', 0)}` | Failed: `{boundary.get('failed', 0)}`\n"
+                    "New exposure remains paused. The bot will retry the boundary action; existing positions remain under the independent protection manager."
+                )
+                return {"outcome": "phase_boundary_pending", "phase": phase, "boundary": boundary}
 
             learning = await self.run_self_optimization()
             next_policy, next_experiment, next_version = await self.optimizer.active_policy("demo")
@@ -2291,10 +2464,12 @@ class MarketScheduler:
             if not completed or completed.get("status") != "completed":
                 return None
             context = dict(active.get("context") or {})
-            operational["phase_review"] = {"phase_id": completed["id"], "outcome": "completed", "metrics": metrics, "learning": learning}
+            operational["phase_boundary_pending"] = False
+            operational["phase_boundary_status"] = {"phase_id": completed["id"], "result": boundary, "action": "protect_then_close"}
+            operational["phase_review"] = {"phase_id": completed["id"], "outcome": "completed", "metrics": metrics, "learning": learning, "boundary": boundary}
             if successor:
                 operational.update({
-                    "phase_id": successor["id"], "phase_number": successor["phase_number"],
+                    "phase_id": successor["id"], "phase_number": self._phase_display_number(successor),
                     "phase_target_equity": successor["target_equity"], "phase_status": successor["status"],
                 })
             else:
@@ -2302,15 +2477,16 @@ class MarketScheduler:
             context["operational"] = operational
             await db.update_active_objective_context(int(active["id"]), context)
             status_line = (
-                f"🟢 Continuing automatically into Phase `{successor['phase_number']}`: `${float(successor['starting_equity']):.2f}` → `${float(successor['target_equity']):.2f}`."
+                f"🟢 Continuing automatically into Phase `{self._phase_display_number(successor)}`: `${float(successor['starting_equity']):.2f}` → `${float(successor['target_equity']):.2f}`."
                 if successor else "🏆 Final phase reached; the objective completion flow is now verifying the overall target."
             )
             await self._notify(
                 "🎯 **PHASE COMPLETE**\n"
-                f"Objective v{active.get('version')} | Phase `{completed['phase_number']}`: `${float(completed.get('starting_equity') or completed['planned_start_equity']):.2f}` → `${float(completed['target_equity']):.2f}`\n"
+                f"Objective v{active.get('version')} | Phase `{self._phase_display_number(completed)}`: `${float(completed.get('starting_equity') or completed['planned_start_equity']):.2f}` → `${float(completed['target_equity']):.2f}`\n"
                 f"Ending equity: `${equity:.2f}` | Trades: `{metrics['trades_taken']}` | Win rate: `{metrics['win_rate']:.1f}%`\n"
                 f"Expectancy: `{metrics['expectancy_r'] if metrics['expectancy_r'] is not None else 'N/A'}` R | Best instrument: `{metrics.get('best_instrument') or 'insufficient evidence'}`\n"
-                f"Learning decision: `{learning.get('decision', 'recorded')}`\n{status_line}"
+                f"Learning decision: `{learning.get('decision', 'recorded')}`\n"
+                f"Boundary: protected `{boundary.get('protected', 0)}` | closed `{boundary.get('closed', 0)}`\n{status_line}"
             )
             return {"outcome": "phase_completed", "phase": completed, "next_phase": successor, "metrics": metrics, "learning": learning}
 
