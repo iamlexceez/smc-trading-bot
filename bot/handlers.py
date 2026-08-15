@@ -403,7 +403,7 @@ class BotHandlers:
                 f"Current DEMO equity: `${float(account.get('equity') or 0.0):.2f}`\n"
                 f"Growth: `{objective.growth_preference.upper()}` | Protection: `{objective.capital_protection_preference.upper()}`\n"
                 f"Allowed instruments: `{instruments}`\n\n"
-                f"🎯 **PHASE {phase.get('session_phase_number') or 1} ACTIVE**\n"
+                f"🎯 **PHASE {phase.get('session_phase_number') if phase.get('session_phase_number') is not None else 1} ACTIVE**\n"
                 f"Milestone: `${float(phase.get('starting_equity') or 0.0):.2f}` → `${float(phase.get('target_equity') or 0.0):.2f}`\n"
                 f"Adaptive plan: `{started.get('phase_count')}` milestones\n\n"
                 "🟢 **ACTIVE — FULL AUTO DEMO**\nThe existing broker-validated scanner and independent position manager are active.",
@@ -1052,7 +1052,8 @@ class BotHandlers:
             f"Session: #{session.get('id')} | Status: {str(session.get('status') or '').upper()}",
             f"Starting equity: ${float(session.get('start_equity') or 0.0):.2f} | Current equity: ${float(session.get('end_equity') or session.get('start_equity') or 0.0):.2f}",
             f"Saved target: ${float(objective.target_capital or 0.0):.2f}",
-            f"Current phase: {phase.get('session_phase_number') if phase else 'N/A'} | Target: ${float((phase or {}).get('target_equity') or 0.0):.2f}",
+            f"Current phase: {phase.get('session_phase_number') if phase and phase.get('session_phase_number') is not None else 'N/A'} | Role: {operational.get('phase_role') or ('RECOVERY' if phase and phase.get('session_phase_number') == 0 else 'GROWTH')} | Target: ${float((phase or {}).get('target_equity') or 0.0):.2f}",
+            f"Recovery target: ${float(operational.get('recovery_target_equity') or 0.0):.2f} | Previous phase: {operational.get('recovery_from_phase_number') if operational.get('recovery_from_phase_number') is not None else 'N/A'}",
             f"Trades: {session.get('strategy_trades', 0)} | Wins/losses: {session.get('wins', 0)}/{session.get('losses', 0)} | Drawdown: {float(session.get('max_drawdown_pct') or 0.0):.1f}%",
             f"Policy versions: {', '.join(session.get('policy_versions') or []) or 'baseline / pending closed evidence'}",
             "Learning status: broker-confirmed completed outcomes feed the existing governed optimizer.",

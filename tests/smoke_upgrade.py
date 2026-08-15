@@ -1398,6 +1398,52 @@ async def test_persistent_objective_template_sessions() -> None:
 def test_session_local_phase_display_number() -> None:
     assert_true(scheduler.MarketScheduler._phase_display_number({"phase_number": 19, "session_phase_number": 1}) == 1, "phase display still uses the cumulative global phase number")
     assert_true(scheduler.MarketScheduler._phase_display_number({"phase_number": 20, "session_phase_number": 2}) == 2, "session-local successor phase number was not selected")
+    assert_true(scheduler.MarketScheduler._phase_display_number({"phase_number": 21, "session_phase_number": 0}) == 0, "Phase 0 was coerced to another phase number")
+    merged = scheduler.MarketScheduler._apply_phase_management_policy(
+        {"breakeven_trigger_r": 1.0, "protection_response": 0.5},
+        {"session_phase_number": 0, "policy_snapshot": {"policy": {"breakeven_trigger_r": 0.5, "protection_response": 0.9}}},
+    )
+    assert_true(merged["active_phase_number"] == 0 and merged["active_phase_role"] == "RECOVERY", "Phase 0 management context was not propagated")
+    assert_true(merged["breakeven_trigger_r"] == 0.5 and merged["protection_response"] == 0.9, "current phase management policy did not overlay active-trade SL inputs")
+
+
+async def test_phase_zero_recovery_lifecycle() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "phase_zero.db")
+        await db.init_db(path)
+        objective = TradingObjective(raw_instruction="phase-zero", account_mode="demo", starting_capital=50.0, target_capital=200.0)
+        await db.create_objective_draft(
+            account_mode="demo", raw_instruction="phase-zero", objective=objective.to_dict(),
+            account_snapshot={"equity": 50.0, "balance": 50.0}, broker_universe=["Boom 100 Index"],
+            context={"operational": {}}, db_path=path,
+        )
+        active = await db.confirm_objective_draft("demo", db_path=path)
+        session_id = await db.create_demo_session(
+            broker_login="fixture", start_balance=50.0, start_equity=50.0,
+            objective_id=active["id"], objective_version=active["version"], db_path=path,
+        )
+        phases = await db.create_objective_phase_plan(
+            objective_id=active["id"], demo_session_id=session_id, starting_equity=50.0,
+            phase_targets=[75.0, 200.0], policy_snapshot={"policy": {"breakeven_trigger_r": 1.0}},
+            instruments=["Boom 100 Index"], include_recovery_phase=True, db_path=path,
+        )
+        phase_zero = next(item for item in phases if item["session_phase_number"] == 0)
+        phase_one = next(item for item in phases if item["session_phase_number"] == 1)
+        assert_true(phase_zero["status"] == "planned" and phase_one["status"] == "active", "new session did not start at active Phase 1 with planned Phase 0")
+        recovery = await db.activate_objective_recovery_phase(
+            active["id"], demo_session_id=session_id, recovery_equity=40.0, recovery_target_equity=50.0,
+            policy_snapshot={"phase_role": "RECOVERY", "policy": {"breakeven_trigger_r": 0.5}},
+            instruments=["Boom 100 Index"], reason="fixture loss", db_path=path,
+        )
+        assert_true(recovery and recovery["session_phase_number"] == 0 and recovery["status"] == "active", "Phase 0 was not activated below session starting balance")
+        paused_phase_one = await db.get_objective_phase(phase_one["id"], db_path=path)
+        assert_true(paused_phase_one["status"] == "recovery_paused", "growth phase was not paused while Phase 0 was active")
+        completed, successor = await db.complete_objective_recovery_phase(
+            recovery["id"], ending_equity=50.0, reason="fixture recovery", metrics={},
+            next_policy_snapshot={"policy": {"breakeven_trigger_r": 1.0}}, next_instruments=["Boom 100 Index"], db_path=path,
+        )
+        assert_true(completed["status"] == "completed" and successor["session_phase_number"] == 1 and successor["status"] == "active", "Phase 0 did not return control to active Phase 1")
+        assert_true(float(successor["starting_equity"]) == 50.0, "Phase 1 did not restart from the recovered session starting balance")
 
 
 async def test_sl_protection_requires_broker_confirmation() -> None:
@@ -1519,7 +1565,8 @@ async def test_legacy_objective_phase_migration() -> None:
             db.update_active_objective_context = original_update
         phases = await db.list_objective_phases(active["id"], db_path=path)
         phase_data = (migrated.get("context") or {}).get("operational") or {}
-        assert_true(phases and phases[0]["status"] == "active", "legacy confirmed objective did not receive an active phase")
+        assert_true(any(item.get("session_phase_number") == 0 and item.get("status") == "planned" for item in phases), "legacy confirmed objective did not receive a planned Phase 0 recovery row")
+        assert_true(any(item.get("session_phase_number") == 1 and item.get("status") == "active" for item in phases), "legacy confirmed objective did not receive an active growth Phase 1")
         assert_true(phase_data.get("phase_plan", {}).get("phase_targets", [])[-1] == 500.0, "legacy phase migration changed the objective target")
         assert_true(phase_data.get("allowed_symbols") == ["Boom 100 Index"], "legacy phase migration changed the broker-resolved objective allowlist")
 
@@ -1795,6 +1842,7 @@ def run() -> None:
     asyncio.run(test_objective_phase_lifecycle())
     asyncio.run(test_persistent_objective_template_sessions())
     test_session_local_phase_display_number()
+    asyncio.run(test_phase_zero_recovery_lifecycle())
     asyncio.run(test_sl_protection_requires_broker_confirmation())
     asyncio.run(test_phase_boundary_closes_unprotected_position())
     asyncio.run(test_legacy_objective_phase_migration())

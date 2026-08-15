@@ -1587,6 +1587,7 @@ async def _objective_phase_row(row) -> Optional[dict]:
 async def create_objective_phase_plan(
     *, objective_id: int, demo_session_id: Optional[int], starting_equity: float,
     phase_targets: list[float], policy_snapshot: Optional[dict], instruments: list[str],
+    include_recovery_phase: bool = False,
     db_path: str = DB_PATH,
 ) -> list[dict]:
     """Persist one immutable milestone plan and activate its first phase."""
@@ -1598,8 +1599,21 @@ async def create_objective_phase_plan(
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute("SELECT COALESCE(MAX(phase_number), 0) FROM objective_phases WHERE objective_id = ?", (int(objective_id),))
         phase_number_base = int((await cursor.fetchone())[0] or 0)
+        if include_recovery_phase:
+            await conn.execute(
+                """INSERT INTO objective_phases
+                   (objective_id, demo_session_id, phase_number, session_phase_number, status, planned_start_equity,
+                    starting_equity, target_equity, started_at, policy_snapshot_json, instruments_json)
+                   VALUES (?, ?, ?, 0, 'planned', ?, NULL, ?, NULL, ?, ?)""",
+                (
+                    int(objective_id), demo_session_id, phase_number_base + 1,
+                    float(starting_equity), float(starting_equity),
+                    json.dumps(policy_snapshot or {}, sort_keys=True), json.dumps(instruments, sort_keys=True),
+                ),
+            )
+        phase_offset = 1 if include_recovery_phase else 0
         for session_number, target in enumerate(phase_targets, start=1):
-            number = phase_number_base + session_number
+            number = phase_number_base + phase_offset + session_number
             active = session_number == 1
             await conn.execute(
                 """INSERT INTO objective_phases
@@ -1618,6 +1632,124 @@ async def create_objective_phase_plan(
             "SELECT * FROM objective_phases WHERE objective_id = ? ORDER BY phase_number ASC", (int(objective_id),)
         )
         return [item for row in await cursor.fetchall() if (item := await _objective_phase_row(row)) is not None]
+
+
+async def activate_objective_recovery_phase(
+    objective_id: int, *, demo_session_id: Optional[int], recovery_equity: float,
+    recovery_target_equity: float, policy_snapshot: Optional[dict], instruments: list[str],
+    reason: str, db_path: str = DB_PATH,
+) -> Optional[dict]:
+    """Pause the current growth phase and activate the persisted session Phase 0."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM objective_phases WHERE objective_id = ? AND demo_session_id IS ? AND status = 'active' ORDER BY phase_number ASC LIMIT 1",
+            (int(objective_id), demo_session_id),
+        )
+        current = await cursor.fetchone()
+        if current is not None and int(current["session_phase_number"] or 0) == 0:
+            return await _objective_phase_row(current)
+        if current is not None:
+            await conn.execute(
+                "UPDATE objective_phases SET status = 'recovery_paused', completion_reason = ? WHERE id = ?",
+                (str(reason), int(current["id"])),
+            )
+        cursor = await conn.execute(
+            "SELECT * FROM objective_phases WHERE objective_id = ? AND demo_session_id IS ? AND session_phase_number = 0 ORDER BY phase_number DESC LIMIT 1",
+            (int(objective_id), demo_session_id),
+        )
+        recovery = await cursor.fetchone()
+        if recovery is None:
+            cursor = await conn.execute("SELECT COALESCE(MAX(phase_number), 0) FROM objective_phases WHERE objective_id = ?", (int(objective_id),))
+            next_number = int((await cursor.fetchone())[0] or 0) + 1
+            await conn.execute(
+                """INSERT INTO objective_phases
+                   (objective_id, demo_session_id, phase_number, session_phase_number, status, planned_start_equity,
+                    starting_equity, target_equity, started_at, completion_reason, policy_snapshot_json, instruments_json, metrics_json)
+                   VALUES (?, ?, ?, 0, 'active', ?, ?, ?, ?, ?, ?, ?, '{}')""",
+                (
+                    int(objective_id), demo_session_id, next_number, float(recovery_target_equity),
+                    float(recovery_equity), float(recovery_target_equity), now, str(reason),
+                    json.dumps(policy_snapshot or {}, sort_keys=True), json.dumps(instruments, sort_keys=True),
+                ),
+            )
+        else:
+            await conn.execute(
+                """UPDATE objective_phases SET status = 'active', planned_start_equity = ?, starting_equity = ?,
+                   target_equity = ?, ending_equity = NULL, started_at = ?, completed_at = NULL,
+                   completion_reason = ?, policy_snapshot_json = ?, instruments_json = ?, metrics_json = '{}'
+                   WHERE id = ?""",
+                (
+                    float(recovery_target_equity), float(recovery_equity), float(recovery_target_equity), now,
+                    str(reason), json.dumps(policy_snapshot or {}, sort_keys=True), json.dumps(instruments, sort_keys=True),
+                    int(recovery["id"]),
+                ),
+            )
+        await conn.commit()
+        cursor = await conn.execute(
+            "SELECT * FROM objective_phases WHERE objective_id = ? AND demo_session_id IS ? AND session_phase_number = 0 AND status = 'active' ORDER BY phase_number DESC LIMIT 1",
+            (int(objective_id), demo_session_id),
+        )
+        return await _objective_phase_row(await cursor.fetchone())
+
+
+async def complete_objective_recovery_phase(
+    phase_id: int, *, ending_equity: float, reason: str, metrics: dict,
+    next_policy_snapshot: Optional[dict], next_instruments: Optional[list[str]],
+    db_path: str = DB_PATH,
+) -> tuple[Optional[dict], Optional[dict]]:
+    """Complete Phase 0 at the session start balance and restart Phase 1."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM objective_phases WHERE id = ?", (int(phase_id),))
+        recovery = await cursor.fetchone()
+        if recovery is None or recovery["status"] != "active" or int(recovery["session_phase_number"] or 0) != 0:
+            return await _objective_phase_row(recovery), None
+        await conn.execute(
+            """UPDATE objective_phases SET status = 'completed', ending_equity = ?, completed_at = ?,
+               completion_reason = ?, metrics_json = ? WHERE id = ?""",
+            (float(ending_equity), now, str(reason), json.dumps(metrics, sort_keys=True), int(phase_id)),
+        )
+        cursor = await conn.execute(
+            "SELECT target_equity FROM objective_phases WHERE objective_id = ? AND demo_session_id IS ? AND session_phase_number > 0 ORDER BY session_phase_number ASC, phase_number ASC",
+            (int(recovery["objective_id"]), recovery["demo_session_id"]),
+        )
+        growth_targets = [float(row["target_equity"]) for row in await cursor.fetchall()]
+        cursor = await conn.execute("SELECT COALESCE(MAX(phase_number), 0) FROM objective_phases WHERE objective_id = ?", (int(recovery["objective_id"]),))
+        phase_number_base = int((await cursor.fetchone())[0] or 0)
+        prior_target = float(ending_equity)
+        phase_one_id = None
+        for session_number, target in enumerate(growth_targets, start=1):
+            phase_number = phase_number_base + session_number
+            active = session_number == 1
+            await conn.execute(
+                """INSERT INTO objective_phases
+                   (objective_id, demo_session_id, phase_number, session_phase_number, status, planned_start_equity,
+                    starting_equity, target_equity, started_at, policy_snapshot_json, instruments_json, metrics_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')""",
+                (
+                    int(recovery["objective_id"]), recovery["demo_session_id"], phase_number, session_number,
+                    "active" if active else "planned", prior_target, float(ending_equity) if active else None,
+                    float(target), now if active else None, json.dumps(next_policy_snapshot or {}, sort_keys=True),
+                    json.dumps(next_instruments or [], sort_keys=True),
+                ),
+            )
+            if active:
+                phase_one_id = phase_number
+            prior_target = float(target)
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM objective_phases WHERE id = ?", (int(phase_id),))
+        completed = await _objective_phase_row(await cursor.fetchone())
+        next_phase = None
+        if phase_one_id is not None:
+            cursor = await conn.execute(
+                "SELECT * FROM objective_phases WHERE objective_id = ? AND demo_session_id IS ? AND phase_number = ?",
+                (int(recovery["objective_id"]), recovery["demo_session_id"], int(phase_one_id)),
+            )
+            next_phase = await _objective_phase_row(await cursor.fetchone())
+        return completed, next_phase
 
 
 async def get_active_objective_phase(objective_id: int, db_path: str = DB_PATH) -> Optional[dict]:

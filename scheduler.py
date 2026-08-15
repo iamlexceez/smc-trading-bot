@@ -212,14 +212,14 @@ class MarketScheduler:
             objective_id=int(active["id"]), demo_session_id=new_session_id, starting_equity=equity,
             phase_targets=list(plan.phase_targets),
             policy_snapshot={"model_version": policy_version, "experiment_id": experiment_id, "policy": policy.to_dict()},
-            instruments=instruments, db_path=db.DB_PATH,
+            instruments=instruments, include_recovery_phase=True, db_path=db.DB_PATH,
         )
         phase = phases[-len(plan.phase_targets)]
         operational.update({
             "phase_plan": plan.to_dict(), "demo_session_id": new_session_id,
             "starting_capital": equity, "phase_id": phase["id"],
-            "phase_number": phase.get("session_phase_number") or 1,
-            "phase_target_equity": phase["target_equity"], "phase_status": phase["status"],
+            "phase_number": phase.get("session_phase_number") if phase.get("session_phase_number") is not None else 1,
+            "phase_target_equity": phase["target_equity"], "phase_status": phase["status"], "phase_role": "GROWTH",
             "phase_boundary_pending": False, "phase_boundary_action": "protect_then_close",
             "session_status": "ACTIVE",
         })
@@ -268,13 +268,13 @@ class MarketScheduler:
             objective_id=int(active["id"]), demo_session_id=self.last_capital_state.get("demo_session_id"),
             starting_equity=starting, phase_targets=list(plan.phase_targets),
             policy_snapshot={"model_version": self.settings.active_model_version, "migration": "legacy_confirmed_objective"},
-            instruments=allowed,
+            instruments=allowed, include_recovery_phase=True,
         )
-        active_phase = phases[0]
+        active_phase = next((item for item in phases if item.get("session_phase_number") == 1), phases[0])
         operational.update({
             "phase_plan": plan.to_dict(), "phase_id": active_phase["id"],
             "phase_number": self._phase_display_number(active_phase), "phase_target_equity": active_phase["target_equity"],
-            "phase_status": active_phase["status"], "phase_boundary_pending": False,
+            "phase_status": active_phase["status"], "phase_role": "GROWTH", "phase_boundary_pending": False,
             "phase_boundary_action": "protect_then_close",
         })
         context["operational"] = operational
@@ -356,16 +356,19 @@ class MarketScheduler:
             }
             return []
         operational_phase = phase_for_equity(operational.get("starting_capital"), current_equity)
+        active_phase_number = self._phase_display_number(active_phase) if active_phase else operational.get("phase_number")
         phase_context = {
             "phase_id": active_phase.get("id") if active_phase else operational.get("phase_id"),
-            "phase_number": self._phase_display_number(active_phase) if active_phase else operational.get("phase_number"),
+            "phase_number": active_phase_number,
             "phase_target_equity": active_phase.get("target_equity") if active_phase else operational.get("phase_target_equity"),
             "phase_status": active_phase.get("status") if active_phase else operational.get("phase_status"),
+            "phase_role": "RECOVERY" if active_phase_number == 0 else ("GROWTH" if active_phase_number is not None else operational.get("phase_role")),
+            "phase_policy_snapshot": active_phase.get("policy_snapshot") if active_phase else operational.get("phase_policy_snapshot"),
         }
         self._operational_objective = {
             **operational, **phase_context, "id": active.get("id"), "version": active.get("version"),
             "status": "ACTIVE", "allowed_symbols": selected,
-            "phase": operational_phase if operational_phase != "UNAVAILABLE" else operational.get("phase", "UNAVAILABLE"),
+            "phase": "RECOVERY" if active_phase_number == 0 else (operational_phase if operational_phase != "UNAVAILABLE" else operational.get("phase", "UNAVAILABLE")),
             "current_equity": current_equity,
         }
         snapshot["market_selection"] = {
@@ -1239,6 +1242,9 @@ class MarketScheduler:
         self.telemetry.increment("observations")
         self.optimizer.settings = self.settings
         policy, experiment_id, policy_version = await self.optimizer.active_policy(self.settings.trading_mode)
+        phase = await self._active_objective_phase()
+        if phase:
+            policy = type(policy).from_dict(self._apply_phase_management_policy(policy.to_dict(), phase))
         if not self._analysis_symbol_is_eligible(symbol):
             reason = "Symbol is absent from the current broker-validated usable-target handoff"
             self.telemetry.increment("setups_rejected")
@@ -2336,9 +2342,42 @@ class MarketScheduler:
         """Return the phase number users see within the current DEMO session."""
         item = dict(phase or {})
         try:
-            return int(item.get("session_phase_number") or item.get("phase_number") or 1)
+            local = item.get("session_phase_number")
+            return int(local if local is not None else (item.get("phase_number") or 1))
         except (TypeError, ValueError):
             return 1
+
+    async def _active_objective_phase(self) -> dict:
+        """Return the broker-account objective's current persisted phase."""
+        if self.settings.trading_mode != "demo":
+            return {}
+        active = await db.get_active_objective("demo")
+        if not active:
+            return {}
+        return await db.get_active_objective_phase(int(active["id"])) or {}
+
+    @staticmethod
+    def _apply_phase_management_policy(policy_data: dict, phase: dict | None) -> dict:
+        """Overlay current-phase management fields without replacing the policy engine."""
+        merged = dict(policy_data or {})
+        phase_data = dict((phase or {}).get("policy_snapshot") or {})
+        phase_policy = dict(phase_data.get("policy") or {})
+        if not phase_policy:
+            return merged
+        management_fields = {
+            "breakeven_model", "breakeven_trigger_r", "profit_lock_trigger_r", "profit_lock_r",
+            "trailing_model", "trailing_trigger_r", "trailing_buffer_atr", "partial_exit_model",
+            "partial_exit_r", "partial_exit_pct", "target_extension_trigger_r", "target_model",
+            "protection_response", "exit_on_opposing_structure",
+        }
+        for field in management_fields:
+            if field in phase_policy:
+                merged[field] = phase_policy[field]
+        local_number = (phase or {}).get("session_phase_number")
+        local_number = int(local_number if local_number is not None else 1)
+        merged["active_phase_number"] = local_number
+        merged["active_phase_role"] = "RECOVERY" if local_number == 0 else "GROWTH"
+        return merged
 
     @staticmethod
     def _sl_protects_profit(position, sl: float | None = None) -> bool:
@@ -2541,6 +2580,35 @@ class MarketScheduler:
             equity = float(account.get("equity"))
             state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
             metrics = await db.objective_phase_summary(int(phase["id"]))
+            phase_number = self._phase_display_number(phase)
+            session_start = float(operational.get("starting_capital") or phase.get("planned_start_equity") or 0.0)
+            new_exposure_possible = state not in AccountCapitalState.BLOCKING
+            if phase_number > 0 and session_start > 0 and equity < session_start and new_exposure_possible:
+                recovery_policy, recovery_experiment, recovery_version = await self.optimizer.active_policy("demo")
+                allowed = list(operational.get("allowed_symbols") or self._execution_selected_symbols)
+                recovery = await db.activate_objective_recovery_phase(
+                    int(active["id"]), demo_session_id=operational.get("demo_session_id"),
+                    recovery_equity=equity, recovery_target_equity=session_start,
+                    policy_snapshot={"model_version": recovery_version, "experiment_id": recovery_experiment, "policy": recovery_policy.to_dict(), "phase_role": "RECOVERY"},
+                    instruments=allowed, reason="Fresh broker equity fell below the session starting balance",
+                )
+                if recovery:
+                    context = dict(active.get("context") or {})
+                    operational.update({
+                        "phase_id": recovery["id"], "phase_number": 0, "phase_target_equity": recovery["target_equity"],
+                        "phase_status": recovery["status"], "phase_role": "RECOVERY", "recovery_target_equity": session_start,
+                        "recovery_from_phase_id": phase["id"], "recovery_from_phase_number": phase_number,
+                        "phase_boundary_pending": False,
+                    })
+                    context["operational"] = operational
+                    await db.update_active_objective_context(int(active["id"]), context)
+                    await self._notify(
+                        "🔄 **PHASE 0 RECOVERY ACTIVATED**\n"
+                        f"Objective v{active.get('version')} | Equity: `${equity:.2f}` | Session start: `${session_start:.2f}`\n"
+                        f"Recovery target: `${session_start:.2f}` | Previous phase: `{phase_number}`\n"
+                        "The current champion policy remains in control of DEMO entries, while every active trade is re-evaluated under the Phase 0 management overlay. No trade is forced."
+                    )
+                    return {"outcome": "phase_zero_activated", "phase": recovery, "previous_phase": phase}
             if state == AccountCapitalState.CAPITAL_EXHAUSTED:
                 failed = await db.fail_objective_phase(
                     int(phase["id"]), ending_equity=equity,
@@ -2602,16 +2670,24 @@ class MarketScheduler:
                 "policy": next_policy.to_dict(), "phase_transition_learning": learning,
             }
             allowed = list(operational.get("allowed_symbols") or self._execution_selected_symbols)
-            completed, successor = await db.complete_objective_phase(
-                int(phase["id"]), ending_equity=equity,
-                reason="Fresh broker equity reached phase target", metrics=metrics,
-                next_policy_snapshot=next_snapshot, next_instruments=allowed,
-            )
+            if phase_number == 0:
+                completed, successor = await db.complete_objective_recovery_phase(
+                    int(phase["id"]), ending_equity=equity,
+                    reason="Fresh broker equity recovered to the session starting balance", metrics=metrics,
+                    next_policy_snapshot=next_snapshot, next_instruments=allowed,
+                )
+            else:
+                completed, successor = await db.complete_objective_phase(
+                    int(phase["id"]), ending_equity=equity,
+                    reason="Fresh broker equity reached phase target", metrics=metrics,
+                    next_policy_snapshot=next_snapshot, next_instruments=allowed,
+                )
             if not completed or completed.get("status") != "completed":
                 return None
             context = dict(active.get("context") or {})
             operational["phase_boundary_pending"] = False
             operational["phase_boundary_status"] = {"phase_id": completed["id"], "result": boundary, "action": "protect_then_close"}
+            operational["phase_role"] = "GROWTH" if successor else operational.get("phase_role", "GROWTH")
             operational["phase_review"] = {"phase_id": completed["id"], "outcome": "completed", "metrics": metrics, "learning": learning, "boundary": boundary}
             if successor:
                 operational.update({
@@ -2626,6 +2702,13 @@ class MarketScheduler:
                 f"🟢 Continuing automatically into Phase `{self._phase_display_number(successor)}`: `${float(successor['starting_equity']):.2f}` → `${float(successor['target_equity']):.2f}`."
                 if successor else "🏆 Final phase reached; the objective completion flow is now verifying the overall target."
             )
+            if phase_number == 0:
+                await self._notify(
+                    "✅ **PHASE 0 RECOVERY COMPLETE**\n"
+                    f"Objective v{active.get('version')} | Equity recovered to `${equity:.2f}`\n"
+                    f"Boundary: protected `{boundary.get('protected', 0)}` | closed `{boundary.get('closed', 0)}`\n"
+                    f"🟢 Returning to Phase `{self._phase_display_number(successor) if successor else 1}` with the existing DEMO research policy."
+                )
             await self._notify(
                 "🎯 **PHASE COMPLETE**\n"
                 f"Objective v{active.get('version')} | Phase `{self._phase_display_number(completed)}`: `${float(completed.get('starting_equity') or completed['planned_start_equity']):.2f}` → `${float(completed['target_equity']):.2f}`\n"
@@ -2973,7 +3056,10 @@ class MarketScheduler:
             await self._reconcile_closed_trades(live_tickets)
             if not positions:
                 return 0
-            logger.info("Managing %s open position(s) using their recorded experimental policies", len(positions))
+            phase = await self._active_objective_phase()
+            phase_number = self._phase_display_number(phase) if phase else None
+            phase_role = "RECOVERY" if phase_number == 0 else ("GROWTH" if phase_number is not None else "UNSCOPED")
+            logger.info("Managing %s open position(s) using current %s Phase %s policy overlay", len(positions), phase_role, phase_number if phase_number is not None else "N/A")
             protection_context = await self._management_protection_context(positions)
 
             for position in positions:
@@ -2986,6 +3072,7 @@ class MarketScheduler:
                         state = ManagementState.INITIAL
                     partial_done = await db.basket_has_action(basket["id"], "Partial Take Profit")
                     policy_data = dict(basket.get("metadata", {}).get("experimental_policy") or {})
+                    policy_data = self._apply_phase_management_policy(policy_data, phase)
                 else:
                     # Manual positions are monitored defensively, but the bot
                     # will not create layers without a recorded basket plan.
@@ -2993,7 +3080,7 @@ class MarketScheduler:
                     state = ManagementState.INITIAL
                     partial_done = False
                     active_policy, _, _ = await self.optimizer.active_policy(self.settings.trading_mode)
-                    policy_data = active_policy.to_dict()
+                    policy_data = self._apply_phase_management_policy(active_policy.to_dict(), phase)
 
                 manager = TradeManager(
                     policy=policy_data,
