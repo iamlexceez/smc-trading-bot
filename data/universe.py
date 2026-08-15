@@ -23,6 +23,10 @@ SYNTHETIC_PRODUCT_TOKENS = (
     "volatility", "boom", "crash", "step index", "jump index", "range break",
     "drift switch", "trek", "skew step", "dex",
 )
+ALLOWED_GOLD_SYMBOLS = frozenset({"xauusd", "xauusdm"})
+CURRENCY_CODES = frozenset({
+    "aud", "cad", "chf", "eur", "gbp", "jpy", "nzd", "sgd", "usd", "zar",
+})
 EXCLUDED_SYNTHETIC_TOKENS = (
     "crypto", "cryptocurrency", "arbitrage", "token", "forex", "fx",
     "stock", "share", "etf", "commodity", "oil", "gas",
@@ -73,6 +77,15 @@ def _number(raw: Any) -> float | None:
         return None
 
 
+def _is_currency_pair(symbol: str) -> bool:
+    """Recognize six-letter FX pairs, including common broker suffixes."""
+    compact = re.sub(r"[^a-z]", "", _normalise(symbol))
+    if len(compact) < 6:
+        return False
+    base = compact[:6]
+    return len(base) == 6 and base[:3] in CURRENCY_CODES and base[3:] in CURRENCY_CODES
+
+
 def _is_deriv_synthetic(raw: dict[str, Any], text: str, path_text: str) -> tuple[bool, str]:
     """Classify from broker metadata before using product-family fallback words."""
     explicit_category = _normalise(raw.get("category") or raw.get("group") or raw.get("sector"))
@@ -94,10 +107,10 @@ def _is_deriv_synthetic(raw: dict[str, Any], text: str, path_text: str) -> tuple
 def _is_gold(raw: dict[str, Any], text: str, path_text: str) -> tuple[bool, str]:
     """Allow only the two requested Gold symbols, never an arbitrary XAU cross."""
     symbol = _normalise(raw.get("name") or raw.get("symbol"))
-    if symbol in {"xauusd", "xauusdmicro"}:
+    if symbol in ALLOWED_GOLD_SYMBOLS:
         return True, "Broker symbol matches explicitly permitted Gold instrument"
     if symbol.startswith("xau") or "gold" in text or "gold" in path_text:
-        return False, "Gold/XAU instrument is outside permitted scope (only XAUUSD and XAUUSDmicro are allowed)"
+        return False, "Gold/XAU instrument is outside permitted scope (only XAUUSD and XAUUSDm are allowed)"
     return False, "Broker metadata does not identify a Gold / XAU instrument"
 
 
@@ -123,10 +136,14 @@ def classify_deriv_symbol(raw: dict[str, Any]) -> MarketSymbol:
     trade_mode_name = str(raw.get("trade_mode_name") or "unknown")
     can_open = bool(raw.get("available", False))
 
+    currency_pair = _is_currency_pair(symbol)
     synthetic, synthetic_reason = _is_deriv_synthetic(raw, text, path_text)
     gold, gold_reason = _is_gold(raw, text, path_text)
     if not symbol:
         category, status, decision, reason = "unsupported", "unsupported", "REJECTED", "Broker record has no symbol name"
+    elif currency_pair:
+        category, status, decision = "currency_pair", "unsupported", "REJECTED"
+        reason = "Currency/forex pair is outside the permitted XAUUSD/XAUUSDm and Synthetic Indices scope"
     elif gold:
         category = "gold"
         if can_open:
@@ -140,8 +157,9 @@ def classify_deriv_symbol(raw: dict[str, Any]) -> MarketSymbol:
         else:
             status, decision, reason = "unavailable", "REJECTED", f"Synthetic metadata matched but broker trade mode is not openable ({trade_mode_name})"
     else:
-        category, status, decision = "unsupported", "unsupported", "REJECTED"
-        reason = gold_reason if "outside permitted scope" in gold_reason else f"{synthetic_reason}; {gold_reason}"
+        category = "gold" if symbol.startswith("xau") or "gold" in text or "gold" in path_text else "unsupported"
+        status, decision = "unsupported", "REJECTED"
+        reason = gold_reason if category == "gold" else f"{synthetic_reason}; {gold_reason}"
 
     return MarketSymbol(
         symbol=symbol,

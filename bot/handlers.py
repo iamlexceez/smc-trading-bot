@@ -694,7 +694,7 @@ class BotHandlers:
     @admin_only
     async def cmd_sizingtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Report the latest rejected setup's full sizing calculation without creating an order."""
-        symbol = " ".join(context.args).strip() if context.args else "XAUUSDmicro"
+        symbol = " ".join(context.args).strip() if context.args else "XAUUSDm"
         if not self.scheduler:
             await self._render_plain_menu(update, "SIZING TEST\n\nScheduler is unavailable; no broker-authoritative calculation can run.")
             return

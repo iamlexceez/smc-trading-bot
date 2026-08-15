@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This system is a **broker-connected DEMO research and execution engine** for Deriv Synthetic Indices and Gold (`XAUUSD` and `XAUUSDmicro`). It does not claim consciousness, guaranteed profitability, or unsupported web intelligence. Its learning is a measurable process: it records broker-realized outcomes, tests explicit policy hypotheses, rejects weak candidates, and only then permits a policy to advance through a versioned DEMO lifecycle.
+This system is a **broker-connected DEMO research and execution engine** for Deriv Synthetic Indices and Gold (`XAUUSD` and `XAUUSDm`). It does not claim consciousness, guaranteed profitability, or unsupported web intelligence. Its learning is a measurable process: it records broker-realized outcomes, tests explicit policy hypotheses, rejects weak candidates, and only then permits a policy to advance through a versioned DEMO lifecycle.
 
 > **Trading policy is experimental. Software integrity is mandatory.**
 >
@@ -10,7 +10,7 @@ This system is a **broker-connected DEMO research and execution engine** for Der
 
 | Boundary | What the system does | What it does not do |
 |---|---|---|
-| Market scope | Uses broker-verified Deriv Synthetic Indices and Gold only. | It does not execute unsupported forex, crypto, or external instruments. |
+| Market scope | Uses broker-verified Deriv Synthetic Indices and the exact Gold aliases `XAUUSD` and `XAUUSDm` only; all currency/forex pairs are rejected. | It does not execute unsupported forex, crypto, or external instruments. |
 | Data | Uses broker-provided closed candles and broker-realized trade outcomes. | It does not fill gaps with synthetic candles or treat unverified data as evidence. |
 | Learning | Evaluates documented hypotheses and policy versions. | It does not call itself self-aware or infer performance from unmeasured claims. |
 | Mode control | Runs research promotion only in DEMO. | It never activates or changes LIVE automatically. |

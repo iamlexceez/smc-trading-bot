@@ -435,10 +435,10 @@ async def test_single_flight_scan_guard() -> None:
 def test_scanner_eligibility_handoff() -> None:
     engine = object.__new__(scheduler.MarketScheduler)
     engine._analysis_eligible_symbols = ()
-    handoff = engine._set_analysis_eligible_symbols({"usable_symbols": ["Volatility 75 Index", "XAUUSDmicro"]})
+    handoff = engine._set_analysis_eligible_symbols({"usable_symbols": ["Volatility 75 Index", "XAUUSDm"]})
     reloaded = TradeSettings.from_dict({"enabled_symbols": "EURUSD"})
     assert_true(not reloaded.enabled_symbols, "fixture did not reproduce intentional empty persisted-symbol migration")
-    assert_true(handoff == ("Volatility 75 Index", "XAUUSDmicro"), "broker-usable scanner handoff lost the returned identifiers")
+    assert_true(handoff == ("Volatility 75 Index", "XAUUSDm"), "broker-usable scanner handoff lost the returned identifiers")
     assert_true(engine._analysis_symbol_is_eligible("Volatility 75 Index"), "broker-validated scanner symbol was rejected after settings reload")
     assert_true(not engine._analysis_symbol_is_eligible("EURUSD"), "unverified legacy symbol entered scanner eligibility")
     engine._set_analysis_eligible_symbols({"usable_symbols": ["Volatility 15 (1s) Index"]})
@@ -459,7 +459,7 @@ def test_config_round_trip() -> None:
     assert_true(legacy.max_open_positions == 5, "experimental position cap should be preserved")
     assert_true(legacy.min_setup_score == 0.0, "learning baseline did not remove the quality-score entry gate")
 
-    migrated_markets = TradeSettings.from_dict({"symbols": "EURUSD,XAUUSDmicro", "enabled_symbols": "EURUSD", "available_symbols": "EURUSD"})
+    migrated_markets = TradeSettings.from_dict({"symbols": "EURUSD,XAUUSDm", "enabled_symbols": "EURUSD", "available_symbols": "EURUSD"})
     assert_true(not migrated_markets.symbols and not migrated_markets.enabled_symbols, "persisted legacy symbols survived restart migration")
 
 
@@ -643,25 +643,29 @@ async def test_deriv_market_universe() -> None:
                 {"name": "DEX 600 UP Index", "description": "DEX 600 UP Index", "path": "Synthetic Indices\\DEX", "trade_mode": 1, "available": True},
                 {"name": "Jump 10 Index", "description": "Jump 10 Index", "path": "Synthetic Indices\\Jump", "trade_mode": 1, "available": True},
                 {"name": "XAUUSD", "description": "Gold vs US Dollar", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
-                {"name": "XAUUSDmicro", "description": "Gold micro", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
+                {"name": "XAUUSDm", "description": "Gold micro", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
+                {"name": "XAUUSDmicro", "description": "Gold legacy micro alias", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
                 {"name": "XAUEUR", "description": "Gold vs Euro", "path": "Metals\\Gold", "trade_mode": 1, "available": True},
                 {"name": "UnsupportedMarket", "description": "Unsupported broker market", "path": "Other\\Market", "trade_mode": 1, "available": True},
                 {"name": "EURUSD", "description": "Euro vs US Dollar", "path": "Forex\\Majors", "trade_mode": 1, "available": True},
+                {"name": "GBPUSDm", "description": "British Pound vs US Dollar", "path": "Forex\\Majors", "trade_mode": 1, "available": True},
                 {"name": "BTCETH Arbitrage Index", "description": "BTCETH Arbitrage Index", "path": "Synthetic Indices\\Specialty", "trade_mode": 1, "available": True},
                 {"name": "Crash 500 Index", "description": "Crash 500 Index", "path": "Synthetic Indices\\Crash", "trade_mode": 0, "available": False},
             ]
 
     universe = DerivMarketUniverse()
     await universe.refresh(FakeBroker())
-    assert_true(universe.available_symbols == ["DEX 600 UP Index", "Jump 10 Index", "Volatility 75 Index", "XAUUSD", "XAUUSDmicro"], "eligible Deriv markets were not classified correctly")
+    assert_true(universe.available_symbols == ["DEX 600 UP Index", "Jump 10 Index", "Volatility 75 Index", "XAUUSD", "XAUUSDm"], "eligible Deriv markets were not classified correctly")
     assert_true(universe.status_for("Crash 500 Index") == "unavailable", "unavailable broker symbol became active")
     assert_true("UnsupportedMarket" in [r.symbol for r in universe.rejected_records], "unsupported broker symbol was not retained for audit")
-    assert_true("EURUSD" in [r.symbol for r in universe.rejected_records], "forex rejection was not retained for audit")
+    assert_true("EURUSD" in [r.symbol for r in universe.rejected_records] and "GBPUSDm" in [r.symbol for r in universe.rejected_records], "forex rejection was not retained for audit")
+    legacy_gold = next(record for record in universe.rejected_records if record.symbol == "XAUUSDmicro")
+    assert_true(legacy_gold.category == "gold" and "only XAUUSD and XAUUSDm" in legacy_gold.decision_reason, "legacy XAUUSDmicro alias was not rejected")
     arbitrage = next(record for record in universe.rejected_records if record.symbol == "BTCETH Arbitrage Index")
     assert_true("excluded non-target" in arbitrage.decision_reason, "non-approved synthetic specialty rejection lacked evidence")
-    assert_true("XAUUSDmicro" in universe.available_symbols, "Gold micro variant was incorrectly excluded")
+    assert_true("XAUUSDm" in universe.available_symbols, "Gold micro variant was incorrectly excluded")
     xau_eur = next(record for record in universe.rejected_records if record.symbol == "XAUEUR")
-    assert_true("only XAUUSD and XAUUSDmicro" in xau_eur.decision_reason, "non-USD Gold cross was incorrectly accepted")
+    assert_true("only XAUUSD and XAUUSDm" in xau_eur.decision_reason, "non-USD Gold cross was incorrectly accepted")
     with tempfile.TemporaryDirectory() as directory:
         json_path, markdown_path = universe.write_audit_report(directory)
         assert_true(json_path.exists() and markdown_path.exists(), "complete MT5 symbol audit files were not written")
@@ -1217,15 +1221,15 @@ async def test_sizing_rejection_diagnostic_persistence() -> None:
         path = os.path.join(directory, "sizing.db")
         await db.init_db(path)
         setup_id = await db.record_setup(
-            account_mode="demo", symbol="XAUUSDmicro", timeframe="M5", direction="BUY", setup_type="test",
+            account_mode="demo", symbol="XAUUSDm", timeframe="M5", direction="BUY", setup_type="test",
             status="sizing_rejected", entry_price=100.0, stop_loss=99.0, take_profit=103.0, rr_ratio=3.0,
             db_path=path,
         )
         await db.record_execution_event(
-            account_mode="demo", symbol="XAUUSDmicro", setup_id=setup_id, status="sizing_rejected",
+            account_mode="demo", symbol="XAUUSDm", setup_id=setup_id, status="sizing_rejected",
             requested_price=100.0, reason="fixture", details={"sizing": {"sizing_code": "MINIMUM_LOT_EXCEEDS_POLICY_RISK"}, "sizing_inputs": {"risk_pct": 1.0, "entry_price": 100.0}}, db_path=path,
         )
-        latest = await db.get_latest_sizing_rejection(account_mode="demo", symbol="XAUUSDmicro", db_path=path)
+        latest = await db.get_latest_sizing_rejection(account_mode="demo", symbol="XAUUSDm", db_path=path)
         assert_true(latest is not None and latest["entry_price"] == 100.0, "latest sizing rejection did not retain setup geometry")
         assert_true(latest["details"]["sizing_inputs"]["risk_pct"] == 1.0, "latest sizing rejection lost sizing inputs")
 
@@ -1284,19 +1288,19 @@ async def test_objective_broker_universe_separation() -> None:
         },
         _analysis_eligible_symbols=(),
         market_universe=SimpleNamespace(
-            accepted_records=[SimpleNamespace(symbol="Boom 500 Index"), SimpleNamespace(symbol="XAUUSDmicro")]
+            accepted_records=[SimpleNamespace(symbol="Boom 500 Index"), SimpleNamespace(symbol="XAUUSDm")]
         ),
     )
     handler.settings = SimpleNamespace(trading_mode="demo")
     account, state, approved = await handler._objective_facts(refresh=False)
     assert_true(state == "CAPITAL_EXHAUSTED" and account["free_margin"] < 0, "fixture did not preserve the broker capital block")
-    assert_true(approved == ("Boom 500 Index", "XAUUSDmicro"), "Objective Console incorrectly hid broker-approved symbols when margin feasibility was zero")
+    assert_true(approved == ("Boom 500 Index", "XAUUSDm"), "Objective Console incorrectly hid broker-approved symbols when margin feasibility was zero")
 
 
 async def test_objective_console_safety() -> None:
     interpreter = ObjectiveInterpreter()
     account = {"equity": 152.60, "free_margin": 152.60, "currency": "USD"}
-    usable = ("Volatility 75 Index", "XAUUSDmicro")
+    usable = ("Volatility 75 Index", "XAUUSDm")
     objective = interpreter.parse(
         "Start with $50 and aim for $10,000 aggressively while protecting capital aggressively. "
         "Trade Synthetic Indices and Gold with RR 0 and adaptive learning.",
@@ -1327,15 +1331,15 @@ async def test_objective_console_safety() -> None:
 
     requested = interpreter.parse(
         "Start with $50, aim for $10,000 aggressively while protecting capital aggressively. "
-        "Trade only Boom 100 Index, Boom 500 Index, Volatility 75 Index and XAUUSDmicro. "
+        "Trade only Boom 100 Index, Boom 500 Index, Volatility 75 Index and XAUUSDm. "
         "Use layering, adaptive sizing, adaptive TP/SL and learning. Fully automate everything.",
         account_mode="demo",
     )
-    requested_usable = ("Boom 100 Index", "Boom 500 Index", "Volatility 75 Index", "XAUUSDmicro", "Crash 500 Index")
+    requested_usable = ("Boom 100 Index", "Boom 500 Index", "Volatility 75 Index", "XAUUSDm", "Crash 500 Index")
     resolved, resolution = resolve_requested_symbols(requested.requested_symbols, requested_usable)
     requested_validation = ObjectiveValidator.validate(requested, account_snapshot=account, account_state="ACCOUNT_VERIFIED", broker_usable_symbols=requested_usable, resolved_symbols=resolution)
     assert_true(requested.full_auto and requested_validation.valid, "fully automated DEMO objective was not parsed as confirmable")
-    assert_true(resolved == ("Boom 100 Index", "Boom 500 Index", "Volatility 75 Index", "XAUUSDmicro"), "explicit objective instruments were not resolved exactly against broker symbols")
+    assert_true(resolved == ("Boom 100 Index", "Boom 500 Index", "Volatility 75 Index", "XAUUSDm"), "explicit objective instruments were not resolved exactly against broker symbols")
     assert_true("Crash 500 Index" not in resolved and all(row["status"] == "BROKER_VERIFIED" for row in resolution), "objective universe silently expanded or unresolved a requested instrument")
 
     with tempfile.TemporaryDirectory() as directory:
