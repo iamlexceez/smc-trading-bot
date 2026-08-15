@@ -327,7 +327,6 @@ def rank_opportunities(
             "analysis_trading_decision": analysis_trading_decision,
             "final_trading_decision": "PENDING_FINAL_VALIDATION",
             "final_trading_reason": "Ranking is descriptive; final broker, portfolio, sizing, stop, and execution gates run after revalidation.",
-            "evidence_classification": evidence_classification,
             "target_source": target_source,
             "target_alternatives": target_alternatives,
             "learning_objective": str(getattr(signal, "learning_objective", "") or "Measure forward-DEMO outcome across this strategy, instrument, regime, and target model."),
