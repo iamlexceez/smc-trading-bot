@@ -1778,8 +1778,37 @@ class BotHandlers:
             self.settings.automation_pause_reason = ""
             await db.save_settings(self.settings)
             if self.scheduler:
-                self.scheduler._start_background_task("resume_scan", self.scheduler.activate_and_scan_now())
-            msg = "▶️ DEMO broker state verified. Auto-trading resumed; an immediate scan has been started."
+                scan_report = await self.scheduler.activate_and_scan_now()
+                scan = dict(scan_report.get("scan") or {})
+                disposition = dict(scan_report.get("disposition") or {})
+                attempted = int(disposition.get("symbols_attempted") or 0)
+                if not scan_report.get("ok"):
+                    msg = (
+                        "⚠️ DEMO broker state verified, but the immediate scan did not start.\n"
+                        f"Reason: {scan.get('reason') or 'No verified broker instrument is available'}\n"
+                        "Use /markets and /engine for the broker-universe diagnostic."
+                    )
+                elif scan.get("state") == "SKIPPED_OVERLAP":
+                    msg = (
+                        "ℹ️ DEMO broker state verified. The immediate scan was already running, "
+                        "so no duplicate scan was started. Use /engine to monitor its result."
+                    )
+                elif attempted == 0:
+                    msg = (
+                        "⚠️ DEMO broker state verified, but the immediate scan completed with zero symbols attempted.\n"
+                        f"State: `{disposition.get('state') or scan.get('state') or 'UNKNOWN'}`\n"
+                        f"Reason: {disposition.get('reason') or scan.get('reason') or 'No scan work was available'}\n"
+                        "Position management remains independent. Use /engine for the exact gate."
+                    )
+                else:
+                    msg = (
+                        "✅ DEMO broker state verified and immediate scan completed.\n"
+                        f"State: `{disposition.get('state') or scan.get('state') or 'COMPLETED'}` | "
+                        f"Symbols attempted: `{attempted}` | Analyzed: `{int(disposition.get('symbols_analyzed') or 0)}`\n"
+                        "Any order still had to pass the existing research, portfolio, sizing, margin, stop, and broker-execution gates."
+                    )
+            else:
+                msg = "⚠️ DEMO broker state verified, but the scheduler is unavailable; no immediate scan was started."
         if update.callback_query:
             await update.callback_query.edit_message_text(msg, reply_markup=keyboards.main_menu())
         else:

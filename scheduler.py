@@ -1073,20 +1073,31 @@ class MarketScheduler:
             )
         return result
 
-    async def activate_and_scan_now(self) -> bool:
-        """Refresh the broker universe and begin the first scan immediately after activation.
+    async def activate_and_scan_now(self) -> dict:
+        """Refresh the broker universe and return the actual immediate-scan outcome.
 
-        This is deliberately asynchronous so the Telegram confirmation returns
-        promptly. It preserves all normal eligibility, duplicate, broker-validity,
-        and fail-closed checks inside ``scan_and_execute``.
+        All normal eligibility, duplicate, broker-validity, and fail-closed checks
+        remain inside ``scan_and_execute``. Returning structured diagnostics keeps
+        Telegram confirmations truthful when refresh fails, a scan overlaps, or
+        the broker/account gate produces zero work.
         """
         logger.info("Autonomous execution activated; starting immediate broker-universe refresh and scan")
         ready = await self.refresh_market_universe()
         if not ready:
             logger.warning("Immediate activation scan skipped because no verified broker instrument is available")
-            return False
-        await self.scan_and_execute()
-        return True
+            return {
+                "ok": False,
+                "refresh_ready": False,
+                "scan": {"state": "BROKER_UNIVERSE_EMPTY", "reason": "No verified broker instrument is available"},
+                "disposition": dict(getattr(self, "_last_scan_disposition", {}) or {}),
+            }
+        scan_result = await self.scan_and_execute()
+        return {
+            "ok": True,
+            "refresh_ready": True,
+            "scan": dict(scan_result or {}),
+            "disposition": dict(getattr(self, "_last_scan_disposition", {}) or {}),
+        }
 
     async def stop(self):
         """Stop the scanner."""

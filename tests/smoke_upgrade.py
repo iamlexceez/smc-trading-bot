@@ -315,6 +315,25 @@ def test_pause_recovery_policy() -> None:
     assert_true(not scheduler.MarketScheduler._pause_recovery_allowed(settings, verified, None), "objective awaiting explicit start was bypassed")
 
 
+async def test_immediate_scan_result_reporting() -> None:
+    engine = object.__new__(scheduler.MarketScheduler)
+    engine.refresh_market_universe = AsyncMock(return_value=False)
+    failed = await engine.activate_and_scan_now()
+    assert_true(not failed["ok"] and failed["scan"]["state"] == "BROKER_UNIVERSE_EMPTY", "immediate scan did not report broker-refresh failure")
+
+    engine.refresh_market_universe = AsyncMock(return_value=True)
+    engine.scan_and_execute = AsyncMock(return_value={"state": "ANALYZING"})
+    engine._last_scan_disposition = {"state": "ANALYZING", "symbols_attempted": 3, "symbols_analyzed": 3}
+    completed = await engine.activate_and_scan_now()
+    assert_true(completed["ok"] and completed["scan"]["state"] == "ANALYZING", "immediate scan did not return the completed scan state")
+    assert_true(completed["disposition"]["symbols_attempted"] == 3, "immediate scan did not return scan accounting")
+
+    engine.scan_and_execute = AsyncMock(return_value={"state": "SKIPPED_OVERLAP"})
+    engine._last_scan_disposition = {"state": "PAUSED", "reason": "overlap", "symbols_attempted": 0}
+    overlap = await engine.activate_and_scan_now()
+    assert_true(overlap["scan"]["state"] == "SKIPPED_OVERLAP", "immediate scan did not report overlap")
+
+
 def test_scanner_gate_telemetry() -> None:
     probe = object.__new__(scheduler.MarketScheduler)
     probe.last_scan_gate = {}
@@ -1962,6 +1981,7 @@ def run() -> None:
     asyncio.run(test_engine_scanner_gate_rendering())
     test_pause_resume_command_registration()
     test_pause_recovery_policy()
+    asyncio.run(test_immediate_scan_result_reporting())
     asyncio.run(test_capital_reduction_closest_action())
     test_capital_reduction_view_is_phase_free()
     test_scanner_gate_telemetry()
