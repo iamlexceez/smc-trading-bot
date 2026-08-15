@@ -889,6 +889,11 @@ class MarketScheduler:
             purpose_text = ", ".join(f"{name}: {count}" for name, count in sorted((window.get("candle_purposes") or {}).items())) or "None"
             total_risk = portfolio.get("total_open_risk")
             total_risk_text = "UNPROTECTED/UNKNOWN" if total_risk == float("inf") else f"{float(total_risk or 0.0):,.2f}"
+            balance_value = float(account.get("balance") or 0.0)
+            equity_value = float(account.get("equity") or 0.0)
+            margin_used = float(account.get("margin") or 0.0)
+            margin_utilization = (margin_used / equity_value * 100.0) if equity_value > 0 else None
+            current_drawdown = (max(0.0, balance_value - equity_value) / balance_value * 100.0) if balance_value > 0 else None
             lines = [
                 "🧠 BOT ACTIVITY — LAST 10 MINUTES",
                 "", "SYSTEM",
@@ -915,8 +920,9 @@ class MarketScheduler:
                 "", "LEARNING",
                 f"Learning engine: {learning_label} | Reason: {learning.get('reason', 'unknown')} | Completed observations: {counters.get('observations', 0)} | Experiments: {counters.get('experiments', 0)} | Optimization runs: {counters.get('optimization_runs', 0)}",
                 "", "ACCOUNT",
-                f"Balance: {account.get('currency') or 'USD'} {float(account.get('balance') or 0.0):,.2f} | Equity: {account.get('currency') or 'USD'} {float(account.get('equity') or 0.0):,.2f}",
-                f"Free margin: {account.get('currency') or 'USD'} {float(account.get('free_margin') or 0.0):,.2f} | Open positions: {position_count}",
+                f"Balance: {account.get('currency') or 'USD'} {balance_value:,.2f} | Equity: {account.get('currency') or 'USD'} {equity_value:,.2f}",
+                f"Free margin: {account.get('currency') or 'USD'} {float(account.get('free_margin') or 0.0):,.2f} | Margin used: {account.get('currency') or 'USD'} {margin_used:,.2f} | Open positions: {position_count}",
+                f"Margin utilization: {f'{margin_utilization:.2f}%' if margin_utilization is not None else 'UNKNOWN'} | Current drawdown vs balance: {f'{current_drawdown:.2f}%' if current_drawdown is not None else 'UNKNOWN'}",
                 f"Total open risk: {total_risk_text} | Unrealized P/L: {float(portfolio.get('total_unrealized_profit') or 0.0):,.2f} | Protected profit: {float(portfolio.get('protected_profit') or 0.0):,.2f}",
                 f"New entries: {new_entries_label} | Reason: {new_entries_reason}",
                 "", "UNIVERSE",
