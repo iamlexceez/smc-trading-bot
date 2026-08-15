@@ -27,6 +27,9 @@ class ExperimentalPolicy:
     entry_model: str = "hybrid"
     required_features: tuple[str, ...] = ()
     score_floor: Optional[float] = None
+    # Optional research-policy threshold for controlled forward-DEMO exploration;
+    # absent means the experiment does not impose an additional quality threshold.
+    exploratory_setup_threshold: Optional[float] = None
     rr_target: Optional[float] = None
     risk_model: str = "fixed_pct"
     risk_pct: Optional[float] = 0.75

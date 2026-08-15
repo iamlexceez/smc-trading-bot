@@ -36,6 +36,7 @@ class GateDecision:
     evidence_classification: str
     confidence_classification: str
     reason: str
+    final_state: str = "PENDING_FINAL_VALIDATION"
     failures: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +45,7 @@ class GateDecision:
             "trading_decision": self.trading_decision,
             "evidence_classification": self.evidence_classification,
             "confidence_classification": self.confidence_classification,
+            "final_state": self.final_state,
             "reason": self.reason,
             "failures": list(self.failures),
         }
@@ -88,6 +90,11 @@ def evaluate_trading_gate(
     portfolio_approved: bool = True,
     structural_conflict: bool = False,
     required_htf_context_available: bool = True,
+    setup_quality: float | None = None,
+    exploratory_threshold: float | None = None,
+    demo_mode: bool = False,
+    experiment_id: int | None = None,
+    risk_valid: bool = True,
 ) -> GateDecision:
     """Evaluate objective eligibility without using a single score as authority.
 
@@ -118,21 +125,54 @@ def evaluate_trading_gate(
         failures.append("Portfolio context")
     if not required_htf_context_available:
         failures.append("Required top-down context")
+    if not risk_valid:
+        failures.append("Risk policy validity")
+
+    hard_failures = {
+        "Broker-valid symbol", "Valid market data", "Valid setup geometry",
+        "Objective/account permits new exposure", "Portfolio context", "Risk policy validity",
+    }
+    hard_blocked = any(item in hard_failures for item in failures)
+    evidence_gap = evidence_classification in {"INSUFFICIENT", "WEAK"} or confidence_classification in {"LOW", "UNVALIDATED"}
+    threshold = float(exploratory_threshold) if exploratory_threshold is not None else None
+    controlled_exploration = bool(
+        demo_mode
+        and experiment_id is not None
+        and forward_demo_experiment_allowed
+        and evidence_gap
+        and not hard_blocked
+        and not structural_conflict
+        and required_htf_context_available
+        and threshold is not None
+        and float(setup_quality or 0.0) >= threshold
+    )
+
+    if controlled_exploration:
+        return GateDecision(
+            research_decision="RESEARCH_ACCEPTED",
+            trading_decision="CONTROLLED_FORWARD_DEMO",
+            evidence_classification=evidence_classification,
+            confidence_classification=confidence_classification,
+            final_state="EXPLORATORY_DEMO",
+            reason="Insufficient completed evidence is being handled as an isolated forward-DEMO exploration; broker, objective, portfolio, and downstream sizing/order safeguards remain mandatory.",
+            failures=tuple(failures),
+        )
 
     if failures:
         if any("conflict" in item.lower() for item in failures):
-            decision = "DEFERRED"
+            decision, final_state = "DEFERRED", "WAITING_FOR_CONFIRMATION"
         elif any(item.startswith("Objective") or item.startswith("Champion") for item in failures):
-            decision = "OBJECTIVE_INELIGIBLE"
+            decision, final_state = "OBJECTIVE_INELIGIBLE", "EXECUTION_BLOCKED"
         elif any(item.startswith("Sufficient") or item.startswith("Validated") or item.startswith("Required") for item in failures):
-            decision = "INSUFFICIENT_EVIDENCE"
+            decision, final_state = "INSUFFICIENT_EVIDENCE", "WAITING_FOR_CONFIRMATION"
         else:
-            decision = "TRADE_REJECTED"
+            decision, final_state = "TRADE_REJECTED", "REJECTED"
         return GateDecision(
             research_decision="RESEARCH_ACCEPTED",
             trading_decision=decision,
             evidence_classification=evidence_classification,
             confidence_classification=confidence_classification,
+            final_state=final_state,
             reason="; ".join(failures),
             failures=tuple(failures),
         )
@@ -141,6 +181,7 @@ def evaluate_trading_gate(
         trading_decision="TRADE_APPROVED",
         evidence_classification=evidence_classification,
         confidence_classification=confidence_classification,
+        final_state="EXECUTION_APPROVED",
         reason="Research candidate passed the independent evidence, confidence, governance, portfolio, and objective-context gate.",
     )
 

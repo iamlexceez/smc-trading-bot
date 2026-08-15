@@ -224,6 +224,17 @@ def rank_opportunities(
         )
         if not target_alternatives and take_profit > 0:
             target_alternatives = [{"price": take_profit, "rr_ratio": actual_rr, "source": target_source, "selected": True}]
+        expected_value = None if sample < 1 else conservative_ev
+        htf_context = list(getattr(signal, "htf_context", []) or [])
+        htf_biases = {str(item.get("bias") or "").upper() for item in htf_context}
+        htf_bias_status = str(getattr(signal, "htf_bias_status", "") or "UNKNOWN").upper()
+        direction_bias = "BULLISH" if direction == "BUY" else "BEARISH"
+        htf_relationship = (
+            "CONFLICTED" if htf_bias_status == "CONFLICTED" or {"BULLISH", "BEARISH"}.issubset(htf_biases)
+            else "ALIGNED" if direction_bias in htf_biases
+            else "COUNTER_TREND" if htf_biases else "UNAVAILABLE"
+        )
+        target_conflict = bool(getattr(validation, "target_conflict", False))
         evidence_classification = str(
             strategy_evidence.get("evidence_classification")
             or strategy_evidence.get("evidence_strength")
@@ -295,8 +306,14 @@ def rank_opportunities(
             "direction": direction,
             "timeframe": getattr(signal, "timeframe", ""),
             "htf_bias": list(getattr(signal, "htf_bias", []) or []),
+            "htf_context": htf_context,
+            "htf_bias_status": htf_bias_status,
+            "htf_relationship": htf_relationship,
             "top_down_context": {
+                "timeframes": htf_context,
                 "htf_bias": list(getattr(signal, "htf_bias", []) or []),
+                "status": htf_bias_status,
+                "relationship": htf_relationship,
                 "required_features": list(getattr(signal, "registry_observed_features", []) or []),
                 "regime": context.get("regime", "UNKNOWN"),
                 "regime_transition": getattr(signal, "regime_transition", context.get("regime", "UNKNOWN")),
@@ -309,9 +326,14 @@ def rank_opportunities(
             "risk_distance": risk_distance,
             "reward_distance": reward_distance,
             "rr": actual_rr,
+            "target_conflict": target_conflict,
+            "target_reason": str(getattr(validation, "target_reason", "") or ""),
             "setup_score": quality,
+            "setup_status": "VALID" if bool(getattr(getattr(signal, "validation", None), "valid", False)) else "INVALID_OR_UNAVAILABLE",
             "strategy_score": strategy_score,
             "historical_expectancy_r": strategy_evidence.get("expectancy_r"),
+            "expected_value_r": expected_value,
+            "expected_value_status": "UNKNOWN" if expected_value is None else "ESTIMATED_FROM_COMPLETED_OUTCOMES",
             "recent_expectancy_r": strategy_evidence.get("recent_expectancy_r"),
             "evidence_classification": evidence_classification,
             "completed_confidence": completed_confidence,
@@ -326,6 +348,7 @@ def rank_opportunities(
             "research_decision": research_decision,
             "analysis_trading_decision": analysis_trading_decision,
             "final_trading_decision": "PENDING_FINAL_VALIDATION",
+            "final_state": "PENDING_FINAL_VALIDATION",
             "final_trading_reason": "Ranking is descriptive; final broker, portfolio, sizing, stop, and execution gates run after revalidation.",
             "target_source": target_source,
             "target_alternatives": target_alternatives,

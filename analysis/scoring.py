@@ -62,12 +62,15 @@ class TradeSignal:
     # Research acceptance and objective-trading approval are deliberately separate.
     research_decision: str = "RESEARCH_REJECTED"
     trading_decision: str = "DEFERRED"
+    final_state: str = "PENDING_FINAL_VALIDATION"
     evidence_classification: str = "INSUFFICIENT"
     confidence_classification: str = "UNVALIDATED"
     research_reason: str = ""
     trading_reason: str = ""
     learning_objective: str = ""
     target_alternatives: list[dict[str, Any]] = field(default_factory=list)
+    htf_context: list[dict[str, Any]] = field(default_factory=list)
+    htf_bias_status: str = "UNKNOWN"
     setup_quality_components: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -77,12 +80,17 @@ class TradeSignal:
 
 def format_signal_report(signal: TradeSignal) -> str:
     """Render validity gates separately from the non-bypassable quality rank."""
+    htf_text = ", ".join(
+        f"{item.get('timeframe', 'TF')}={item.get('bias', 'UNKNOWN')}"
+        for item in signal.htf_context
+    ) or "unavailable"
     header = [
         f"📊 **{signal.symbol}** — `{signal.direction}` ({signal.timeframe})",
         f"Setup: `{signal.setup_type}` | Entry model: `{signal.entry_mode}`",
         f"Quality rank: `{signal.score:.1f}/100` | Market-derived RR: `1:{signal.rr_ratio:.2f}`",
-        f"Research: `{signal.research_decision}` | Objective trading: `{signal.trading_decision}`",
+        f"Research: `{signal.research_decision}` | Objective trading: `{signal.trading_decision}` | Final state: `{signal.final_state}`",
         f"Evidence: `{signal.evidence_classification}` | Confidence: `{signal.confidence_classification}`",
+        f"Top-down context: `{signal.htf_bias_status}` | {htf_text}",
         "",
         f"Entry: `{signal.entry_price:.5f}` | SL: `{signal.stop_loss:.5f}` | TP: `{signal.take_profit:.5f}`",
     ]

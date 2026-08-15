@@ -75,6 +75,76 @@ def test_live_position_enrichment_uses_fresh_side_price() -> None:
     assert rows[0].market.stale is False
 
 
+def test_insufficient_evidence_can_be_controlled_forward_demo_exploration() -> None:
+    from analysis.decision_gates import evaluate_trading_gate
+
+    decision = evaluate_trading_gate(
+        setup_valid=True,
+        broker_symbol_valid=True,
+        valid_market_data=True,
+        objective_permits_exposure=True,
+        evidence={"sample_size": 0, "evidence_classification": "INSUFFICIENT", "confidence_classification": "UNVALIDATED"},
+        champion_governed=False,
+        forward_demo_experiment_allowed=True,
+        portfolio_approved=True,
+        structural_conflict=False,
+        required_htf_context_available=True,
+        setup_quality=84.5,
+        exploratory_threshold=80.0,
+        demo_mode=True,
+        experiment_id=17,
+    )
+    assert decision.trading_decision == "CONTROLLED_FORWARD_DEMO"
+    assert decision.final_state == "EXPLORATORY_DEMO"
+    assert decision.evidence_classification == "INSUFFICIENT"
+
+
+def test_insufficient_evidence_does_not_override_hard_gate() -> None:
+    from analysis.decision_gates import evaluate_trading_gate
+
+    decision = evaluate_trading_gate(
+        setup_valid=True,
+        broker_symbol_valid=True,
+        valid_market_data=True,
+        objective_permits_exposure=False,
+        evidence={"sample_size": 0, "evidence_classification": "INSUFFICIENT"},
+        champion_governed=False,
+        forward_demo_experiment_allowed=True,
+        portfolio_approved=True,
+        structural_conflict=False,
+        required_htf_context_available=True,
+        setup_quality=95.0,
+        exploratory_threshold=80.0,
+        demo_mode=True,
+        experiment_id=17,
+    )
+    assert decision.final_state == "EXECUTION_BLOCKED"
+    assert decision.trading_decision == "OBJECTIVE_INELIGIBLE"
+
+
+def test_conflicted_top_down_context_is_explicitly_waiting() -> None:
+    from analysis.decision_gates import evaluate_trading_gate
+
+    decision = evaluate_trading_gate(
+        setup_valid=True,
+        broker_symbol_valid=True,
+        valid_market_data=True,
+        objective_permits_exposure=True,
+        evidence={"evidence_classification": "INSUFFICIENT"},
+        champion_governed=False,
+        forward_demo_experiment_allowed=True,
+        portfolio_approved=True,
+        structural_conflict=True,
+        required_htf_context_available=True,
+        setup_quality=90.0,
+        exploratory_threshold=80.0,
+        demo_mode=True,
+        experiment_id=17,
+    )
+    assert decision.final_state == "WAITING_FOR_CONFIRMATION"
+    assert decision.trading_decision == "DEFERRED"
+
+
 def test_forward_demo_challenger_is_allowed_to_trade_in_isolated_demo() -> None:
     from analysis.decision_gates import evaluate_trading_gate
 
@@ -91,6 +161,7 @@ def test_forward_demo_challenger_is_allowed_to_trade_in_isolated_demo() -> None:
         required_htf_context_available=True,
     )
     assert decision.trading_decision == "TRADE_APPROVED"
+    assert decision.final_state == "EXECUTION_APPROVED"
 
 
 def test_challenger_without_isolated_demo_authority_is_rejected() -> None:

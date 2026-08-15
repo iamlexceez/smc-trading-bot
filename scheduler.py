@@ -1864,6 +1864,12 @@ class MarketScheduler:
         signal.market_context = regime_context
         signal.symbol_profile = profile
         signal.htf_bias = [item.trend.value for item in htf_structures]
+        signal.htf_context = [
+            {"timeframe": timeframe, "bias": structure.trend.value.upper()}
+            for timeframe, structure in zip(self.settings.htf_timeframes, htf_structures)
+        ]
+        htf_biases = {item["bias"] for item in signal.htf_context}
+        signal.htf_bias_status = "CONFLICTED" if {"BULLISH", "BEARISH"}.issubset(htf_biases) else (next(iter(htf_biases), "UNKNOWN"))
         signal.selected_strategy = selected_strategy
         signal.strategy_score = strategy_score
         signal.strategy_evidence = strategy_evidence
@@ -1937,6 +1943,12 @@ class MarketScheduler:
         required_htf = bool(policy.get("requires_htf_context")) or bool(required_timeframes) or registry_requires_htf
         htf_available = bool(signal.htf_bias) if required_htf else True
         evidence = dict(signal.strategy_evidence or signal.evidence_summary or {})
+        setup_quality = float((signal.setup_quality_components or {}).get("overall_feature_score", signal.score) or signal.score or 0.0)
+        exploratory_threshold = policy.get("exploratory_setup_threshold")
+        structural_conflict = (
+            str(evidence.get("decision") or "").upper() in {"REJECTED", "CONFLICTED"}
+            or str(getattr(signal, "htf_bias_status", "")).upper() == "CONFLICTED"
+        )
         champion_governed = signal.experiment_id is None
         forward_demo_experiment_allowed = bool(
             signal.experiment_id is not None
@@ -1953,8 +1965,13 @@ class MarketScheduler:
             champion_governed=champion_governed,
             forward_demo_experiment_allowed=forward_demo_experiment_allowed,
             portfolio_approved=portfolio_approved,
-            structural_conflict=str(evidence.get("decision") or "").upper() in {"REJECTED", "CONFLICTED"},
+            structural_conflict=structural_conflict,
             required_htf_context_available=htf_available,
+            setup_quality=setup_quality,
+            exploratory_threshold=float(exploratory_threshold) if exploratory_threshold is not None else None,
+            demo_mode=self.settings.trading_mode == "demo",
+            experiment_id=signal.experiment_id,
+            risk_valid=bool(signal.experimental_policy.get("risk_model") or signal.experimental_policy.get("fixed_volume")),
         )
 
     async def _execute_signal(self, signal: TradeSignal, df: pd.DataFrame = None) -> bool:
@@ -2028,6 +2045,7 @@ class MarketScheduler:
                     details.update({
                         "research_decision": gate.research_decision,
                         "final_trading_decision": gate.trading_decision,
+                        "final_state": gate.final_state,
                         "final_trading_reason": gate.reason,
                         "evidence_classification": gate.evidence_classification,
                         "confidence_classification": gate.confidence_classification,
@@ -2035,10 +2053,11 @@ class MarketScheduler:
                     break
             signal.research_decision = gate.research_decision
             signal.trading_decision = gate.trading_decision
+            signal.final_state = gate.final_state
             signal.evidence_classification = gate.evidence_classification
             signal.confidence_classification = gate.confidence_classification
             signal.trading_reason = gate.reason
-            if gate.trading_decision != "TRADE_APPROVED":
+            if gate.trading_decision not in {"TRADE_APPROVED", "CONTROLLED_FORWARD_DEMO"}:
                 self.telemetry.increment("no_trade_decisions")
                 self.telemetry.record_rejection(f"TRADING_GATE: {gate.reason}")
                 if setup_id is not None:
@@ -2050,13 +2069,14 @@ class MarketScheduler:
                     )
                 await self._chart_activity(
                     "execution_rejected", symbol,
-                    f"⛔ **OBJECTIVE TRADING GATE — {symbol}**\nResearch: `{gate.research_decision}`\nTrading: `{gate.trading_decision}`\nEvidence: `{gate.evidence_classification}` | Confidence: `{gate.confidence_classification}`\nWhy not traded: {gate.reason}\nThe candidate remains available for research and counterfactual learning. No order was submitted.",
+                    f"⛔ **OBJECTIVE TRADING GATE — {symbol}**\nResearch: `{gate.research_decision}`\nDecision state: `{gate.final_state}`\nTrading: `{gate.trading_decision}`\nEvidence: `{gate.evidence_classification}` | Confidence: `{gate.confidence_classification}`\nWhy not traded: {gate.reason}\nThe candidate remains available for research and counterfactual learning. No order was submitted.",
                     fingerprint=f"{setup_id}:objective-gate:{gate.trading_decision}:{gate.reason}", essential=True,
                 )
                 return False
             await db.record_execution_event(
                 account_mode=self.settings.trading_mode, symbol=symbol, setup_id=setup_id,
-                status="objective_trade_approved", requested_price=signal.entry_price,
+                status="controlled_forward_demo" if gate.final_state == "EXPLORATORY_DEMO" else "objective_trade_approved",
+                requested_price=signal.entry_price,
                 reason=gate.reason, details={"decision": gate.to_dict(), "score_is_non_authoritative": True},
             )
             sym_info = await self._execution_symbol_spec(symbol, signal.direction)
@@ -2728,6 +2748,7 @@ class MarketScheduler:
                 "research_decision": opportunity.details.get("research_decision") or getattr(signal, "research_decision", "RESEARCH_ACCEPTED"),
                 "analysis_trading_decision": opportunity.details.get("analysis_trading_decision") or getattr(signal, "trading_decision", "DEFERRED"),
                 "final_trading_decision": "PENDING_FINAL_VALIDATION",
+                "final_state": "PENDING_FINAL_VALIDATION",
                 "evidence_classification": opportunity.details.get("evidence_classification", "INSUFFICIENT"),
                 "completed_confidence": opportunity.details.get("completed_confidence", "UNKNOWN"),
                 "sample_size": opportunity.details.get("sample_size", 0),
@@ -2736,6 +2757,13 @@ class MarketScheduler:
                 "risk_distance": opportunity.details.get("risk_distance", 0.0),
                 "reward_distance": opportunity.details.get("reward_distance", 0.0),
                 "learning_objective": opportunity.details.get("learning_objective", ""),
+                "expected_value_r": opportunity.details.get("expected_value_r"),
+                "expected_value_status": opportunity.details.get("expected_value_status", "UNKNOWN"),
+                "setup_status": opportunity.details.get("setup_status", "UNKNOWN"),
+                "htf_bias_status": opportunity.details.get("htf_bias_status", "UNKNOWN"),
+                "htf_relationship": opportunity.details.get("htf_relationship", "UNKNOWN"),
+                "target_conflict": opportunity.details.get("target_conflict", False),
+                "target_reason": opportunity.details.get("target_reason", ""),
                 "top_down_context": dict(opportunity.details.get("top_down_context") or {}),
                 "displacement_ratio": opportunity.details.get("displacement_ratio"),
                 "observed_features": list(getattr(signal, "registry_observed_features", []) or []),
@@ -2812,16 +2840,21 @@ class MarketScheduler:
             f"#{index} {item.symbol} {item.score:.1f} ({item.details.get('confidence_classification', 'UNKNOWN')}/{item.details.get('evidence_classification', 'INSUFFICIENT')})"
             for index, item in enumerate(ranked[:3], start=1)
         )
+        htf_summary = ", ".join(
+            f"{item.get('timeframe', 'TF')}={item.get('bias', 'UNKNOWN')}"
+            for item in (best.details.get('htf_context') or [])
+        ) or "UNKNOWN"
         await self._chart_activity(
             "best_opportunity", selected.symbol,
             f"🎯 **BEST CURRENT OPPORTUNITY — {selected.symbol}**\n"
             f"Rank: `1/{len(ranked)}` | Opportunity score: `{best.score:.1f}` | Confidence: `{best.details.get('confidence_classification', 'UNKNOWN')}`\n"
-            f"Research decision: `{best.details.get('research_decision', 'RESEARCH_ACCEPTED')}` | Final trading decision: `PENDING_FINAL_VALIDATION`\n"
-            f"Evidence: `{best.details.get('evidence_classification', 'INSUFFICIENT')}` | Completed confidence: `{best.details.get('completed_confidence', 'UNKNOWN')}` | Sample size: `{int(best.details.get('sample_size') or 0)}`\n"
+            f"Setup: `{best.details.get('setup_status', 'UNKNOWN')}` ({float(best.details.get('setup_score') or 0.0):.1f}/100) | Research decision: `{best.details.get('research_decision', 'RESEARCH_ACCEPTED')}` | Final state: `PENDING_FINAL_VALIDATION`\n"
+            f"Evidence: `{best.details.get('evidence_classification', 'INSUFFICIENT')}` | Completed confidence: `{best.details.get('completed_confidence', 'UNKNOWN')}` | Sample size: `{int(best.details.get('sample_size') or 0)}` | Expected value: `{best.details.get('expected_value_r') if best.details.get('expected_value_r') is not None else 'UNKNOWN'}`\n"
             f"Regime: `{best.context.get('regime', 'UNKNOWN')}` | Strategy: `{getattr(selected, 'selected_strategy', selected.setup_type)}` | Direction: `{selected.direction}` | Timeframe: `{getattr(selected, 'timeframe', 'UNKNOWN')}`\n"
-            f"Top-down bias: `{', '.join(best.details.get('htf_bias') or []) or 'UNKNOWN'}` | Observed features: `{', '.join(best.details.get('observed_features') or []) or 'UNKNOWN'}` | Displacement ratio: `{float(best.details.get('displacement_ratio') or 0.0):.2f}`\n"
+            f"Top-down: `{best.details.get('htf_bias_status', 'UNKNOWN')}` / `{best.details.get('htf_relationship', 'UNKNOWN')}` | Timeframes: `{htf_summary}`\n"
+            f"Observed features: `{', '.join(best.details.get('observed_features') or []) or 'UNKNOWN'}` | Displacement ratio: `{float(best.details.get('displacement_ratio') or 0.0):.2f}`\n"
             f"Entry: `{float(best.details.get('entry') or 0.0):.8g}` | SL: `{float(best.details.get('stop_loss') or 0.0):.8g}` | TP: `{float(best.details.get('take_profit') or 0.0):.8g}` | Risk distance: `{float(best.details.get('risk_distance') or 0.0):.8g}` | Reward distance: `{float(best.details.get('reward_distance') or 0.0):.8g}` | Actual RR: `1:{float(best.details.get('rr') or 0.0):.4f}`\n"
-            f"TP source: `{best.details.get('target_source', 'UNKNOWN')}` | TP alternatives: `{len(best.details.get('target_alternatives') or [])}`\n"
+            f"TP source: `{best.details.get('target_source', 'UNKNOWN')}` | TP alternatives: `{len(best.details.get('target_alternatives') or [])}` | Target conflict: `{bool(best.details.get('target_conflict'))}`\n"
             f"Top comparison: `{comparison}`\n"
             f"Thesis: {'; '.join(best.rationale)}\n"
             f"Learning objective: {best.details.get('learning_objective') or 'Measure forward-DEMO outcome in this exact context.'}\n"
