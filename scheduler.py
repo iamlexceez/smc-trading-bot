@@ -3718,7 +3718,7 @@ class MarketScheduler:
         
         # Live scan progress and system summaries bypass cooldown to ensure
         # the user sees the bot is active in real-time.
-        is_live_progress = stage in {"scan_started", "scan_completed", "study_started"}
+        is_live_progress = stage in {"scan_started", "scan_completed"}
         if prior and now - prior[1] < cooldown and not essential and not is_live_progress:
             return False
         self._chart_activity_ledger[key] = (fingerprint, now)
