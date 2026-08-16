@@ -2820,6 +2820,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("settings", self.cmd_settings))
         app.add_handler(CommandHandler("pause", self.cmd_bus_dispatch))
         app.add_handler(CommandHandler("resume", self.cmd_bus_dispatch))
+        app.add_handler(CommandHandler("confirm", self.cmd_bus_dispatch))
         app.add_handler(CommandHandler("activity", self.cmd_activity))
         app.add_handler(CommandHandler("emergency", self.cmd_emergency))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))

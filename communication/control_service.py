@@ -118,6 +118,80 @@ class SharedControlService:
             )
         return "\n".join(lines)
 
+    async def core(self, request: CommandRequest) -> str:
+        records = list(getattr(getattr(self.scheduler, "market_universe", None), "accepted_records", []) or [])
+        names = [str(getattr(record, "symbol", record)) for record in records[:8]]
+        return "CORE / BROKER UNIVERSE\n" + ("\n".join(f"{index}. {name}" for index, name in enumerate(names, 1)) if names else "No broker-verified core candidates are available.")
+
+    async def learning(self, request: CommandRequest) -> str:
+        kwargs = {"db_path": self.db_path} if self.db_path else {}
+        rows = await db.get_strategy_evidence_summary(self.settings.trading_mode, days=30, **kwargs)
+        if not rows:
+            return "LEARNING\nInsufficient evidence is available for a ranked strategy summary."
+        total_samples = sum(int(row.get("sample_size") or 0) for row in rows)
+        best = rows[0]
+        return "\n".join([
+            "LEARNING",
+            f"Contexts: {len(rows)}",
+            f"Samples: {total_samples}",
+            f"Best context: {best.get('strategy_id', 'unknown')} / {best.get('symbol', 'unknown')}",
+            f"Expectancy: {best.get('expectancy_r', 'unknown')} R",
+            f"Confidence: {best.get('confidence', 'UNKNOWN')}",
+        ])
+
+    async def research(self, request: CommandRequest) -> str:
+        kwargs = {"db_path": self.db_path} if self.db_path else {}
+        hypotheses = await db.get_open_hypotheses(self.settings.trading_mode, **kwargs)
+        if not hypotheses:
+            return "RESEARCH\nNo open hypotheses."
+        return "\n".join(["RESEARCH OPEN HYPOTHESES", *[
+            f"- {item.get('hypothesis_key', '?')}: {item.get('statement', '未 specified')}"
+            for item in hypotheses[:8]
+        ]])
+
+    async def experiments(self, request: CommandRequest) -> str:
+        kwargs = {"db_path": self.db_path} if self.db_path else {}
+        rows = await db.list_policy_experiments(self.settings.trading_mode, limit=8, **kwargs)
+        if not rows:
+            return "EXPERIMENTS\nNone recorded."
+        return "\n".join(["EXPERIMENTS", *[
+            f"- #{row.get('id', '?')} {row.get('status', '?')} {row.get('policy_fingerprint', '?')}"
+            for row in rows
+        ]])
+
+    async def objective(self, request: CommandRequest) -> str:
+        kwargs = {"db_path": self.db_path} if self.db_path else {}
+        active = await db.get_active_objective(self.settings.trading_mode, **kwargs)
+        if not active:
+            return "OBJECTIVE\nNo active objective."
+        objective = active.get("objective_json") or active.get("objective") or {}
+        if isinstance(objective, str):
+            import json
+            objective = json.loads(objective or "{}")
+        return "\n".join([
+            "OBJECTIVE",
+            f"Status: {active.get('status', 'UNKNOWN')}",
+            f"Version: {active.get('version', '?')}",
+            f"Target: {objective.get('target_capital', objective.get('target_equity', 'unknown'))}",
+            f"Mode: {self.settings.trading_mode.upper()}",
+        ])
+
+    async def performance(self, request: CommandRequest) -> str:
+        kwargs = {"db_path": self.db_path} if self.db_path else {}
+        summary = await db.get_performance_summary(self.settings.trading_mode, days=7, **kwargs)
+        return "\n".join([
+            "PERFORMANCE — LAST 7 DAYS",
+            f"Trades: {summary.get('trades', summary.get('trade_count', 'unknown'))}",
+            f"PnL: {summary.get('pnl', summary.get('total_pnl', 'unknown'))}",
+            f"Win rate: {summary.get('win_rate', 'unknown')}",
+        ])
+
+    async def diagnostics(self, request: CommandRequest) -> str:
+        return await self.engine(request)
+
+    async def logs(self, request: CommandRequest) -> str:
+        return "LOGS\nRaw logs remain on the VPS in logs\\bot_runtime.log. Use /diagnostics for a safe operational summary."
+
     async def help(self, request: CommandRequest) -> str:
         return "\n".join([
             "SMC COMMANDS",
@@ -161,6 +235,14 @@ def build_command_bus(service: SharedControlService) -> CommandBus:
     bus.register("health", service.health)
     bus.register("positions", service.positions)
     bus.register("opportunities", service.opportunities)
+    bus.register("core", service.core)
+    bus.register("learning", service.learning)
+    bus.register("research", service.research)
+    bus.register("experiments", service.experiments)
+    bus.register("objective", service.objective)
+    bus.register("performance", service.performance)
+    bus.register("diagnostics", service.diagnostics)
+    bus.register("logs", service.logs)
     bus.register("help", service.help)
     bus.register("pause", service.pause, dangerous=True)
     bus.register("resume", service.resume, dangerous=True)
