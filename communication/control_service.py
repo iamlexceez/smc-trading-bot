@@ -217,6 +217,8 @@ class SharedControlService:
         result = await service.verify_resume() if service else {"resume_verified": False, "reason": "Account service unavailable"}
         if not result.get("resume_verified"):
             return f"Trading remains halted: {result.get('reason', 'broker state not verified')}"
+        if str(self.settings.trading_mode).lower() == "demo":
+            self.settings.auto_trade = True
         self.settings.is_paused = False
         self.settings.automation_pause_reason = ""
         kwargs = {"db_path": self.db_path} if self.db_path else {}

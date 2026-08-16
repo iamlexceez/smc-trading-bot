@@ -1795,6 +1795,8 @@ class BotHandlers:
         if not result.get("resume_verified"):
             msg = f"Trading remains HALTED. Broker account state is not viable for resumption: {result.get('reason', result.get('state', 'unknown'))}."
         else:
+            if str(self.settings.trading_mode).lower() == "demo":
+                self.settings.auto_trade = True
             self.settings.is_paused = False
             self.settings.automation_pause_reason = ""
             await db.save_settings(self.settings)

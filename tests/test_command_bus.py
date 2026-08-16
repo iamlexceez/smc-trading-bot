@@ -78,3 +78,56 @@ def test_unauthorized_command_is_rejected():
         assert "Not authorized" in response.text
 
     asyncio.run(scenario())
+
+
+def test_verified_demo_resume_reenables_auto_trade_and_clears_pause(tmp_path: Path):
+    from types import SimpleNamespace
+    from communication.control_service import SharedControlService
+
+    async def scenario():
+        path = tmp_path / "resume.db"
+        await db.init_db(str(path))
+        from config import TradeSettings
+        settings = TradeSettings.defaults()
+        settings.trading_mode = "demo"
+        settings.auto_trade = False
+        settings.is_paused = True
+        settings.automation_pause_reason = "EMERGENCY_STOP"
+
+        class CapitalState:
+            async def verify_resume(self):
+                return {"resume_verified": True, "state": "ACCOUNT_VERIFIED"}
+
+        service = SharedControlService(settings, SimpleNamespace(capital_state_service=CapitalState()), db_path=str(path))
+        result = await service.resume(CommandRequest("telegram", "admin", "1", "/resume"))
+        assert "Trading resumed" in result
+        assert settings.auto_trade is True
+        assert settings.is_paused is False
+        assert settings.automation_pause_reason == ""
+
+    asyncio.run(scenario())
+
+
+def test_blocked_demo_resume_keeps_auto_trade_disabled():
+    from types import SimpleNamespace
+    from communication.control_service import SharedControlService
+
+    async def scenario():
+        from config import TradeSettings
+        settings = TradeSettings.defaults()
+        settings.trading_mode = "demo"
+        settings.auto_trade = False
+        settings.is_paused = True
+        settings.automation_pause_reason = "ACCOUNT_SAFETY"
+
+        class CapitalState:
+            async def verify_resume(self):
+                return {"resume_verified": False, "reason": "CAPITAL_EXHAUSTED"}
+
+        service = SharedControlService(settings, SimpleNamespace(capital_state_service=CapitalState()))
+        result = await service.resume(CommandRequest("telegram", "admin", "1", "/resume"))
+        assert "CAPITAL_EXHAUSTED" in result
+        assert settings.auto_trade is False
+        assert settings.is_paused is True
+
+    asyncio.run(scenario())
