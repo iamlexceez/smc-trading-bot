@@ -185,6 +185,7 @@ class BotHandlers:
             objective_line = "Objective: no confirmed operational objective"
         return "\n".join([
             "🤖 **DERIV AUTONOMOUS RESEARCH SYSTEM**",
+            f"Server Time: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC`",
             f"Mode: `{self.settings.trading_mode.upper()}` | Autonomous execution: `{'ON' if self.settings.auto_trade and not self.settings.is_paused else 'OFF'}`",
             f"Broker universe: `{active_count}` active / `{available_count}` available Deriv Synthetic Indices or Gold",
             f"Today: `{performance['trades']}` closed trades | P/L `${performance['pnl']:.2f}` | win rate `{performance['win_rate']:.1f}%`",
@@ -1293,7 +1294,7 @@ class BotHandlers:
         try:
             # We don't wait for the result here because the scheduler emits
             # its own Telegram notifications during the scan.
-            asyncio.create_task(self.scheduler.scan_and_execute())
+            asyncio.create_task(self.scheduler.scan_and_execute(is_manual=True))
         except Exception as e:
             logger.error(f"Error initiating manual scan: {e}")
             await reply_target.reply_text(f"❌ Failed to start scan: {e}")
