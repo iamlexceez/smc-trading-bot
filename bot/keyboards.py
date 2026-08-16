@@ -17,7 +17,7 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧠 Learning", callback_data="learning")],
         [InlineKeyboardButton("🎯 Capital Test", callback_data="capital_test"), InlineKeyboardButton("🧪 Experiments", callback_data="experiments")],
         [InlineKeyboardButton("🏆 Champion", callback_data="champion"), InlineKeyboardButton("⚔️ Challengers", callback_data="challengers")],
-        [InlineKeyboardButton("📜 History", callback_data="history")],
+        [InlineKeyboardButton("📜 History", callback_data="history"), InlineKeyboardButton("🔍 Manual Scan", callback_data="scan")],
         [InlineKeyboardButton("🚨 Emergency Stop", callback_data="emergency")],
     ])
 

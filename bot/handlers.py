@@ -555,6 +555,7 @@ class BotHandlers:
             "`/learned` — plain-language evidence summary across saved objective sessions\n"
             "`/knowledge` — persistent expert methodology hypotheses, tests, decisions, and uncertainties\n"
             "`/opportunities` — current ranked strategy, regime, evidence, and thesis board\n"
+            "`/scan` — manually trigger the authoritative market scanner\n"
             "`/activity [detailed|essential|off]` — chart-study notification mode\n"
             "`/settings` — autonomy, alerts, and explicit DEMO/LIVE controls\n"
             "`/emergency` — pause new execution and optionally close positions\n\n"
@@ -581,7 +582,7 @@ class BotHandlers:
             f"Rejected setup alerts: `{'ON' if self.settings.chart_activity_include_rejections else 'OFF'}`",
             f"Duplicate cooldown: `{self.settings.chart_activity_cooldown_seconds}s` per symbol and stage",
             "",
-            "**Detailed** reports closed-candle study, structure, hard-gate rejections, validated setups, final risk review, broker submission, execution, and management actions.",
+            "**Detailed** reports live scanning progress, closed-candle study, structure, hard-gate rejections, validated setups, final risk review, broker submission, execution, and management actions.",
             "**Essential** reports execution-critical broker, safety, and management events only.",
             "Use `/activity detailed`, `/activity essential`, or `/activity off`.",
         ])
@@ -1275,34 +1276,27 @@ class BotHandlers:
     async def cmd_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Trigger a market scan and auto-execute valid signals."""
         reply_target = update.callback_query.message if update.callback_query else update.message
-        if self.scheduler:
-            await reply_target.reply_text("🔍 **MANUAL SCAN & EXECUTION INITIATED**\n_Scanning for high-probability setups..._")
-            
-            # Use the existing scan logic
-            signals = []
-            for symbol in self.scheduler.settings.enabled_symbols:
-                try:
-                    # 1. Fetch data
-                    primary_tf = "M1" if self.scheduler.settings.aggressive_mode else "M15"
-                    df = await self.scheduler.fetch_candles(symbol, primary_tf, 500)
-                    if df.empty: continue
-                    
-                    # 2. Analyze
-                    signal = await self.scheduler.analyze_symbol(symbol)
-                    if not signal or not signal.passed or signal.score < self.scheduler.settings.min_setup_score:
-                        continue
-                    
-                    # 3. Auto-Execute
-                    await self.scheduler.execute_signal(signal, df)
-                    signals.append(signal)
-                    
-                except Exception as e:
-                    logger.error(f"Error in manual scan for {symbol}: {e}")
-
-            if not signals:
-                await reply_target.reply_text("No tradeable setups found at this time.")
-        else:
+        if not self.scheduler:
             await reply_target.reply_text("Scheduler not initialized.")
+            return
+
+        # Check if a scan is already running to avoid unnecessary wait messages
+        if self.scheduler._scan_lock.locked():
+            await reply_target.reply_text("🔍 **SCAN IN PROGRESS**\nA market scan is already running. Please wait for it to complete.")
+            return
+
+        await reply_target.reply_text("🔍 **MANUAL SCAN INITIATED**\n_The bot is scanning the broker universe for high-probability setups..._")
+        
+        # Use the authoritative non-blocking scheduler implementation.
+        # This ensures manual scans use the same timeout, lock, and execution
+        # logic as the background loop.
+        try:
+            # We don't wait for the result here because the scheduler emits
+            # its own Telegram notifications during the scan.
+            asyncio.create_task(self.scheduler.scan_and_execute())
+        except Exception as e:
+            logger.error(f"Error initiating manual scan: {e}")
+            await reply_target.reply_text(f"❌ Failed to start scan: {e}")
 
     @admin_only
     async def cmd_analyze(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2779,6 +2773,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("positions", self.cmd_positions))
         app.add_handler(CommandHandler("position", self.cmd_position))
         app.add_handler(CommandHandler("orders", self.cmd_orders))
+        app.add_handler(CommandHandler("scan", self.cmd_scan))
         app.add_handler(CommandHandler("history", self.cmd_history))
         app.add_handler(CommandHandler("exposure", self.cmd_exposure))
         app.add_handler(CommandHandler("health", self.cmd_health))
