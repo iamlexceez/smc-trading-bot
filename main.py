@@ -52,8 +52,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def create_executor(settings: TradeSettings) -> object:
-    """Create the appropriate MT5 executor based on settings (demo or live)."""
+async def create_executor(settings: TradeSettings, *, connect: bool = False) -> object:
+    """Create the MT5 adapter without making Telegram depend on broker startup.
+
+    Connection is normally deferred to the scheduler background task. The
+    optional ``connect`` flag is retained for explicit diagnostic callers.
+    """
     if not MT5_AVAILABLE:
         logger.error("❌ MetaTrader5 package not available. Bot cannot run in demo or live mode.")
         return None
@@ -72,6 +76,10 @@ async def create_executor(settings: TradeSettings) -> object:
         path=creds["path"],
     )
     
+    if not connect:
+        logger.info("MT5 executor created; connection deferred until Telegram control plane is online")
+        return executor
+
     connected = await executor.connect()
     if not connected:
         logger.error(f"❌ Failed to connect to MT5 {mode.upper()} account {creds['login']}.")
@@ -101,8 +109,9 @@ async def main():
     settings = await db.load_settings()
     logger.info(f"Settings loaded: mode={settings.trading_mode}, auto_trade={settings.auto_trade}")
 
-    # Create executor (demo or live MT5)
-    executor = await create_executor(settings)
+    # Create the adapter only. Broker connection is deliberately deferred until
+    # Telegram polling is online so MT5 cannot make the control plane unresponsive.
+    executor = await create_executor(settings, connect=False)
 
     # Create risk manager
     risk_manager = RiskManager(settings)
@@ -171,70 +180,88 @@ async def main():
         BotCommand("emergency", "Pause execution; optionally close positions"),
         BotCommand("help", "Operational command guide"),
     ]
-    await app.bot.set_my_commands(commands)
-
-    # Send an early liveness notice before broker discovery and account
-    # reconciliation. Those broker operations may legitimately take time; the
-    # user must still know that the Python process and Telegram connection are alive.
-    if admin_ids:
-        for admin_id in admin_ids:
-            try:
-                await asyncio.wait_for(
-                    app.bot.send_message(
-                        admin_id,
-                        "🔄 **SMC Trading Bot process online**\n\nInitializing MT5 connection and broker universe; detailed startup status will follow.",
-                    ),
-                    timeout=15.0,
-                )
-            except Exception as e:
-                logger.error(f"Failed to send early startup notice to {admin_id}: {e}")
-
-    # Start scheduler
-    await scheduler.start(interval_seconds=60)  # closed-candle scan every minute; broker-validation heartbeat every 10 minutes
-
-    # Notify admin
-    if admin_ids:
-        for admin_id in admin_ids:
-            try:
-                status_msg = f"🤖 **SMC Trading Bot Started**\n\n"
-                status_msg += f"Mode: `{settings.trading_mode.upper()}`\n"
-                status_msg += f"Auto-Trade: {'✅ ON' if settings.auto_trade else '❌ OFF'}\n\n"
-                
-                if executor and await executor.is_connected():
-                    status_msg += "✅ **MT5 Connected**"
-                else:
-                    status_msg += "❌ **MT5 Connection Failed**\nCheck if MT5 terminal is open on VPS and credentials are correct."
-                
-                status_msg += f"\n\nUse /help to see all commands."
-                
-                await app.bot.send_message(admin_id, status_msg)
-            except Exception as e:
-                logger.error(f"Failed to notify admin {admin_id}: {e}")
-
-    logger.info("🚀 SMC Trading Bot is running!")
-    logger.info(f"Admin IDs: {admin_ids}")
-    logger.info(f"Mode: {settings.trading_mode}")
-    logger.info(f"Active Deriv Synthetic Indices / Gold symbols: {settings.enabled_symbols}")
-
-    # Start polling using async lifecycle (compatible with asyncio.run)
+    # Start Telegram first. MT5 connection, symbol discovery, account
+    # reconciliation, and scanning are broker-subsystem work and must never
+    # prevent the control plane from becoming responsive.
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=["message", "callback_query"])
+    try:
+        await app.bot.set_my_commands(commands)
+    except Exception:
+        logger.exception("Could not publish Telegram command menu; control plane remains online")
 
-    # Explicitly start the first scan if not running
-    if not scheduler._running:
-        await scheduler.start()
+    if admin_ids:
+        for admin_id in admin_ids:
+            try:
+                status_msg = "\n".join([
+                    "🤖 **SMC Trading Bot Started**",
+                    "",
+                    f"Mode: `{settings.trading_mode.upper()}`",
+                    f"Auto-Trade: `{'ON' if settings.auto_trade else 'OFF'}`",
+                    "Telegram control plane: `ONLINE`",
+                    "MT5 broker subsystem: `STARTING`",
+                    "",
+                    "Use `/engine` or `/health` for live subsystem status.",
+                ])
+                await asyncio.wait_for(app.bot.send_message(admin_id, status_msg), timeout=15.0)
+            except Exception:
+                logger.exception("Failed to send Telegram startup status to %s", admin_id)
 
-    # Keep running until interrupted
+    logger.info("🚀 Telegram control plane is online; broker subsystem startup is running in background")
+    logger.info(f"Admin IDs: {admin_ids}")
+    logger.info(f"Mode: {settings.trading_mode}")
+
+    async def _start_broker_subsystem() -> None:
+        """Start broker discovery without taking Telegram down if it fails."""
+        try:
+            await scheduler.start(interval_seconds=60)
+            logger.info("Broker subsystem startup completed")
+            if admin_ids:
+                for admin_id in admin_ids:
+                    try:
+                        connected = bool(executor and await asyncio.wait_for(executor.is_connected(), timeout=10.0))
+                        status = "CONNECTED" if connected else "DISCONNECTED"
+                        await app.bot.send_message(
+                            admin_id,
+                            f"🩺 **BROKER SUBSYSTEM READY**\n\nMT5: `{status}`\nMarket engine: `{'ARMED' if scheduler._running else 'NOT READY'}`\nUse `/engine` for details.",
+                        )
+                    except Exception:
+                        logger.exception("Failed to send broker startup status to %s", admin_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Broker subsystem startup failed; Telegram control plane remains online")
+            if admin_ids:
+                for admin_id in admin_ids:
+                    try:
+                        await app.bot.send_message(
+                            admin_id,
+                            "⚠️ **BROKER SUBSYSTEM UNAVAILABLE**\n\nTelegram remains online. MT5-dependent trading is disabled until broker health recovers.",
+                        )
+                    except Exception:
+                        logger.exception("Failed to send broker failure status to %s", admin_id)
+
+    broker_startup_task = asyncio.create_task(_start_broker_subsystem(), name="broker_subsystem_startup")
+
+    # Keep running until interrupted.
     stop_event = asyncio.Event()
     try:
         await stop_event.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        if not broker_startup_task.done():
+            broker_startup_task.cancel()
+            await asyncio.gather(broker_startup_task, return_exceptions=True)
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+        if executor and hasattr(executor, "disconnect"):
+            try:
+                await executor.disconnect()
+            except Exception:
+                logger.exception("Failed to disconnect MT5 executor during shutdown")
 
 
 if __name__ == "__main__":
