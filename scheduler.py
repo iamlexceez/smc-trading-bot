@@ -52,6 +52,8 @@ from analysis.opportunity import market_context, rank_opportunities
 from analysis.decision_gates import GateDecision, classify_confidence, classify_evidence, evaluate_trading_gate
 from data.provider import DataProvider
 from data.universe import DerivMarketUniverse
+from communication.events import DeliveryChannel, EventSeverity, NotificationEvent
+from communication.notification_manager import NotificationManager, SlackWebhookAdapter, TelegramAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,7 @@ class MarketScheduler:
         risk_manager: RiskManager,
         bot_app=None,
         admin_chat_id: Optional[int] = None,
+        db_path: str | None = None,
     ):
         self.settings = settings
         self.executor = executor
@@ -95,6 +98,12 @@ class MarketScheduler:
         self._telegram_last_backoff_log_at = 0.0
         self._slack_notify_lock = asyncio.Lock()
         self._slack_next_allowed_at = 0.0
+        self.notification_manager = NotificationManager(
+            telegram=TelegramAdapter(bot_app, admin_chat_id),
+            slack=SlackWebhookAdapter(),
+            db_module=db,
+            db_path=db_path or getattr(settings, "db_path", None),
+        )
         # Initialize Self-Optimizer
         self.optimizer = SelfOptimizer(self.settings)
         self.research_governance = ResearchGovernance(self.settings)
@@ -3736,49 +3745,27 @@ class MarketScheduler:
         return True
 
     async def _notify(self, message: str, photo: bytes = None, *, include_whatsapp: bool = True):
-        """Send notification to Telegram and, for material events, WhatsApp.
+        """Publish through the single notification boundary.
 
-        Telegram notifications are deliberately serialized and rate-limited per
-        process. A broker scan can produce many distinct research events, but
-        Telegram must not receive them as an unrestricted burst. RetryAfter is
-        treated as a server-directed circuit breaker, not as an invitation to
-        retry immediately.
+        ``include_whatsapp`` is retained for compatibility with existing call
+        sites; it now means that the event is material and may route to Slack.
+        Chart-study detail remains Telegram-only. Delivery failures are isolated
+        from scanning, execution, and position management.
         """
-        # Telegram
-        if self.bot_app and self.admin_chat_id:
-            now = monotonic()
-            if now < self._telegram_backoff_until:
-                if now - self._telegram_last_backoff_log_at >= 60:
-                    remaining = int(self._telegram_backoff_until - now)
-                    logger.warning("Telegram notifications paused by flood control; retry window remains about %ss", remaining)
-                    self._telegram_last_backoff_log_at = now
-            else:
-                async with self._telegram_notify_lock:
-                    now = monotonic()
-                    if now < self._telegram_backoff_until:
-                        return await self._notify_whatsapp(message, include_whatsapp)
-                    wait_for = max(0.0, self._telegram_next_allowed_at - now)
-                    if wait_for:
-                        await asyncio.sleep(wait_for)
-                    try:
-                        if photo:
-                            await self.bot_app.bot.send_photo(self.admin_chat_id, photo, caption=message)
-                        else:
-                            await self.bot_app.bot.send_message(self.admin_chat_id, message)
-                        self._telegram_next_allowed_at = monotonic() + 1.05
-                    except RetryAfter as exc:
-                        retry_after = max(1.0, float(getattr(exc, "retry_after", 60.0)))
-                        self._telegram_backoff_until = monotonic() + retry_after
-                        self._telegram_last_backoff_log_at = monotonic()
-                        logger.error("Telegram flood control engaged; suppressing notifications for %ss", int(retry_after))
-                    except Exception as e:
-                        logger.error(f"Failed to send Telegram notification: {e}")
-        
-        # Slack receives the same material events as the WhatsApp fallback.
-        # Detailed chart-study traffic remains Telegram-only by design.
-        if include_whatsapp:
-            await self._notify_slack(message)
-        return await self._notify_whatsapp(message, include_whatsapp)
+        channels = (
+            (DeliveryChannel.TELEGRAM, DeliveryChannel.SLACK)
+            if include_whatsapp
+            else (DeliveryChannel.TELEGRAM,)
+        )
+        event = NotificationEvent(
+            event_type="essential_notification" if include_whatsapp else "chart_activity",
+            message=message,
+            severity=EventSeverity.IMPORTANT if include_whatsapp else EventSeverity.PERIODIC,
+            dedupe_key=f"{('essential' if include_whatsapp else 'chart')}:{message}",
+            channels=channels,
+            photo=photo,
+        )
+        return await self.notification_manager.publish(event)
 
     async def _notify_slack(self, message: str) -> None:
         """Post an essential event to an official Slack incoming webhook.

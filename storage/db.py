@@ -7,7 +7,7 @@ import os
 import math
 import aiosqlite
 import json
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Any, Optional
 from config import TradeSettings
 from analysis.evidence import completed_outcome_statistics
@@ -411,6 +411,49 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS notification_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                message TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                channels_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                persistent INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS notification_deliveries (
+                event_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                retry_after REAL,
+                last_attempt_at TEXT,
+                delivered_at TEXT,
+                PRIMARY KEY (event_id, channel),
+                FOREIGN KEY(event_id) REFERENCES notification_events(event_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS command_audit (
+                command_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                command TEXT NOT NULL,
+                arguments TEXT NOT NULL DEFAULT '',
+                authorization_result TEXT NOT NULL,
+                execution_result TEXT,
+                response_status TEXT NOT NULL DEFAULT 'PENDING',
+                state_before_json TEXT NOT NULL DEFAULT '{}',
+                state_after_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS trade_baskets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
@@ -519,8 +562,112 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_capital_reduction_mode_status ON capital_reduction_sessions(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_capital_reduction_actions_session ON capital_reduction_actions(session_id, created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_layers_ticket ON trade_layers(ticket)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_notification_delivery_status ON notification_deliveries(status, retry_after)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_command_audit_platform_time ON command_audit(platform, timestamp)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_baskets_status ON trade_baskets(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trade_baskets_mode_status ON trade_baskets(account_mode, status)")
+        await db.commit()
+
+
+async def record_notification_event(event: Any, db_path: str = DB_PATH) -> None:
+    payload = event.serialized_payload()
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """INSERT OR IGNORE INTO notification_events
+               (event_id, event_type, severity, message, dedupe_key, payload_json,
+                channels_json, created_at, persistent)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (event.event_id, event.event_type, event.severity.value, event.message,
+             event.resolved_dedupe_key, json.dumps(event.payload, default=str),
+             json.dumps([channel.value for channel in event.target_channels]),
+             event.created_at.isoformat(), 1 if event.persistent else 0),
+        )
+        for channel in event.target_channels:
+            await db.execute(
+                "INSERT OR IGNORE INTO notification_deliveries (event_id, channel) VALUES (?, ?)",
+                (event.event_id, channel.value),
+            )
+        await db.commit()
+
+
+async def record_notification_delivery(
+    event_id: str,
+    channel: str,
+    delivered: bool,
+    error: str | None = None,
+    retry_after: float | None = None,
+    db_path: str = DB_PATH,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    status = "DELIVERED" if delivered else "RETRY"
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """INSERT INTO notification_deliveries
+               (event_id, channel, status, attempts, last_error, retry_after, last_attempt_at, delivered_at)
+               VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+               ON CONFLICT(event_id, channel) DO UPDATE SET
+                 status=excluded.status,
+                 attempts=notification_deliveries.attempts + 1,
+                 last_error=excluded.last_error,
+                 retry_after=excluded.retry_after,
+                 last_attempt_at=excluded.last_attempt_at,
+                 delivered_at=excluded.delivered_at""",
+            (event_id, channel, status, error, retry_after, now, now if delivered else None),
+        )
+        await db.commit()
+
+
+async def get_pending_notification_events(limit: int = 50, db_path: str = DB_PATH) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT DISTINCT e.event_id, e.event_type, e.severity, e.message,
+                      e.dedupe_key, e.payload_json, e.channels_json
+               FROM notification_events e
+               JOIN notification_deliveries d ON d.event_id = e.event_id
+               WHERE e.persistent = 1 AND d.status != 'DELIVERED'
+               ORDER BY e.created_at ASC LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+    return [
+        {
+            "event_id": row["event_id"],
+            "event_type": row["event_type"],
+            "severity": row["severity"],
+            "message": row["message"],
+            "dedupe_key": row["dedupe_key"],
+            "payload": json.loads(row["payload_json"] or "{}"),
+            "channels": json.loads(row["channels_json"] or "[]"),
+        }
+        for row in rows
+    ]
+
+
+async def record_command_audit(
+    command_id: str,
+    user_id: str,
+    platform: str,
+    channel_id: str,
+    command: str,
+    arguments: str,
+    authorization_result: str,
+    execution_result: str | None = None,
+    response_status: str = "PENDING",
+    state_before: dict[str, Any] | None = None,
+    state_after: dict[str, Any] | None = None,
+    db_path: str = DB_PATH,
+) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """INSERT OR REPLACE INTO command_audit
+               (command_id, user_id, platform, channel_id, timestamp, command, arguments,
+                authorization_result, execution_result, response_status, state_before_json, state_after_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (command_id, str(user_id), platform, str(channel_id), datetime.now(timezone.utc).isoformat(),
+             command, arguments, authorization_result, execution_result, response_status,
+             json.dumps(state_before or {}, default=str), json.dumps(state_after or {}, default=str)),
+        )
         await db.commit()
 
 
@@ -536,7 +683,7 @@ async def load_settings(db_path: str = DB_PATH) -> TradeSettings:
 async def save_settings(settings: TradeSettings, db_path: str = DB_PATH) -> None:
     async with aiosqlite.connect(db_path) as db:
         data = json.dumps(settings.to_dict())
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         await db.execute(
             "INSERT OR REPLACE INTO settings (id, data, updated_at) VALUES (1, ?, ?)",
             (data, now)
@@ -553,7 +700,7 @@ async def record_trade(
     demo_session_id: Optional[int] = None, objective_phase_id: Optional[int] = None, db_path: str = DB_PATH
 ) -> int:
     async with aiosqlite.connect(db_path) as db:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         cursor = await db.execute(
             """INSERT INTO trades (timestamp, symbol, direction, entry_price, sl_price, tp_price,
                lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk,
@@ -580,7 +727,7 @@ async def close_trade(
 ) -> None:
     """Close one recorded trade while retaining its learning outcome."""
     assignments = ["status = 'closed'", "pnl = ?", "closed_at = ?"]
-    values: list = [pnl, datetime.utcnow().isoformat()]
+    values: list = [pnl, datetime.now(timezone.utc).isoformat()]
     for column, value in (
         ("exit_price", exit_price),
         ("exit_reason", exit_reason),
@@ -647,7 +794,7 @@ async def record_setup(
     db_path: str = DB_PATH,
 ) -> int:
     """Store every qualifying, rejected, and executed setup hypothesis."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         cursor = await conn.execute(
             """INSERT INTO setup_records
@@ -685,7 +832,7 @@ async def update_setup_record(
 ) -> None:
     """Update a setup's execution link or counterfactual/realized outcome."""
     assignments = ["updated_at = ?"]
-    values: list = [datetime.utcnow().isoformat()]
+    values: list = [datetime.now(timezone.utc).isoformat()]
     for column, value in (
         ("status", status),
         ("setup_type", setup_type),
@@ -731,7 +878,7 @@ async def record_execution_event(
                 executed_price, slippage, execution_delay_ms, status, reason, details_json)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                datetime.utcnow().isoformat(), account_mode, setup_id, trade_id, ticket, symbol,
+                datetime.now(timezone.utc).isoformat(), account_mode, setup_id, trade_id, ticket, symbol,
                 requested_price, executed_price, slippage, execution_delay_ms, status, reason,
                 json.dumps(details or {}, sort_keys=True),
             ),
@@ -784,7 +931,7 @@ async def upsert_symbol_profile(
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(account_mode, symbol, timeframe)
                DO UPDATE SET metrics_json = excluded.metrics_json, updated_at = excluded.updated_at""",
-            (account_mode, symbol, timeframe, json.dumps(metrics, sort_keys=True), datetime.utcnow().isoformat()),
+            (account_mode, symbol, timeframe, json.dumps(metrics, sort_keys=True), datetime.now(timezone.utc).isoformat()),
         )
         await conn.commit()
 
@@ -880,7 +1027,7 @@ async def create_model_version(
 ) -> None:
     """Persist an immutable model candidate or champion with its evidence."""
     windows = windows or {}
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute(
             """INSERT INTO model_versions
@@ -958,7 +1105,7 @@ async def activate_model_version(
     db_path: str = DB_PATH,
 ) -> None:
     """Atomically replace the active champion while preserving version history."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute(
             "UPDATE model_versions SET status = 'superseded' WHERE account_mode = ? AND role = 'champion' AND status = 'active'",
@@ -987,7 +1134,7 @@ async def log_optimization_run(
             """INSERT INTO optimization_runs
                (account_mode, created_at, champion_version, challenger_version, decision, details_json)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (account_mode, datetime.utcnow().isoformat(), champion_version, challenger_version, decision, json.dumps(details, sort_keys=True)),
+            (account_mode, datetime.now(timezone.utc).isoformat(), champion_version, challenger_version, decision, json.dumps(details, sort_keys=True)),
         )
         await conn.commit()
 
@@ -1030,7 +1177,7 @@ async def upsert_research_hypothesis(
     db_path: str = DB_PATH,
 ) -> int:
     """Persist a falsifiable research hypothesis without overwriting prior evidence."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute(
             """INSERT INTO research_hypotheses
@@ -1103,7 +1250,7 @@ async def create_policy_experiment(
     db_path: str = DB_PATH,
 ) -> int:
     """Create an immutable policy experiment, returning its stable id."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute(
             """INSERT INTO policy_experiments
@@ -1133,7 +1280,7 @@ async def update_policy_experiment(
     db_path: str = DB_PATH,
 ) -> None:
     """Advance a policy experiment while retaining its immutable policy payload."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     fields = ["status = ?"]
     values: list = [status]
     if evaluation is not None:
@@ -1259,7 +1406,7 @@ async def get_today_pnl(account_mode: str = "demo", db_path: str = DB_PATH) -> f
 
 async def set_symbol_cooldown(symbol: str, db_path: str = DB_PATH) -> None:
     async with aiosqlite.connect(db_path) as db:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         await db.execute(
             "INSERT OR REPLACE INTO symbol_cooldowns (symbol, last_trade_time) VALUES (?, ?)",
             (symbol, now)
@@ -1399,7 +1546,7 @@ async def create_objective_draft(
     broker_universe: list[str], context: dict, db_path: str = DB_PATH,
 ) -> dict:
     """Persist one non-active objective draft; it has no execution authority."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         await conn.execute(
@@ -1461,7 +1608,7 @@ async def confirm_objective_draft(
     context: Optional[dict] = None, db_path: str = DB_PATH,
 ) -> Optional[dict]:
     """Activate the latest stored draft and preserve any prior objective as history."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute(
@@ -1499,7 +1646,7 @@ async def confirm_objective_draft(
 
 
 async def cancel_objective_draft(account_mode: str = "demo", db_path: str = DB_PATH) -> bool:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         cursor = await conn.execute(
             "UPDATE trading_objectives SET status = 'cancelled', cancelled_at = ? WHERE account_mode = ? AND status = 'draft'",
@@ -1524,7 +1671,7 @@ async def set_objective_scope_disabled(account_mode: str = "demo", disabled: boo
     if not disabled and operational.get("terminal"):
         return False
     operational["scope_disabled"] = bool(disabled)
-    operational["scope_disabled_at"] = datetime.utcnow().isoformat()
+    operational["scope_disabled_at"] = datetime.now(timezone.utc).isoformat()
     operational["scope_disabled_reason"] = "User disabled objective execution scope" if disabled else "User re-enabled objective execution scope"
     context["operational"] = operational
     updated = await update_active_objective_context(int(active["id"]), context, db_path)
@@ -1570,7 +1717,7 @@ async def mark_active_objective_terminal(
     terminal = {
         "outcome": str(outcome), "state": str(terminal_state),
         "demo_session_id": int(demo_session_id), "equity": float(terminal_equity),
-        "reason": str(reason), "recorded_at": datetime.utcnow().isoformat(),
+        "reason": str(reason), "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
     operational["terminal"] = terminal
     operational["status"] = "TERMINAL"
@@ -1615,7 +1762,7 @@ async def create_objective_phase_plan(
     """Persist one immutable milestone plan and activate its first phase."""
     if not phase_targets:
         raise ValueError("Objective phase plan requires at least one target")
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     prior = float(starting_equity)
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
@@ -1662,7 +1809,7 @@ async def activate_objective_recovery_phase(
     reason: str, db_path: str = DB_PATH,
 ) -> Optional[dict]:
     """Pause the current growth phase and activate the persisted session Phase 0."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute(
@@ -1722,7 +1869,7 @@ async def complete_objective_recovery_phase(
     db_path: str = DB_PATH,
 ) -> tuple[Optional[dict], Optional[dict]]:
     """Complete Phase 0 at the session start balance and restart Phase 1."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute("SELECT * FROM objective_phases WHERE id = ?", (int(phase_id),))
@@ -1879,7 +2026,7 @@ async def complete_objective_phase(
     db_path: str = DB_PATH,
 ) -> tuple[Optional[dict], Optional[dict]]:
     """Freeze an active phase and atomically begin its preplanned successor, if any."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute("SELECT * FROM objective_phases WHERE id = ?", (int(phase_id),))
@@ -1917,7 +2064,7 @@ async def fail_objective_phase(
     phase_id: int, *, ending_equity: float, reason: str, metrics: dict,
     db_path: str = DB_PATH,
 ) -> Optional[dict]:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         await conn.execute(
@@ -1978,7 +2125,7 @@ async def get_performance_summary(account_mode: str, days: Optional[int] = None,
 async def log_trade_action(ticket: int, action: str, details: str = "", trade_id: int = None, db_path: str = DB_PATH) -> None:
     """Record a management action for a specific trade."""
     async with aiosqlite.connect(db_path) as db:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         await db.execute(
             "INSERT INTO trade_logs (trade_id, ticket, timestamp, action, details) VALUES (?, ?, ?, ?, ?)",
             (trade_id, ticket, now, action, details)
@@ -2018,7 +2165,7 @@ async def create_trade_basket(
     db_path: str = DB_PATH,
 ) -> int:
     """Persist one setup-level risk budget and its future layer plan."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         cursor = await conn.execute(
             """INSERT INTO trade_baskets
@@ -2063,7 +2210,7 @@ async def record_trade_layer(
     db_path: str = DB_PATH,
 ) -> int:
     """Record a planned or executed layer without treating it as separate risk."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         cursor = await conn.execute(
             """INSERT INTO trade_layers
@@ -2139,7 +2286,7 @@ async def update_basket_state(
 ) -> None:
     """Update management state with an atomic timestamp refresh."""
     assignments = ["updated_at = ?"]
-    values: list = [datetime.utcnow().isoformat()]
+    values: list = [datetime.now(timezone.utc).isoformat()]
     if state is not None:
         assignments.append("state = ?")
         values.append(state)
@@ -2168,7 +2315,7 @@ async def update_trade_layer(
 ) -> None:
     """Persist the latest layer execution or management state."""
     assignments = ["updated_at = ?"]
-    values: list = [datetime.utcnow().isoformat()]
+    values: list = [datetime.now(timezone.utc).isoformat()]
     for column, value in (
         ("status", status),
         ("ticket", ticket),
@@ -2264,7 +2411,7 @@ async def create_capital_reduction_session(
     db_path: str = DB_PATH,
 ) -> int:
     """Create an isolated DEMO reduction session; it never creates a strategy trade."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         cursor = await conn.execute(
             """INSERT INTO capital_reduction_sessions
@@ -2327,16 +2474,16 @@ async def update_capital_reduction_session(
 ) -> None:
     """Update session state without writing to normal trading/learning tables."""
     fields = ["updated_at = ?"]
-    values: list[Any] = [datetime.utcnow().isoformat()]
+    values: list[Any] = [datetime.now(timezone.utc).isoformat()]
     if status is not None:
         fields.append("status = ?")
         values.append(status)
         if status == "paused":
             fields.append("paused_at = ?")
-            values.append(datetime.utcnow().isoformat())
+            values.append(datetime.now(timezone.utc).isoformat())
         if status in {"completed", "cancelled", "blocked", "failed"}:
             fields.append("completed_at = ?")
-            values.append(datetime.utcnow().isoformat())
+            values.append(datetime.now(timezone.utc).isoformat())
     if current_equity is not None:
         fields.append("current_equity = ?")
         values.append(float(current_equity))
@@ -2373,7 +2520,7 @@ async def record_capital_reduction_action(
     details: Optional[dict] = None,
     db_path: str = DB_PATH,
 ) -> int:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         cursor = await conn.execute(
             """INSERT INTO capital_reduction_actions
@@ -2484,7 +2631,7 @@ async def upsert_account_state(
     db_path: str = DB_PATH,
 ) -> None:
     """Persist one authoritative broker-account state row per account mode."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     previous = await get_account_state(account_mode, db_path)
     changed_at = now if not previous or previous.get("state") != state else previous.get("state_changed_at", now)
     async with aiosqlite.connect(db_path) as conn:
@@ -2525,7 +2672,7 @@ async def create_demo_session(
     objective_id: Optional[int] = None, objective_version: Optional[int] = None,
     db_path: str = DB_PATH,
 ) -> int:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         cursor = await conn.execute(
             """INSERT INTO demo_sessions
@@ -2658,7 +2805,7 @@ async def close_demo_session(
         await conn.execute(
             """UPDATE demo_sessions SET status = ?, ended_at = ?, end_balance = ?, end_equity = ?,
                exhaustion_reason = ?, reset_detected_at = ? WHERE id = ?""",
-            (status, datetime.utcnow().isoformat(), float(balance), float(equity), exhaustion_reason, reset_detected_at, int(session_id)),
+            (status, datetime.now(timezone.utc).isoformat(), float(balance), float(equity), exhaustion_reason, reset_detected_at, int(session_id)),
         )
         await conn.commit()
 
@@ -2674,7 +2821,7 @@ async def claim_objective_session_review(
                (demo_session_id, objective_id, outcome, terminal_state, created_at, summary_json)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (int(demo_session_id), objective_id, str(outcome), str(terminal_state),
-             datetime.utcnow().isoformat(), json.dumps(summary or {}, sort_keys=True)),
+             datetime.now(timezone.utc).isoformat(), json.dumps(summary or {}, sort_keys=True)),
         )
         await conn.commit()
         return cursor.rowcount > 0
@@ -2689,7 +2836,7 @@ async def complete_objective_session_review(
             """UPDATE objective_session_reviews
                SET completed_at = ?, summary_json = ?, optimization_json = ?
                WHERE demo_session_id = ?""",
-            (datetime.utcnow().isoformat(), json.dumps(summary or {}, sort_keys=True),
+            (datetime.now(timezone.utc).isoformat(), json.dumps(summary or {}, sort_keys=True),
              json.dumps(optimization or {}, sort_keys=True), int(demo_session_id)),
         )
         await conn.commit()
@@ -2723,7 +2870,7 @@ async def record_account_state_event(
                 balance, equity, free_margin, margin_level, minimum_operating_capital, details_json)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (account_mode, broker_login, demo_session_id, event_type, state,
-             datetime.utcnow().isoformat(), balance, equity, free_margin,
+             datetime.now(timezone.utc).isoformat(), balance, equity, free_margin,
              margin_level, minimum_operating_capital, json.dumps(details or {}, sort_keys=True)),
         )
         await conn.commit()
@@ -2895,7 +3042,7 @@ async def upsert_strategy_evidence(
             max_drawdown = min(max_drawdown, cumulative - peak)
         confidence = _strategy_confidence(trades, expectancy)
         statistics = completed_outcome_statistics(evidence_rows)
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         await conn.execute(
             """INSERT INTO strategy_evidence
                    (account_mode, symbol, strategy_id, regime, timeframe, trades, wins, losses,
@@ -3072,7 +3219,7 @@ async def upsert_strategy_transition_evidence(
             peak = max(peak, cumulative)
             max_drawdown = min(max_drawdown, cumulative - peak)
         confidence = _strategy_confidence(sample_size, expectancy)
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         await conn.execute(
             """INSERT INTO strategy_transition_evidence
                    (account_mode, symbol, strategy_id, previous_regime, regime, regime_transition,
@@ -3121,7 +3268,7 @@ async def ensure_expert_knowledge_seeded(account_mode: str = "demo", db_path: st
     from analysis.expert_knowledge import catalog_rows
 
     rows = catalog_rows()
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     inserted = 0
     async with aiosqlite.connect(db_path) as conn:
         for item in rows:
@@ -3170,7 +3317,7 @@ async def record_expert_hypothesis_test(
         forward_sample_size=forward_sample_size,
         historical_sample_size=historical_sample_size,
     )
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute(

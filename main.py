@@ -26,6 +26,7 @@ from bot.handlers import BotHandlers
 from executors.mt5 import MT5Executor, MT5_AVAILABLE
 from risk.manager import RiskManager
 from scheduler import MarketScheduler
+from communication.events import DeliveryChannel, EventSeverity, NotificationEvent
 
 # ─── Logging ──────────────────────────────────────────────
 # Windows VPS consoles may default to CP1252, which cannot encode the emoji
@@ -127,6 +128,7 @@ async def main():
         risk_manager=risk_manager,
         bot_app=app,
         admin_chat_id=admin_ids[0] if admin_ids else None,
+        db_path=db_path,
     )
 
     # Create handlers
@@ -191,22 +193,22 @@ async def main():
     except Exception:
         logger.exception("Could not publish Telegram command menu; control plane remains online")
 
-    if admin_ids:
-        for admin_id in admin_ids:
-            try:
-                status_msg = "\n".join([
-                    "🤖 **SMC Trading Bot Started**",
-                    "",
-                    f"Mode: `{settings.trading_mode.upper()}`",
-                    f"Auto-Trade: `{'ON' if settings.auto_trade else 'OFF'}`",
-                    "Telegram control plane: `ONLINE`",
-                    "MT5 broker subsystem: `STARTING`",
-                    "",
-                    "Use `/engine` or `/health` for live subsystem status.",
-                ])
-                await asyncio.wait_for(app.bot.send_message(admin_id, status_msg), timeout=15.0)
-            except Exception:
-                logger.exception("Failed to send Telegram startup status to %s", admin_id)
+    await scheduler.notification_manager.publish(NotificationEvent(
+        event_type="bot_started",
+        message="\n".join([
+            "🤖 **SMC Trading Bot Started**",
+            "",
+            f"Mode: `{settings.trading_mode.upper()}`",
+            f"Auto-Trade: `{'ON' if settings.auto_trade else 'OFF'}`",
+            "Telegram control plane: `ONLINE`",
+            "MT5 broker subsystem: `STARTING`",
+            "",
+            "Use `/engine` or `/health` for live subsystem status.",
+        ]),
+        severity=EventSeverity.IMPORTANT,
+        channels=(DeliveryChannel.TELEGRAM, DeliveryChannel.SLACK),
+        dedupe_key="bot_started",
+    ))
 
     logger.info("🚀 Telegram control plane is online; broker subsystem startup is running in background")
     logger.info(f"Admin IDs: {admin_ids}")
@@ -217,30 +219,26 @@ async def main():
         try:
             await scheduler.start(interval_seconds=60)
             logger.info("Broker subsystem startup completed")
-            if admin_ids:
-                for admin_id in admin_ids:
-                    try:
-                        connected = bool(executor and await asyncio.wait_for(executor.is_connected(), timeout=10.0))
-                        status = "CONNECTED" if connected else "DISCONNECTED"
-                        await app.bot.send_message(
-                            admin_id,
-                            f"🩺 **BROKER SUBSYSTEM READY**\n\nMT5: `{status}`\nMarket engine: `{'ARMED' if scheduler._running else 'NOT READY'}`\nUse `/engine` for details.",
-                        )
-                    except Exception:
-                        logger.exception("Failed to send broker startup status to %s", admin_id)
+            connected = bool(executor and await asyncio.wait_for(executor.is_connected(), timeout=10.0))
+            status = "CONNECTED" if connected else "DISCONNECTED"
+            await scheduler.notification_manager.publish(NotificationEvent(
+                event_type="broker_status",
+                message=f"🩺 **BROKER SUBSYSTEM READY**\n\nMT5: `{status}`\nMarket engine: `{'ARMED' if scheduler._running else 'NOT READY'}`\nUse `/engine` for details.",
+                severity=EventSeverity.IMPORTANT,
+                channels=(DeliveryChannel.TELEGRAM, DeliveryChannel.SLACK),
+                dedupe_key=f"broker_ready:{status}",
+            ))
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Broker subsystem startup failed; Telegram control plane remains online")
-            if admin_ids:
-                for admin_id in admin_ids:
-                    try:
-                        await app.bot.send_message(
-                            admin_id,
-                            "⚠️ **BROKER SUBSYSTEM UNAVAILABLE**\n\nTelegram remains online. MT5-dependent trading is disabled until broker health recovers.",
-                        )
-                    except Exception:
-                        logger.exception("Failed to send broker failure status to %s", admin_id)
+            await scheduler.notification_manager.publish(NotificationEvent(
+                event_type="critical_broker_failure",
+                message="⚠️ **BROKER SUBSYSTEM UNAVAILABLE**\n\nTelegram remains online. MT5-dependent trading is disabled until broker health recovers.",
+                severity=EventSeverity.CRITICAL,
+                channels=(DeliveryChannel.TELEGRAM, DeliveryChannel.SLACK),
+                dedupe_key="broker_subsystem_unavailable",
+            ))
 
     broker_startup_task = asyncio.create_task(_start_broker_subsystem(), name="broker_subsystem_startup")
 
