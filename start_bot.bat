@@ -14,7 +14,7 @@ if not exist "venv\Scripts\python.exe" (
     exit /b 1
 )
 
-"venv\Scripts\python.exe" -u main.py >> "logs\bot_runtime.log" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { & .\venv\Scripts\python.exe -u .\main.py 2>&1 | Tee-Object -FilePath .\logs\bot_runtime.log -Append; exit $LASTEXITCODE }"
 set EXIT_CODE=%ERRORLEVEL%
 echo [%date% %time%] Bot process exited with code %EXIT_CODE%. >> "logs\bot_runtime.log"
 echo Bot process exited with code %EXIT_CODE%. Review logs\bot_runtime.log

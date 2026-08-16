@@ -165,6 +165,22 @@ async def main():
     ]
     await app.bot.set_my_commands(commands)
 
+    # Send an early liveness notice before broker discovery and account
+    # reconciliation. Those broker operations may legitimately take time; the
+    # user must still know that the Python process and Telegram connection are alive.
+    if admin_ids:
+        for admin_id in admin_ids:
+            try:
+                await asyncio.wait_for(
+                    app.bot.send_message(
+                        admin_id,
+                        "🔄 **SMC Trading Bot process online**\n\nInitializing MT5 connection and broker universe; detailed startup status will follow.",
+                    ),
+                    timeout=15.0,
+                )
+            except Exception as e:
+                logger.error(f"Failed to send early startup notice to {admin_id}: {e}")
+
     # Start scheduler
     await scheduler.start(interval_seconds=60)  # closed-candle scan every minute; broker-validation heartbeat every 10 minutes
 
