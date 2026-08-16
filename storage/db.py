@@ -621,8 +621,8 @@ async def get_pending_notification_events(limit: int = 50, db_path: str = DB_PAT
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """SELECT DISTINCT e.event_id, e.event_type, e.severity, e.message,
-                      e.dedupe_key, e.payload_json, e.channels_json
+            """SELECT e.event_id, e.event_type, e.severity, e.message,
+                      e.dedupe_key, e.payload_json, d.channel
                FROM notification_events e
                JOIN notification_deliveries d ON d.event_id = e.event_id
                WHERE e.persistent = 1 AND d.status != 'DELIVERED'
@@ -630,18 +630,19 @@ async def get_pending_notification_events(limit: int = 50, db_path: str = DB_PAT
             (limit,),
         )
         rows = await cursor.fetchall()
-    return [
-        {
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        item = grouped.setdefault(row["event_id"], {
             "event_id": row["event_id"],
             "event_type": row["event_type"],
             "severity": row["severity"],
             "message": row["message"],
             "dedupe_key": row["dedupe_key"],
             "payload": json.loads(row["payload_json"] or "{}"),
-            "channels": json.loads(row["channels_json"] or "[]"),
-        }
-        for row in rows
-    ]
+            "channels": [],
+        })
+        item["channels"].append(row["channel"])
+    return list(grouped.values())
 
 
 async def record_command_audit(

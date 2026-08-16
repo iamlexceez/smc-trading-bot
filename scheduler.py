@@ -573,6 +573,9 @@ class MarketScheduler:
     async def _heartbeat_job(self):
         return await self._run_scheduled_task("activity_heartbeat", "10 minutes", self.send_activity_heartbeat)
 
+    async def _notification_retry_job(self):
+        return await self._run_scheduled_task("notification_retry", "60 seconds", self.notification_manager.retry_pending)
+
     async def _optimization_job(self):
         return await self._run_scheduled_task("self_optimization", "daily", self.run_self_optimization)
 
@@ -652,6 +655,12 @@ class MarketScheduler:
             self._heartbeat_job,
             IntervalTrigger(minutes=10),
             id="activity_heartbeat",
+            replace_existing=True,
+        )
+        self.scheduler.add_job(
+            self._notification_retry_job,
+            IntervalTrigger(seconds=60),
+            id="notification_retry",
             replace_existing=True,
         )
         self.scheduler.start()

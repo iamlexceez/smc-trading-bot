@@ -27,6 +27,9 @@ from executors.mt5 import MT5Executor, MT5_AVAILABLE
 from risk.manager import RiskManager
 from scheduler import MarketScheduler
 from communication.events import DeliveryChannel, EventSeverity, NotificationEvent
+from communication.command_bus import CommandBus
+from communication.control_service import SharedControlService, build_command_bus
+from communication.slack_control import SlackSocketControl
 
 # ─── Logging ──────────────────────────────────────────────
 # Windows VPS consoles may default to CP1252, which cannot encode the emoji
@@ -131,6 +134,13 @@ async def main():
         db_path=db_path,
     )
 
+    # One command bus is shared by every future communication adapter. The
+    # existing Telegram handlers remain compatible while Slack control is
+    # enabled only when its explicit credentials and allow-list are present.
+    control_service = SharedControlService(settings, scheduler, db_path=db_path)
+    command_bus = build_command_bus(control_service)
+    slack_control = SlackSocketControl(command_bus)
+
     # Create handlers
     handlers = BotHandlers(
         settings=settings,
@@ -188,6 +198,7 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=["message", "callback_query"])
+    await slack_control.start()
     try:
         await app.bot.set_my_commands(commands)
     except Exception:
@@ -252,6 +263,7 @@ async def main():
         if not broker_startup_task.done():
             broker_startup_task.cancel()
             await asyncio.gather(broker_startup_task, return_exceptions=True)
+        await slack_control.stop()
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
