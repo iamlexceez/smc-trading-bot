@@ -2415,6 +2415,14 @@ class BotHandlers:
             await query.edit_message_text("Action cancelled.", reply_markup=keyboards.main_menu())
         elif data == "scan":
             await self.cmd_scan(update, context)
+        elif data == "positions":
+            await self.cmd_positions(update, context)
+        elif data == "settings":
+            await self.cmd_settings(update, context)
+        elif data == "account":
+            await self.cmd_account(update, context)
+        elif data == "history":
+            await self.cmd_history(update, context)
         elif data == "debug_mt5":
             await self.cmd_debug_mt5(update, context)
         elif data == "safety":

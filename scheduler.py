@@ -97,6 +97,7 @@ class MarketScheduler:
             "updated_at": None, "analysis_symbols": 0,
         }
         self._active_scan_cycle_id: str | None = None
+        self._manual_scan_requested: bool = False
         self._last_scan_disposition: dict = {
             "state": "NOT_SCANNED", "reason": "No scan has completed in this process.",
             "symbols_discovered": 0, "symbols_targeted": 0, "symbols_eligible": 0,
@@ -2671,12 +2672,15 @@ class MarketScheduler:
             logger.info("[SCANNER START] cycle=%s timestamp=%s", self._active_scan_cycle_id, datetime.utcnow().isoformat())
             
             # Immediate feedback for detailed mode
-            await self._chart_activity(
-                "scan_started", "SYSTEM",
-                f"🔍 **MARKET SCAN STARTED**\nCycle: `{self._active_scan_cycle_id[:8]}`\nThe bot is evaluating the broker universe...",
-                fingerprint=f"scan_start:{self._active_scan_cycle_id}",
-                essential=False, # Only shows in detailed mode
-            )
+            try:
+                await self._chart_activity(
+                    "scan_started", "SYSTEM",
+                    f"🔍 **MARKET SCAN STARTED**\nCycle: `{self._active_scan_cycle_id[:8]}`\nThe bot is evaluating the broker universe...",
+                    fingerprint=f"scan_start:{self._active_scan_cycle_id}",
+                    essential=False, # Only shows in detailed mode
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send scan start notification: {e}")
             
             try:
                 # Bounded scan execution: ensure the lock is released even if
@@ -2717,12 +2721,15 @@ class MarketScheduler:
                 
                 # Summary feedback for detailed mode if no trade was opened
                 if not result or not result.get("order_submitted"):
-                    await self._chart_activity(
-                        "scan_completed", "SYSTEM",
-                        f"✅ **MARKET SCAN COMPLETED**\nCycle: `{self._active_scan_cycle_id[:8]}`\nAnalyzed: `{disposition.get('symbols_analyzed', 0)}` | Rejected: `{disposition.get('symbols_rejected', 0)}` | Failed: `{disposition.get('symbols_failed', 0)}`\nResult: No executable setups found. Monitoring continues...",
-                        fingerprint=f"scan_end:{self._active_scan_cycle_id}",
-                        essential=False,
-                    )
+                    try:
+                        await self._chart_activity(
+                            "scan_completed", "SYSTEM",
+                            f"✅ **MARKET SCAN COMPLETED**\nCycle: `{self._active_scan_cycle_id[:8]}`\nAnalyzed: `{disposition.get('symbols_analyzed', 0)}` | Rejected: `{disposition.get('symbols_rejected', 0)}` | Failed: `{disposition.get('symbols_failed', 0)}`\nResult: No executable setups found. Monitoring continues...",
+                            fingerprint=f"scan_end:{self._active_scan_cycle_id}",
+                            essential=False,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to send scan completion notification: {e}")
 
             logger.info("[SCANNER COMPLETE] cycle=%s disposition=%s duration=%.3fs", self._active_scan_cycle_id, disposition, perf_counter() - started)
             self._active_scan_cycle_id = None
