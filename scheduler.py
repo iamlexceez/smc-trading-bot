@@ -354,22 +354,26 @@ class MarketScheduler:
         context = dict(active.get("context") or {})
         operational = dict(context.get("operational") or {})
         if operational.get("scope_disabled"):
-            usable = sorted({str(symbol) for symbol in broker_usable_symbols if str(symbol).strip()})
+            # Even in standalone mode, we limit the analysis universe to prevent
+            # VPS overload and extremely slow scan cycles.  We use the top-ranked
+            # markets from the evidence-first research governance.
+            limit = max(1, int(self.settings.research_market_limit))
+            selected = list(snapshot["market_selection"]["selected_symbols"])
             self._operational_objective = {
                 "id": active.get("id"), "version": active.get("version"),
                 "status": "STANDALONE", "scope_disabled": True,
-                "allowed_symbols": usable,
+                "allowed_symbols": selected,
                 "scope_disabled_reason": operational.get("scope_disabled_reason") or "User disabled objective execution scope",
             }
             snapshot["market_selection"] = {
                 **snapshot["market_selection"],
                 "state": "standalone_broker_universe",
-                "analysis_symbols": usable,
-                "selected_symbols": usable,
-                "disabled_symbols": [],
-                "selection_explanation": "Objective scope is disabled. The existing standalone DEMO scanner uses the current broker-verified Synthetic Index / Gold universe; ranking, evidence, broker validation, and final execution gates remain active.",
+                "analysis_symbols": selected,
+                "selected_symbols": selected,
+                "disabled_symbols": [s for s in broker_usable_symbols if s not in selected],
+                "selection_explanation": f"Objective scope is disabled. Standalone scanning is limited to the top {limit} evidence-ranked markets to maintain responsiveness; use /markets to see the full universe.",
             }
-            return usable
+            return selected
         active = await self._ensure_objective_phase_plan(active)
         if active.get("is_paused"):
             self._operational_objective = {"id": active.get("id"), "version": active.get("version"), "status": "PAUSED"}
@@ -2666,7 +2670,16 @@ class MarketScheduler:
             self.telemetry.increment("scan_cycles_started")
             logger.info("[SCANNER START] cycle=%s timestamp=%s", self._active_scan_cycle_id, datetime.utcnow().isoformat())
             try:
-                result = await self._scan_and_execute()
+                # Bounded scan execution: ensure the lock is released even if
+                # a broker operation or analysis loop hangs or takes too long.
+                result = await asyncio.wait_for(self._scan_and_execute(), timeout=240.0)
+            except asyncio.TimeoutError:
+                self.telemetry.increment("scan_cycles_failed")
+                self.telemetry.component_failed("market_scanner", TimeoutError("Scan cycle timed out after 240 seconds"))
+                self._set_scan_disposition("FAILED", "Scan cycle timed out after 240 seconds")
+                logger.error("[SCANNER TIMEOUT] cycle=%s duration > 240s; lock will be released", self._active_scan_cycle_id)
+                self._active_scan_cycle_id = None
+                return {"state": "FAILED", "reason": "timeout"}
             except Exception as exc:
                 self.telemetry.increment("scan_cycles_failed")
                 self.telemetry.component_failed("market_scanner", exc)
@@ -2804,9 +2817,18 @@ class MarketScheduler:
                 # For the background loop, we analyze and execute.
                 self.telemetry.component_started("analysis_engine")
                 try:
-                    signal = await self.analyze_symbol(symbol)
+                    # Per-symbol analysis timeout: ensure one slow instrument
+                    # doesn't stall the entire scan cycle.
+                    signal = await asyncio.wait_for(self.analyze_symbol(symbol), timeout=30.0)
                     analyzed_count += 1
                     self.telemetry.increment("symbols_analyzed")
+                except asyncio.TimeoutError:
+                    failed_count += 1
+                    self.telemetry.increment("symbols_failed")
+                    self.telemetry.increment("analysis_failures")
+                    self.telemetry.component_failed("analysis_engine", TimeoutError(f"Analysis for {symbol} timed out after 30s"))
+                    logger.error("[SYMBOL TIMEOUT] %s analysis exceeded 30s; skipping", symbol)
+                    continue
                 except Exception as exc:
                     failed_count += 1
                     self.telemetry.increment("symbols_failed")

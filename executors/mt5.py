@@ -27,10 +27,13 @@ except ImportError:
     logger.warning("MetaTrader5 not installed. Install with: pip install MetaTrader5")
 
 
+from concurrent.futures import ThreadPoolExecutor
+
 class MT5Executor(BaseExecutor):
     name = "mt5"
 
     def __init__(self, login: int, password: str, server: str, path: Optional[str] = None):
+        self._thread_pool = ThreadPoolExecutor(max_workers=1) # MT5 is not thread-safe; use one worker
         self.login = login
         self.password = password
         self.server = server
@@ -38,6 +41,11 @@ class MT5Executor(BaseExecutor):
         self._connected = False
         self.last_symbol_discovery_error = ""
         self.last_symbol_discovery_count = 0
+
+    async def _run_sync(self, func, *args, **kwargs):
+        """Run a synchronous MT5 call in the thread pool to avoid blocking the event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._thread_pool, lambda: func(*args, **kwargs))
 
     async def connect(self) -> bool:
         if not MT5_AVAILABLE:
@@ -72,27 +80,27 @@ class MT5Executor(BaseExecutor):
             if p:
                 kwargs["path"] = p
             
-            if mt5.initialize(**kwargs):
+            if await self._run_sync(mt5.initialize, **kwargs):
                 initialized = True
                 logger.info(f"MT5 initialized successfully using path: {p}")
                 break
             else:
-                error = mt5.last_error()
+                error = await self._run_sync(mt5.last_error)
 
         if not initialized:
             logger.error(f"MT5 initialize failed for {self.login} @ {self.server}. Last error: {error}")
             return False
 
         # Verify account matches the credentials
-        acc_info = mt5.account_info()
+        acc_info = await self._run_sync(mt5.account_info)
         if acc_info is None:
             logger.error("Failed to get account info after initialization")
-            mt5.shutdown()
+            await self._run_sync(mt5.shutdown)
             return False
         
         if acc_info.login != self.login:
             logger.error(f"Account mismatch: requested {self.login}, got {acc_info.login}")
-            mt5.shutdown()
+            await self._run_sync(mt5.shutdown)
             return False
 
         self._connected = True
@@ -102,7 +110,8 @@ class MT5Executor(BaseExecutor):
     async def is_connected(self) -> bool:
         if not MT5_AVAILABLE:
             return False
-        return self._connected and mt5.terminal_info() is not None
+        term_info = await self._run_sync(mt5.terminal_info)
+        return self._connected and term_info is not None
 
     async def _ensure_connected(self) -> bool:
         """Helper to ensure MT5 is connected before any operation."""
@@ -117,7 +126,7 @@ class MT5Executor(BaseExecutor):
         if not await self._ensure_connected():
             return {}
 
-        info = mt5.account_info()
+        info = await self._run_sync(mt5.account_info)
         if info is None:
             return {}
         account_trade_mode = int(getattr(info, "trade_mode", -1))
@@ -158,13 +167,13 @@ class MT5Executor(BaseExecutor):
         if not MT5_AVAILABLE:
             return {"current": False, "error": "MetaTrader5 package not installed"}
         if not await self._ensure_connected():
-            return {"current": False, "error": f"MT5 connection unavailable: {mt5.last_error()}"}
+            return {"current": False, "error": f"MT5 connection unavailable: {await self._run_sync(mt5.last_error)}"}
         account = await self.get_account_info()
         if not account:
             return {"current": False, "error": "MT5 account_info returned no data"}
 
-        positions = mt5.positions_get() or ()
-        orders = mt5.orders_get() or ()
+        positions = await self._run_sync(mt5.positions_get) or ()
+        orders = await self._run_sync(mt5.orders_get) or ()
         buy_type = getattr(mt5, "POSITION_TYPE_BUY", 0)
         order_type_names = {
             getattr(mt5, "ORDER_TYPE_BUY_LIMIT", -1): "buy_limit",
@@ -186,10 +195,10 @@ class MT5Executor(BaseExecutor):
             potential_sl = 0.0
             potential_tp = 0.0
             if sl > 0:
-                calculated = mt5.order_calc_profit(order_type, position.symbol, volume, entry, sl)
+                calculated = await self._run_sync(mt5.order_calc_profit, order_type, position.symbol, volume, entry, sl)
                 potential_sl = float(calculated or 0.0)
             if tp > 0:
-                calculated = mt5.order_calc_profit(order_type, position.symbol, volume, entry, tp)
+                calculated = await self._run_sync(mt5.order_calc_profit, order_type, position.symbol, volume, entry, tp)
                 potential_tp = float(calculated or 0.0)
             distance_sl = abs(current - sl) if current and sl else None
             distance_tp = abs(tp - current) if current and tp else None
@@ -220,7 +229,7 @@ class MT5Executor(BaseExecutor):
         for order in orders:
             symbol = str(getattr(order, "symbol", ""))
             entry_price = float(getattr(order, "price_open", 0.0) or 0.0)
-            tick = mt5.symbol_info_tick(symbol)
+            tick = await self._run_sync(mt5.symbol_info_tick, symbol)
             current_price = ((float(getattr(tick, "bid", 0.0) or 0.0) + float(getattr(tick, "ask", 0.0) or 0.0)) / 2) if tick else 0.0
             order_rows.append({
                 "ticket": int(getattr(order, "ticket", 0)),
@@ -242,7 +251,7 @@ class MT5Executor(BaseExecutor):
         history_rows = []
         if history_days > 0:
             start = end - timedelta(days=int(history_days))
-            deals = mt5.history_deals_get(start, end) or ()
+            deals = await self._run_sync(mt5.history_deals_get, start, end) or ()
             close_entries = {getattr(mt5, "DEAL_ENTRY_OUT", 1), getattr(mt5, "DEAL_ENTRY_OUT_BY", 3)}
             for deal in deals:
                 if getattr(deal, "entry", None) not in close_entries:
@@ -277,9 +286,9 @@ class MT5Executor(BaseExecutor):
         
         await self._ensure_connected()
 
-        term_info = mt5.terminal_info()
-        acc_info = mt5.account_info()
-        last_error = mt5.last_error()
+        term_info = await self._run_sync(mt5.terminal_info)
+        acc_info = await self._run_sync(mt5.account_info)
+        last_error = await self._run_sync(mt5.last_error)
         
         diag = {
             "available": True,
@@ -316,7 +325,7 @@ class MT5Executor(BaseExecutor):
         if not await self._ensure_connected():
             return (0.0, 0.0)
 
-        tick = mt5.symbol_info_tick(symbol)
+        tick = await self._run_sync(mt5.symbol_info_tick, symbol)
         if tick is None:
             return (0.0, 0.0)
         return (tick.bid, tick.ask)
@@ -356,18 +365,20 @@ class MT5Executor(BaseExecutor):
             result["error"] = "MetaTrader5 package not installed"
             return result
         if not await self._ensure_connected():
-            result["error"] = f"MT5 connection unavailable: {mt5.last_error()}"
+            result["error"] = f"MT5 connection unavailable: {await self._run_sync(mt5.last_error)}"
             return result
-        selected = bool(mt5.symbol_select(symbol, True))
+        selected = bool(await self._run_sync(mt5.symbol_select, symbol, True))
         result["selected"] = selected
         if not selected:
-            result["error"] = f"MT5 symbol_select failed: {mt5.last_error()}"
+            last_err = await self._run_sync(mt5.last_error)
+            result["error"] = f"MT5 symbol_select failed: {last_err}"
             return result
-        info = mt5.symbol_info(symbol)
+        info = await self._run_sync(mt5.symbol_info, symbol)
         if info is None:
-            result["error"] = f"MT5 symbol_info returned no data: {mt5.last_error()}"
+            last_err = await self._run_sync(mt5.last_error)
+            result["error"] = f"MT5 symbol_info returned no data: {last_err}"
             return result
-        tick = mt5.symbol_info_tick(symbol)
+        tick = await self._run_sync(mt5.symbol_info_tick, symbol)
         bid = getattr(tick, "bid", None) if tick else None
         ask = getattr(tick, "ask", None) if tick else None
         last = getattr(tick, "last", None) if tick else None
@@ -410,11 +421,12 @@ class MT5Executor(BaseExecutor):
             if price is None or float(price) <= 0 or volume <= 0:
                 result["margin_error"] = "No positive executable price or minimum volume for margin calculation"
             else:
-                margin = mt5.order_calc_margin(order_type, symbol, volume, float(price))
+                margin = await self._run_sync(mt5.order_calc_margin, order_type, symbol, volume, float(price))
                 result["margin_required"] = margin
                 result["margin_source"] = "order_calc_margin"
                 if margin is None:
-                    result["margin_error"] = f"MT5 order_calc_margin returned no data: {mt5.last_error()}"
+                    last_err = await self._run_sync(mt5.last_error)
+                    result["margin_error"] = f"MT5 order_calc_margin returned no data: {last_err}"
         except Exception as exc:
             result["margin_error"] = f"MT5 order_calc_margin raised {type(exc).__name__}: {exc}"
         return result
@@ -493,15 +505,17 @@ class MT5Executor(BaseExecutor):
             result["reason"] = "MetaTrader5 package not available"
             return result
         if not await self._ensure_connected():
-            result["reason"] = f"MT5 not connected: {mt5.last_error()}"
+            result["reason"] = f"MT5 not connected: {await self._run_sync(mt5.last_error)}"
             return result
-        if not mt5.symbol_select(symbol, True):
-            result["reason"] = f"MT5 symbol_select failed: {mt5.last_error()}"
+        if not await self._run_sync(mt5.symbol_select, symbol, True):
+            last_err = await self._run_sync(mt5.last_error)
+            result["reason"] = f"MT5 symbol_select failed: {last_err}"
             return result
-        info = mt5.symbol_info(symbol)
-        tick = mt5.symbol_info_tick(symbol)
+        info = await self._run_sync(mt5.symbol_info, symbol)
+        tick = await self._run_sync(mt5.symbol_info_tick, symbol)
         if info is None or tick is None:
-            result["reason"] = f"MT5 symbol metadata/tick unavailable: {mt5.last_error()}"
+            last_err = await self._run_sync(mt5.last_error)
+            result["reason"] = f"MT5 symbol metadata/tick unavailable: {last_err}"
             return result
         result = self._normalise_protective_levels(
             direction=direction, bid=float(getattr(tick, "bid", 0.0) or 0.0), ask=float(getattr(tick, "ask", 0.0) or 0.0),
@@ -523,21 +537,23 @@ class MT5Executor(BaseExecutor):
             result["error"] = "MetaTrader5 package not installed"
             return result
         if not await self._ensure_connected():
-            result["error"] = f"MT5 connection unavailable: {mt5.last_error()}"
+            result["error"] = f"MT5 connection unavailable: {await self._run_sync(mt5.last_error)}"
             return result
-        if not mt5.symbol_select(symbol, True):
-            result["error"] = f"MT5 symbol_select failed: {mt5.last_error()}"
+        if not await self._run_sync(mt5.symbol_select, symbol, True):
+            last_err = await self._run_sync(mt5.last_error)
+            result["error"] = f"MT5 symbol_select failed: {last_err}"
             return result
-        info = mt5.symbol_info(symbol)
+        info = await self._run_sync(mt5.symbol_info, symbol)
         if info is None:
-            result["error"] = f"MT5 symbol_info returned no data: {mt5.last_error()}"
+            last_err = await self._run_sync(mt5.last_error)
+            result["error"] = f"MT5 symbol_info returned no data: {last_err}"
             return result
         normalized = self._normalise_broker_volume(volume, getattr(info, "volume_min", None), getattr(info, "volume_max", None), getattr(info, "volume_step", None))
         result["normalized_volume"] = normalized
         if normalized is None:
             result["error"] = "Requested volume cannot be normalized to broker min/max/step"
             return result
-        tick = mt5.symbol_info_tick(symbol)
+        tick = await self._run_sync(mt5.symbol_info_tick, symbol)
         buy = str(direction).upper() != "SELL"
         fallback_price = getattr(tick, "ask", None) if buy else getattr(tick, "bid", None)
         test_price = float(price) if isinstance(price, (int, float)) and float(price) > 0 else fallback_price
@@ -547,10 +563,11 @@ class MT5Executor(BaseExecutor):
         try:
             order_type = getattr(mt5, "ORDER_TYPE_BUY", 0) if buy else getattr(mt5, "ORDER_TYPE_SELL", 1)
             result["price"] = float(test_price)
-            margin = mt5.order_calc_margin(order_type, symbol, float(normalized), float(test_price))
+            margin = await self._run_sync(mt5.order_calc_margin, order_type, symbol, float(normalized), float(test_price))
             result["margin"] = float(margin) if margin is not None else None
             if margin is None:
-                result["error"] = f"MT5 order_calc_margin returned no data: {mt5.last_error()}"
+                last_err = await self._run_sync(mt5.last_error)
+                result["error"] = f"MT5 order_calc_margin returned no data: {last_err}"
         except Exception as exc:
             result["error"] = f"MT5 order_calc_margin raised {type(exc).__name__}: {exc}"
         return result
@@ -564,12 +581,12 @@ class MT5Executor(BaseExecutor):
             return {}
 
         # Ensure symbol is selected so we get full info
-        mt5.symbol_select(symbol, True)
-        info = mt5.symbol_info(symbol)
+        await self._run_sync(mt5.symbol_select, symbol, True)
+        info = await self._run_sync(mt5.symbol_info, symbol)
         if info is None:
             return {}
             
-        tick = mt5.symbol_info_tick(symbol)
+        tick = await self._run_sync(mt5.symbol_info_tick, symbol)
         return {
             "pip_size": info.point,
             "min_lot": info.volume_min,
@@ -601,11 +618,12 @@ class MT5Executor(BaseExecutor):
             self.last_symbol_discovery_error = "MetaTrader5 package is not installed"
             return []
         if not await self._ensure_connected():
-            self.last_symbol_discovery_error = f"MT5 connection is unavailable: {mt5.last_error()}"
+            last_err = await self._run_sync(mt5.last_error)
+            self.last_symbol_discovery_error = f"MT5 connection is unavailable: {last_err}"
             return []
-        symbols = mt5.symbols_get()
+        symbols = await self._run_sync(mt5.symbols_get)
         if symbols is None:
-            self.last_symbol_discovery_error = f"MT5 symbols_get failed: {mt5.last_error()}"
+            self.last_symbol_discovery_error = f"MT5 symbols_get failed: {await self._run_sync(mt5.last_error)}"
             logger.error(self.last_symbol_discovery_error)
             return []
 
@@ -650,7 +668,7 @@ class MT5Executor(BaseExecutor):
         """Fetch only closed broker candles for causal live analysis."""
         if not MT5_AVAILABLE or not await self._ensure_connected():
             return None
-        if not mt5.symbol_select(symbol, True):
+        if not await self._run_sync(mt5.symbol_select, symbol, True):
             logger.warning("Unable to select broker symbol %s", symbol)
             return None
         tf_const = getattr(mt5, f"TIMEFRAME_{timeframe}", None)
@@ -659,9 +677,10 @@ class MT5Executor(BaseExecutor):
             return None
         # Position 0 is the forming candle.  Starting at 1 prevents the scan
         # and any stored learning record from seeing future intrabar extremes.
-        rates = mt5.copy_rates_from_pos(symbol, tf_const, 1, count)
+        rates = await self._run_sync(mt5.copy_rates_from_pos, symbol, tf_const, 1, count)
         if rates is None or len(rates) == 0:
-            logger.warning("No closed rates for %s %s: %s", symbol, timeframe, mt5.last_error())
+            last_err = await self._run_sync(mt5.last_error)
+            logger.warning("No closed rates for %s %s: %s", symbol, timeframe, last_err)
             return None
         import pandas as pd
         frame = pd.DataFrame(rates)
@@ -672,12 +691,12 @@ class MT5Executor(BaseExecutor):
         """Fetch broker historical candles without a generic-data fallback."""
         if not MT5_AVAILABLE or not await self._ensure_connected():
             return None
-        if not mt5.symbol_select(symbol, True):
+        if not await self._run_sync(mt5.symbol_select, symbol, True):
             return None
         tf_const = getattr(mt5, f"TIMEFRAME_{timeframe}", None)
         if tf_const is None:
             return None
-        rates = mt5.copy_rates_range(symbol, tf_const, start, end)
+        rates = await self._run_sync(mt5.copy_rates_range, symbol, tf_const, start, end)
         if rates is None or len(rates) == 0:
             return None
         import pandas as pd
@@ -719,12 +738,12 @@ class MT5Executor(BaseExecutor):
             return ExecutionResult(success=False, message="MT5 package not available")
         if not await self._ensure_connected():
             return ExecutionResult(success=False, message="MT5 not connected")
-        info = mt5.symbol_info(symbol)
+        info = await self._run_sync(mt5.symbol_info, symbol)
         if info is None:
             return ExecutionResult(success=False, message=f"Symbol {symbol} not found in MT5")
-        if not info.visible and not mt5.symbol_select(symbol, True):
+        if not info.visible and not await self._run_sync(mt5.symbol_select, symbol, True):
             return ExecutionResult(success=False, message=f"Failed to select {symbol}")
-        tick = mt5.symbol_info_tick(symbol)
+        tick = await self._run_sync(mt5.symbol_info_tick, symbol)
         if tick is None:
             return ExecutionResult(success=False, message=f"No tick for {symbol}")
         is_buy = str(direction).upper() == "BUY"
@@ -746,18 +765,20 @@ class MT5Executor(BaseExecutor):
             "deviation": 20, "magic": magic, "comment": comment or "CAPITAL_REDUCTION",
             "type_time": mt5.ORDER_TIME_GTC, "type_filling": filling_mode,
         }
-        check = mt5.order_check(request)
+        check = await self._run_sync(mt5.order_check, request)
         if check is None:
-            return ExecutionResult(success=False, message=f"Immediate-close MT5 order_check returned None: {mt5.last_error()}", entry_price=price, lot_size=float(lot_size))
+            last_err = await self._run_sync(mt5.last_error)
+            return ExecutionResult(success=False, message=f"Immediate-close MT5 order_check returned None: {last_err}", entry_price=price, lot_size=float(lot_size))
         if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
             return ExecutionResult(success=False, message=(
                 f"Immediate-close MT5 order_check failed: retcode={check.retcode}, comment={check.comment}; "
                 f"price={price:.10g}, stops_level={getattr(info, 'trade_stops_level', 0)}, "
                 f"freeze_level={getattr(info, 'trade_freeze_level', 0)}"
             ), entry_price=price, lot_size=float(lot_size))
-        result = mt5.order_send(request)
+        result = await self._run_sync(mt5.order_send, request)
         if result is None:
-            return ExecutionResult(success=False, message=f"Immediate-close order_send returned None: {mt5.last_error()}", entry_price=price, lot_size=float(lot_size))
+            last_err = await self._run_sync(mt5.last_error)
+            return ExecutionResult(success=False, message=f"Immediate-close order_send returned None: {last_err}", entry_price=price, lot_size=float(lot_size))
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             return ExecutionResult(success=False, message=f"Immediate-close MT5 order failed: retcode={result.retcode}, comment={result.comment}", entry_price=price, lot_size=float(lot_size))
         return ExecutionResult(success=True, ticket=result.order, message=f"MT5 immediate-close {direction} {lot_size} lots {symbol} @ {price:.5f}", entry_price=price, lot_size=float(lot_size))
@@ -773,15 +794,15 @@ class MT5Executor(BaseExecutor):
             return ExecutionResult(success=False, message="MT5 not connected")
 
         # Ensure symbol is visible
-        info = mt5.symbol_info(symbol)
+        info = await self._run_sync(mt5.symbol_info, symbol)
         if info is None:
             return ExecutionResult(success=False, message=f"Symbol {symbol} not found in MT5")
         if not info.visible:
-            if not mt5.symbol_select(symbol, True):
+            if not await self._run_sync(mt5.symbol_select, symbol, True):
                 return ExecutionResult(success=False, message=f"Failed to select {symbol}")
 
         order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
-        tick = mt5.symbol_info_tick(symbol)
+        tick = await self._run_sync(mt5.symbol_info_tick, symbol)
         if tick is None:
             return ExecutionResult(success=False, message=f"No tick for {symbol}")
 
@@ -828,17 +849,18 @@ class MT5Executor(BaseExecutor):
 
         # MT5 validates the exact server-side stop rules without submitting an
         # order. This catches broker-specific constraints beyond symbol_info.
-        check = mt5.order_check(request)
+        check = await self._run_sync(mt5.order_check, request)
         if check is None:
-            return ExecutionResult(success=False, message=f"Pre-submit MT5 order_check returned None: {mt5.last_error()}", entry_price=float(price or 0.0), sl=sl, tp=tp, lot_size=float(lot_size))
+            last_err = await self._run_sync(mt5.last_error)
+            return ExecutionResult(success=False, message=f"Pre-submit MT5 order_check returned None: {last_err}", entry_price=float(price or 0.0), sl=sl, tp=tp, lot_size=float(lot_size))
         invalid_stops_code = getattr(mt5, "TRADE_RETCODE_INVALID_STOPS", 10016)
         if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)) and int(getattr(check, "retcode", -1)) == invalid_stops_code:
             # Some MT5 servers reject a stop set exactly at their advertised
             # distance. Discover an acceptable buffer by checking—not sending—
             # bounded fresh-quote alternatives.
             for extra_ticks in (1, 2, 4, 8, 16, 32):
-                fresh_info = mt5.symbol_info(symbol)
-                fresh_tick = mt5.symbol_info_tick(symbol)
+                fresh_info = await self._run_sync(mt5.symbol_info, symbol)
+                fresh_tick = await self._run_sync(mt5.symbol_info_tick, symbol)
                 if fresh_info is None or fresh_tick is None:
                     break
                 padded_sl, padded_tp = self._expand_protective_levels(
@@ -857,7 +879,7 @@ class MT5Executor(BaseExecutor):
                 if not retry.get("valid"):
                     continue
                 request.update({"price": float(retry["entry_price"]), "sl": float(retry["sl"]), "tp": float(retry["tp"])})
-                check = mt5.order_check(request)
+                check = await self._run_sync(mt5.order_check, request)
                 if self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
                     price, sl, tp = float(request["price"]), float(request["sl"]), float(request["tp"])
                     logger.info("MT5 order_check accepted stop buffer of %s tick(s) for %s %s", extra_ticks, symbol, direction)
@@ -865,12 +887,12 @@ class MT5Executor(BaseExecutor):
         if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
             return ExecutionResult(success=False, message=(f"Pre-submit MT5 order_check failed: retcode={check.retcode}, comment={check.comment}; " f"price={float(request['price']):.10g}, sl={float(request['sl']):.10g}, tp={float(request['tp']):.10g}, " f"stops_level={getattr(info, 'trade_stops_level', 0)}, freeze_level={getattr(info, 'trade_freeze_level', 0)}"), entry_price=float(request["price"] or 0.0), sl=float(request["sl"]), tp=float(request["tp"]), lot_size=float(lot_size))
 
-        result = mt5.order_send(request)
+        result = await self._run_sync(mt5.order_send, request)
         if result is not None and result.retcode == invalid_stops_code:
             # A quote can move after order_check. Re-read the broker quote and
             # retry once with freshly normalized levels; never loop or force it.
-            latest_info = mt5.symbol_info(symbol)
-            latest_tick = mt5.symbol_info_tick(symbol)
+            latest_info = await self._run_sync(mt5.symbol_info, symbol)
+            latest_tick = await self._run_sync(mt5.symbol_info_tick, symbol)
             if latest_info is not None and latest_tick is not None:
                 retry = self._normalise_protective_levels(
                     direction=direction, bid=float(getattr(latest_tick, "bid", 0.0) or 0.0), ask=float(getattr(latest_tick, "ask", 0.0) or 0.0),
@@ -882,13 +904,13 @@ class MT5Executor(BaseExecutor):
                 )
                 if retry.get("valid"):
                     request.update({"price": float(retry["entry_price"]), "sl": float(retry["sl"]), "tp": float(retry["tp"])})
-                    retry_check = mt5.order_check(request)
+                    retry_check = await self._run_sync(mt5.order_check, request)
                     if self._order_check_succeeded(retry_check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
-                        result = mt5.order_send(request)
+                        result = await self._run_sync(mt5.order_send, request)
                         sl, tp, price = float(retry["sl"]), float(retry["tp"]), float(retry["entry_price"])
 
         if result is None:
-            return ExecutionResult(success=False, message=f"order_send returned None: {mt5.last_error()}")
+            return ExecutionResult(success=False, message=f"order_send returned None: {await self._run_sync(mt5.last_error)}")
 
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             return ExecutionResult(
@@ -913,17 +935,17 @@ class MT5Executor(BaseExecutor):
         if not await self._ensure_connected():
             return False
 
-        positions = mt5.positions_get(ticket=ticket)
+        positions = await self._run_sync(mt5.positions_get, ticket=ticket)
         if not positions:
             return False
 
         pos = positions[0]
         symbol = pos.symbol
-        info = mt5.symbol_info(symbol)
+        info = await self._run_sync(mt5.symbol_info, symbol)
         if info is None:
             return False
 
-        tick = mt5.symbol_info_tick(symbol)
+        tick = await self._run_sync(mt5.symbol_info_tick, symbol)
         if tick is None:
             return False
 
@@ -955,7 +977,7 @@ class MT5Executor(BaseExecutor):
             "type_filling": filling_mode,
         }
 
-        result = mt5.order_send(request)
+        result = await self._run_sync(mt5.order_send, request)
         return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
 
     async def close_partial(self, ticket: int, volume: float) -> bool:
@@ -965,12 +987,12 @@ class MT5Executor(BaseExecutor):
         if not await self._ensure_connected():
             return False
 
-        positions = mt5.positions_get(ticket=ticket)
+        positions = await self._run_sync(mt5.positions_get, ticket=ticket)
         if not positions:
             return False
         pos = positions[0]
-        info = mt5.symbol_info(pos.symbol)
-        tick = mt5.symbol_info_tick(pos.symbol)
+        info = await self._run_sync(mt5.symbol_info, pos.symbol)
+        tick = await self._run_sync(mt5.symbol_info_tick, pos.symbol)
         if info is None or tick is None:
             return False
 
@@ -1006,9 +1028,10 @@ class MT5Executor(BaseExecutor):
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": filling_mode,
         }
-        result = mt5.order_send(request)
+        result = await self._run_sync(mt5.order_send, request)
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.error("Partial close failed for #%s: %s", ticket, mt5.last_error() if result is None else result.comment)
+            last_err = await self._run_sync(mt5.last_error)
+            logger.error("Partial close failed for #%s: %s", ticket, last_err if result is None else result.comment)
             return False
         return True
 
@@ -1019,7 +1042,7 @@ class MT5Executor(BaseExecutor):
         if not await self._ensure_connected():
             return False
 
-        positions = mt5.positions_get(ticket=ticket)
+        positions = await self._run_sync(mt5.positions_get, ticket=ticket)
         if not positions:
             return False
 
@@ -1031,14 +1054,15 @@ class MT5Executor(BaseExecutor):
 
         desired_sl = float(sl) if sl is not None else float(pos.sl or 0.0)
         desired_tp = float(tp) if tp is not None else float(pos.tp or 0.0)
-        if not mt5.symbol_select(pos.symbol, True):
-            logger.error("modify_position symbol_select failed for #%s: %s", ticket, mt5.last_error())
+        if not await self._run_sync(mt5.symbol_select, pos.symbol, True):
+            last_err = await self._run_sync(mt5.last_error)
+            logger.error("modify_position symbol_select failed for #%s: %s", ticket, last_err)
             return False
-        info = mt5.symbol_info(pos.symbol)
-        tick = mt5.symbol_info_tick(pos.symbol)
+        info = await self._run_sync(mt5.symbol_info, pos.symbol)
+        tick = await self._run_sync(mt5.symbol_info_tick, pos.symbol)
         direction = "BUY" if int(getattr(pos, "type", -1)) == getattr(mt5, "POSITION_TYPE_BUY", 0) else "SELL"
         if info is None or tick is None:
-            logger.error("modify_position metadata/tick unavailable for #%s: %s", ticket, mt5.last_error())
+            logger.error("modify_position metadata/tick unavailable for #%s: %s", ticket, await self._run_sync(mt5.last_error))
             return False
         stop_check = self._normalise_protective_levels(
             direction=direction, bid=float(getattr(tick, "bid", 0.0) or 0.0), ask=float(getattr(tick, "ask", 0.0) or 0.0),
@@ -1059,13 +1083,15 @@ class MT5Executor(BaseExecutor):
             "magic": pos.magic,
         }
 
-        check = mt5.order_check(request)
+        check = await self._run_sync(mt5.order_check, request)
         if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
-            logger.error("modify_position pre-submit MT5 order_check failed for #%s: %s", ticket, mt5.last_error() if check is None else check.comment)
+            last_err = await self._run_sync(mt5.last_error)
+            logger.error("modify_position pre-submit MT5 order_check failed for #%s: %s", ticket, last_err if check is None else check.comment)
             return False
-        result = mt5.order_send(request)
+        result = await self._run_sync(mt5.order_send, request)
         if result is None:
-            logger.error(f"modify_position order_send returned None: {mt5.last_error()}")
+            last_err = await self._run_sync(mt5.last_error)
+            logger.error(f"modify_position order_send returned None: {last_err}")
             return False
             
         if result.retcode != mt5.TRADE_RETCODE_DONE:
@@ -1081,13 +1107,14 @@ class MT5Executor(BaseExecutor):
         if not await self._ensure_connected():
             return 0
 
-        positions = mt5.positions_get()
+        positions = await self._run_sync(mt5.positions_get)
         if not positions:
             return 0
 
         closed = 0
         for pos in positions:
-            if await self.close_position(pos.ticket):
+            # Type check constants don't block
+            if await self.close_position(int(getattr(pos, "ticket", 0))):
                 closed += 1
         return closed
 
@@ -1100,7 +1127,7 @@ class MT5Executor(BaseExecutor):
         """
         if not MT5_AVAILABLE or not await self._ensure_connected():
             return None
-        deals = mt5.history_deals_get(position=ticket)
+        deals = await self._run_sync(mt5.history_deals_get, position=ticket)
         if not deals:
             return None
         closed_entry = getattr(mt5, "DEAL_ENTRY_OUT", None)
@@ -1151,6 +1178,6 @@ class MT5Executor(BaseExecutor):
 
     async def disconnect(self) -> None:
         if MT5_AVAILABLE:
-            mt5.shutdown()
+            await self._run_sync(mt5.shutdown)
         self._connected = False
         logger.info("MT5 disconnected")
