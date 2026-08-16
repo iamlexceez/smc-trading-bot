@@ -2660,7 +2660,7 @@ class MarketScheduler:
         """Run at most one real market scan across every trigger source at a time."""
         if self._scan_lock.locked():
             self.telemetry.increment("scan_cycles_skipped_overlap")
-            logger.warning("[SCANNER SKIPPED] reason=overlap active_scan_started=%s", self.telemetry.snapshot().get("components", {}).get("market_scanner", {}).get("last_started"))
+            logger.warning("[SCANNER SKIPPED] reason=overlap active_scan_started=%s", self.telemetry.snapshot().get("components", {}).get("last_started"))
             return {"skipped": "scan already running", "state": "SKIPPED_OVERLAP", "reason": "Another scan cycle is already running"}
         async with self._scan_lock:
             started = perf_counter()
@@ -2669,6 +2669,15 @@ class MarketScheduler:
             self.telemetry.component_started("market_scanner")
             self.telemetry.increment("scan_cycles_started")
             logger.info("[SCANNER START] cycle=%s timestamp=%s", self._active_scan_cycle_id, datetime.utcnow().isoformat())
+            
+            # Immediate feedback for detailed mode
+            await self._chart_activity(
+                "scan_started", "SYSTEM",
+                f"🔍 **MARKET SCAN STARTED**\nCycle: `{self._active_scan_cycle_id[:8]}`\nThe bot is evaluating the broker universe...",
+                fingerprint=f"scan_start:{self._active_scan_cycle_id}",
+                essential=False, # Only shows in detailed mode
+            )
+            
             try:
                 # Bounded scan execution: ensure the lock is released even if
                 # a broker operation or analysis loop hangs or takes too long.
@@ -2705,6 +2714,16 @@ class MarketScheduler:
                     )
             else:
                 self.telemetry.component_succeeded("market_scanner", state_override="RUNNING", reason=f"Processed {disposition.get('symbols_attempted', 0)} symbol(s)")
+                
+                # Summary feedback for detailed mode if no trade was opened
+                if not result or not result.get("order_submitted"):
+                    await self._chart_activity(
+                        "scan_completed", "SYSTEM",
+                        f"✅ **MARKET SCAN COMPLETED**\nCycle: `{self._active_scan_cycle_id[:8]}`\nAnalyzed: `{disposition.get('symbols_analyzed', 0)}` | Rejected: `{disposition.get('symbols_rejected', 0)}` | Failed: `{disposition.get('symbols_failed', 0)}`\nResult: No executable setups found. Monitoring continues...",
+                        fingerprint=f"scan_end:{self._active_scan_cycle_id}",
+                        essential=False,
+                    )
+
             logger.info("[SCANNER COMPLETE] cycle=%s disposition=%s duration=%.3fs", self._active_scan_cycle_id, disposition, perf_counter() - started)
             self._active_scan_cycle_id = None
             return result
@@ -3681,7 +3700,11 @@ class MarketScheduler:
         cooldown = max(30, int(self.settings.chart_activity_cooldown_seconds))
         if prior and prior[0] == fingerprint:
             return False
-        if prior and now - prior[1] < cooldown and not essential:
+        
+        # Live scan progress and system summaries bypass cooldown to ensure
+        # the user sees the bot is active in real-time.
+        is_live_progress = stage in {"scan_started", "scan_completed", "study_started"}
+        if prior and now - prior[1] < cooldown and not essential and not is_live_progress:
             return False
         self._chart_activity_ledger[key] = (fingerprint, now)
         await self._notify(message, photo=photo, include_whatsapp=essential)
