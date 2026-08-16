@@ -13,7 +13,7 @@ import json
 import os
 from time import monotonic, perf_counter
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pandas as pd
@@ -2656,7 +2656,7 @@ class MarketScheduler:
             logger.error(f"Error executing signal for {symbol}: {e}", exc_info=True)
             raise
 
-    async def scan_and_execute(self, is_manual: bool = False):
+    async def scan_and_execute(self):
         """Run at most one real market scan across every trigger source at a time."""
         if self._scan_lock.locked():
             self.telemetry.increment("scan_cycles_skipped_overlap")
@@ -2681,7 +2681,7 @@ class MarketScheduler:
             try:
                 # Bounded scan execution: ensure the lock is released even if
                 # a broker operation or analysis loop hangs or takes too long.
-                result = await asyncio.wait_for(self._scan_and_execute(is_manual=is_manual), timeout=240.0)
+                result = await asyncio.wait_for(self._scan_and_execute(), timeout=240.0)
             except asyncio.TimeoutError:
                 self.telemetry.increment("scan_cycles_failed")
                 self.telemetry.component_failed("market_scanner", TimeoutError("Scan cycle timed out after 240 seconds"))
@@ -2728,7 +2728,7 @@ class MarketScheduler:
             self._active_scan_cycle_id = None
             return result
 
-    async def _scan_and_execute(self, is_manual: bool = False):
+    async def _scan_and_execute(self):
         """Main scan implementation: validate account, manage positions, then scan usable markets."""
         await self._reload_settings()
         self.capital_state_service.settings = self.settings
@@ -2780,6 +2780,8 @@ class MarketScheduler:
             logger.info(reason)
             return {"state": "CAPITAL_REDUCTION_BLOCKED", "reason": reason}
 
+        # Check if this is a manual scan bypass
+        is_manual = getattr(self, "_manual_scan_requested", False)
         if (not self.settings.auto_trade or self.settings.is_paused) and not is_manual:
             reason = "Auto-trade is disabled." if not self.settings.auto_trade else "Bot-wide pause is active."
             self._set_scan_gate("AUTOMATION_PAUSED", reason, auto_trade=bool(self.settings.auto_trade), is_paused=bool(self.settings.is_paused), analysis_symbols=0)
@@ -2790,6 +2792,8 @@ class MarketScheduler:
             return {"state": "PAUSED", "reason": reason}
         elif (not self.settings.auto_trade or self.settings.is_paused) and is_manual:
             logger.info("Manual scan bypasses automation pause for analysis-only mode.")
+            # Reset flag after check
+            self._manual_scan_requested = False
             
         audit = capital.get("broker_metadata") or {}
         broker_usable_symbols = list(audit.get("usable_symbols") or [])

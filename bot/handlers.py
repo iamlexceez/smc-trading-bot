@@ -1292,9 +1292,10 @@ class BotHandlers:
         # This ensures manual scans use the same timeout, lock, and execution
         # logic as the background loop.
         try:
-            # We don't wait for the result here because the scheduler emits
-            # its own Telegram notifications during the scan.
-            asyncio.create_task(self.scheduler.scan_and_execute(is_manual=True))
+            # Use a class flag to signal a manual scan bypass instead of 
+            # changing the method signature, which is safer for background tasks.
+            self.scheduler._manual_scan_requested = True
+            asyncio.create_task(self.scheduler.scan_and_execute())
         except Exception as e:
             logger.error(f"Error initiating manual scan: {e}")
             await reply_target.reply_text(f"❌ Failed to start scan: {e}")
@@ -2414,16 +2415,8 @@ class BotHandlers:
             await query.edit_message_text("Action cancelled.", reply_markup=keyboards.main_menu())
         elif data == "scan":
             await self.cmd_scan(update, context)
-        elif data == "positions":
-            await self.cmd_positions(update, context)
-        elif data == "settings":
-            await self.cmd_settings(update, context)
-        elif data == "account":
-            await self.cmd_account(update, context)
         elif data == "debug_mt5":
             await self.cmd_debug_mt5(update, context)
-        elif data == "history":
-            await self.cmd_history(update, context)
         elif data == "safety":
             streak = await db.get_consecutive_losses(account_mode=self.settings.trading_mode)
             await query.edit_message_text(
