@@ -2527,6 +2527,7 @@ class BotHandlers:
                 )
             else:
                 self.settings.auto_trade = False
+                self.settings.automation_pause_reason = "AUTO_TRADE_MANUAL_OFF"
                 await db.save_settings(self.settings)
                 await query.edit_message_text(
                     "Auto-Trade is now OFF ❌",

@@ -210,6 +210,44 @@ class MarketScheduler:
             return True
         return reason in {"ACCOUNT_SAFETY", "LEGACY_STALE"}
 
+    async def _autonomous_demo_recovery(self, capital: dict) -> str:
+        """Recover ordinary stale DEMO state without overriding deliberate stops."""
+        if str(self.settings.trading_mode).lower() != "demo":
+            return ""
+        state = str(capital.get("state") or "ACCOUNT_STATE_UNKNOWN")
+        if state not in {AccountCapitalState.ACCOUNT_VERIFIED, AccountCapitalState.LOW_CAPITAL}:
+            return ""
+        if capital.get("reset_detected") and not self.settings.demo_auto_resume_after_reset:
+            return ""
+        active = await db.get_active_objective(self.settings.trading_mode)
+        if active and bool(active.get("is_paused")):
+            return ""
+        operational = dict(((active or {}).get("context") or {}).get("operational") or {})
+        if bool(operational.get("terminal")):
+            return ""
+        reason = str(getattr(self.settings, "automation_pause_reason", "") or "").upper()
+        deliberate = {
+            "MANUAL", "MANUAL_TELEGRAM", "MANUAL_SLACK", "EMERGENCY_STOP",
+            "OBJECTIVE_AWAITING_START", "AUTO_TRADE_MANUAL_OFF",
+        }
+        if reason in deliberate:
+            return ""
+        changed: list[str] = []
+        if not self.settings.auto_trade:
+            self.settings.auto_trade = True
+            changed.append("auto_trade")
+        if self.settings.is_paused:
+            self.settings.is_paused = False
+            changed.append("is_paused")
+        if reason:
+            self.settings.automation_pause_reason = ""
+            changed.append("automation_pause_reason")
+        if not changed:
+            return ""
+        await db.save_settings(self.settings)
+        self.risk_manager.settings = self.settings
+        return ",".join(changed)
+
     async def _recover_stale_automation_pause(self, capital: dict, active_objective: Optional[dict] = None) -> bool:
         if not self._pause_recovery_allowed(self.settings, capital, active_objective):
             return False
@@ -721,6 +759,11 @@ class MarketScheduler:
 
         state = capital.get("state")
         blocking = state in AccountCapitalState.BLOCKING
+        autonomous_recovery = ""
+        if not blocking:
+            autonomous_recovery = await self._autonomous_demo_recovery(capital)
+            if autonomous_recovery:
+                logger.info("Autonomous DEMO execution re-enabled after verified broker recovery: %s", autonomous_recovery)
         if blocking and not self.settings.is_paused:
             self.settings.is_paused = True
             self.settings.automation_pause_reason = "ACCOUNT_SAFETY"
@@ -777,6 +820,12 @@ class MarketScheduler:
         elif not blocking:
             await self._recover_stale_automation_pause(capital, await db.get_active_objective(self.settings.trading_mode))
 
+        if autonomous_recovery:
+            await self._notify(
+                "🤖 **DEMO AUTONOMOUS MODE ACTIVE**\n"
+                "Fresh broker verification completed and ordinary stale automation state was recovered.\n"
+                "Emergency, manual, broker-capital, objective, and execution-integrity gates remain authoritative."
+            )
         if capital.get("changed"):
             audit = capital.get("broker_metadata")
             if audit:
