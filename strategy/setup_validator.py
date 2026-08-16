@@ -76,6 +76,13 @@ class SetupValidationResult:
     target_reason: str = ""
     target_candidates: list[dict] = field(default_factory=list)
     target_conflict: bool = False
+    structural_target: float = 0.0
+    structural_rr: float = 0.0
+    minimum_rr: float = 0.0
+    preferred_rr: float = 0.0
+    rr_filter_enabled: bool = True
+    rr_filter_status: str = "ENABLED"
+    low_rr_experiment: bool = False
 
     @property
     def rejection_reason(self) -> str:
@@ -101,8 +108,10 @@ def calculate_rr(direction: str, entry_price: float, stop_loss: float, take_prof
 
 
 def rr_filter_passes(actual_rr: float, configured_min_rr: float) -> bool:
-    """RR remains observable evidence and never rejects a valid setup."""
-    return True
+    """Apply the explicit RR floor; zero means the RR-only filter is disabled."""
+    if float(configured_min_rr or 0.0) <= 0.0:
+        return True
+    return float(actual_rr or 0.0) >= float(configured_min_rr)
 
 
 def _event_matches_direction(event_type: StructureEventType, direction: str) -> bool:
@@ -234,13 +243,102 @@ class SetupValidator:
         displacement_range_ratio: float = 1.20,
         stop_atr_buffer: float = 0.15,
         require_ltf_confirmation: bool = True,
+        rr_filter_enabled: bool = True,
+        preferred_rr: float = 3.0,
+        allow_low_rr_experiment: bool = False,
     ):
-        self.min_rr = float(min_rr)
+        self.min_rr = max(0.0, float(min_rr))
+        self.rr_filter_enabled = bool(rr_filter_enabled) and self.min_rr > 0.0
+        self.preferred_rr = max(0.0, float(preferred_rr))
+        self.allow_low_rr_experiment = bool(allow_low_rr_experiment)
         self.min_sweep_penetration_atr = float(min_sweep_penetration_atr)
         self.displacement_body_ratio = float(displacement_body_ratio)
         self.displacement_range_ratio = float(displacement_range_ratio)
         self.stop_atr_buffer = float(stop_atr_buffer)
         self.require_ltf_confirmation = bool(require_ltf_confirmation)
+
+    def _apply_rr_metadata(self, result: SetupValidationResult) -> None:
+        result.minimum_rr = self.min_rr
+        result.preferred_rr = self.preferred_rr
+        result.rr_filter_enabled = self.rr_filter_enabled
+        result.rr_filter_status = "ENABLED" if self.rr_filter_enabled else "DISABLED"
+        result.low_rr_experiment = self.allow_low_rr_experiment
+
+    def _finalize_target(
+        self,
+        result: SetupValidationResult,
+        *,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        target_candidates: list[LiquidityPool],
+        target_model: str,
+        target_rr: Optional[float],
+    ) -> None:
+        """Select and validate a target without manufacturing reward."""
+        risk = abs(float(entry) - float(stop_loss))
+        result.target_candidates = [
+            {
+                "level": float(pool.level),
+                "kind": pool.kind.value,
+                "timeframe": pool.timeframe,
+                "rr_ratio": abs(float(pool.level) - entry) / risk if risk > 0 else 0.0,
+            }
+            for pool in target_candidates
+        ]
+        target_pool = target_candidates[0] if target_candidates else None
+        result.target_conflict = bool(
+            target_candidates
+            and target_model not in {"liquidity", "structure", "dynamic", "adaptive"}
+            and target_rr is not None
+        )
+        if target_pool is not None:
+            result.target_pool = target_pool
+            result.structural_target = float(target_pool.level)
+            result.structural_rr = abs(float(target_pool.level) - entry) / risk if risk > 0 else 0.0
+            result.target_source = f"liquidity:{target_pool.kind.value}"
+            result.target_reason = (
+                f"Selected nearest opposing unswept {target_pool.kind.value} liquidity at {target_pool.level:.5f}; "
+                f"structural RR 1:{result.structural_rr:.8f}"
+            )
+            take_profit = float(target_pool.level)
+        elif target_model not in {"liquidity", "structure", "dynamic", "adaptive"} and risk > 0 and target_rr is not None and float(target_rr) > 0:
+            result.target_source = "policy_rr_target"
+            result.target_reason = f"Policy target model requested {float(target_rr):.8f}R; no legitimate structural target was available"
+            take_profit = entry + risk * float(target_rr) if direction == "BUY" else entry - risk * float(target_rr)
+        else:
+            result.target_source = "UNKNOWN"
+            result.target_reason = "No legitimate structural target or positive policy target was available"
+            take_profit = 0.0
+        result.take_profit = float(take_profit)
+        target_valid = (direction == "BUY" and take_profit > entry) or (direction == "SELL" and 0 < take_profit < entry)
+        result.checks.append(ValidationCheck("Executable target", target_valid, f"TP {take_profit:.5f}" if target_valid else "Could not derive valid target"))
+        _, _, result.rr_ratio = calculate_rr(direction, entry, stop_loss, take_profit) if target_valid else (0.0, 0.0, 0.0)
+        result.checks.append(ValidationCheck("Actual RR", target_valid, f"Actual RR {result.rr_ratio:.8f}; {result.target_reason}"))
+        if not target_valid:
+            result.valid = False
+            return
+
+        policy_target = result.target_source == "policy_rr_target"
+        normal_floor = self.min_rr if self.rr_filter_enabled else 2.0
+        rr_pass = rr_filter_passes(result.rr_ratio, self.min_rr) if self.rr_filter_enabled else True
+        if policy_target and result.rr_ratio < normal_floor and not self.allow_low_rr_experiment:
+            rr_pass = False
+            rr_detail = (
+                f"POLICY_TARGET_BELOW_NORMAL_RR: policy target produced 1:{result.rr_ratio:.8f}; "
+                "an explicit LOW_RR_EXPERIMENT is required"
+            )
+        elif not rr_pass:
+            rr_detail = f"STRUCTURAL_TARGET_BELOW_MIN_RR: structural target produced 1:{result.rr_ratio:.8f}; minimum is 1:{self.min_rr:.8f}"
+        elif self.rr_filter_enabled:
+            rr_detail = f"Actual RR 1:{result.rr_ratio:.8f} meets minimum 1:{self.min_rr:.8f}"
+        else:
+            rr_detail = "RR_FILTER_DISABLED: actual RR is recorded but does not independently reject this structural target"
+        result.checks.append(ValidationCheck("Minimum RR", rr_pass, rr_detail))
+        if not rr_pass:
+            result.valid = False
+        elif result.target_source == "policy_rr_target" and self.allow_low_rr_experiment and result.rr_ratio < normal_floor:
+            result.rr_filter_status = "EXPERIMENTAL_LOW_RR"
 
     def observe(
         self,
@@ -268,6 +366,7 @@ class SetupValidator:
         """
         requested_direction = direction.upper()
         result = SetupValidationResult(valid=False, direction=requested_direction, entry_mode=entry_mode)
+        self._apply_rr_metadata(result)
         if df.empty or len(df) < 30:
             result.checks.append(ValidationCheck("Market data", False, "Insufficient closed candles"))
             return result
@@ -342,47 +441,20 @@ class SetupValidator:
         result.stop_loss = stop_loss
         stop_valid = (requested_direction == "BUY" and 0 < stop_loss < entry) or (requested_direction == "SELL" and stop_loss > entry)
         result.checks.append(ValidationCheck("Executable stop", stop_valid, f"SL {stop_loss:.5f}" if stop_valid else "Could not derive valid stop"))
-        risk = abs(entry - stop_loss)
-        # 1) TP selection: choose only the target produced by the selected
-        # market/policy target model. It never receives the RR filter value.
         target_candidates = select_market_targets(pools, requested_direction, entry)
-        result.target_candidates = [
-            {
-                "level": float(pool.level), "kind": pool.kind.value, "timeframe": pool.timeframe,
-                "rr_ratio": abs(float(pool.level) - entry) / risk if risk > 0 else 0.0,
-            }
-            for pool in target_candidates
-        ]
-        target_pool = None
-        result.target_conflict = bool(target_candidates and target_model not in {"liquidity", "structure", "dynamic", "adaptive"} and target_rr is not None)
-        if target_model in {"liquidity", "structure", "dynamic", "adaptive"} and target_candidates:
-            target_pool = target_candidates[0]
-            result.target_source = f"liquidity:{target_pool.kind.value}"
-            result.target_reason = f"Selected nearest opposing unswept {target_pool.kind.value} liquidity at {target_pool.level:.5f}"
-        elif risk > 0 and target_rr is not None:
-            result.target_source = "policy_rr_target"
-            result.target_reason = (
-                f"Policy target model requested {target_rr:.8f}R; structural/liquidity alternatives were retained for comparison"
-                if result.target_conflict else f"Policy target model requested {target_rr:.8f}R"
-            )
-        result.target_pool = target_pool
-        if target_pool is not None:
-            take_profit = float(target_pool.level)
-        elif target_model not in {"liquidity", "structure", "dynamic", "adaptive"} and risk > 0 and target_rr is not None:
-            take_profit = entry + risk * float(target_rr) if requested_direction == "BUY" else entry - risk * float(target_rr)
-        else:
-            take_profit = 0.0
-        result.take_profit = take_profit
-        target_valid = (requested_direction == "BUY" and take_profit > entry) or (requested_direction == "SELL" and 0 < take_profit < entry)
-        result.checks.append(ValidationCheck("Executable target", target_valid, f"TP {take_profit:.5f}" if target_valid else "Could not derive valid target"))
-
-        # 2) Actual RR calculation: always calculated from the TP and SL chosen above.
-        _, _, result.rr_ratio = calculate_rr(requested_direction, entry, stop_loss, take_profit) if target_valid else (0.0, 0.0, 0.0)
-
-        # 3) RR observation: calculate and retain the actual value without
-        # imposing an execution threshold or manufacturing a TP to satisfy one.
-        result.checks.append(ValidationCheck("Actual RR", target_valid, f"Actual RR {result.rr_ratio:.8f}; recorded without a minimum-RR execution filter; {result.target_reason or 'No target source'}"))
-        result.valid = stop_valid and target_valid
+        self._finalize_target(
+            result,
+            direction=requested_direction,
+            entry=entry,
+            stop_loss=stop_loss,
+            target_candidates=target_candidates,
+            target_model=target_model,
+            target_rr=target_rr,
+        )
+        executable_checks = {"Executable stop", "Executable target", "Actual RR", "Minimum RR"}
+        result.valid = stop_valid and all(
+            check.passed for check in result.checks if check.name in executable_checks
+        )
         return result
 
     def validate(
@@ -401,6 +473,7 @@ class SetupValidator:
         """Return a complete, auditable validity decision for the latest closed bar."""
         requested_direction = direction.upper()
         result = SetupValidationResult(valid=False, direction=requested_direction, entry_mode=entry_mode)
+        self._apply_rr_metadata(result)
         if df.empty or len(df) < 30:
             result.checks.append(ValidationCheck("Market data", False, "Insufficient closed candles"))
             return result
@@ -507,45 +580,18 @@ class SetupValidator:
                 atr_value,
                 self.stop_atr_buffer,
             )
-            target_candidates = select_market_targets(pools, requested_direction, entry)
-            result.target_candidates = [
-                {
-                    "level": float(pool.level), "kind": pool.kind.value, "timeframe": pool.timeframe,
-                    "rr_ratio": abs(float(pool.level) - entry) / abs(entry - stop_loss) if abs(entry - stop_loss) > 0 else 0.0,
-                }
-                for pool in target_candidates
-            ]
-            target_pool = target_candidates[0] if target_candidates else None
-            result.target_pool = target_pool
-            result.target_source = f"liquidity:{target_pool.kind.value}" if target_pool else "UNKNOWN"
-            result.target_reason = f"Selected nearest opposing unswept {target_pool.kind.value} liquidity at {target_pool.level:.5f}" if target_pool else "No opposing liquidity target available"
             result.stop_loss = stop_loss
-            result.take_profit = target_pool.level if target_pool else 0.0
-
             stop_valid = (requested_direction == "BUY" and stop_loss < entry) or (requested_direction == "SELL" and stop_loss > entry)
             result.checks.append(ValidationCheck("Structural stop", stop_valid, f"SL {stop_loss:.5f}" if stop_valid else "Invalid structural stop"))
-
-            target_valid = (
-                target_pool is not None
-                and ((requested_direction == "BUY" and target_pool.level > entry) or (requested_direction == "SELL" and target_pool.level < entry))
-            )
-            result.checks.append(
-                ValidationCheck(
-                    "Market-derived target",
-                    target_valid,
-                    f"Target {target_pool.level:.5f} from {target_pool.kind.value}" if target_valid else "No opposing liquidity target",
-                )
-            )
-
-            risk = abs(entry - stop_loss)
-            reward = abs(result.take_profit - entry) if target_valid else 0.0
-            result.rr_ratio = reward / risk if risk > 0 else 0.0
-            result.checks.append(
-                ValidationCheck(
-                    "Actual RR",
-                    True,
-                    f"RR 1:{result.rr_ratio:.2f}; recorded without a minimum-RR execution filter",
-                )
+            target_candidates = select_market_targets(pools, requested_direction, entry)
+            self._finalize_target(
+                result,
+                direction=requested_direction,
+                entry=entry,
+                stop_loss=stop_loss,
+                target_candidates=target_candidates,
+                target_model="liquidity",
+                target_rr=None,
             )
         else:
             result.checks.extend(
@@ -553,6 +599,7 @@ class SetupValidator:
                     ValidationCheck("Structural stop", False, "Cannot derive stop without zone and sweep"),
                     ValidationCheck("Market-derived target", False, "Cannot derive target without valid setup"),
                     ValidationCheck("Actual RR", False, "RR unavailable because no structurally valid target exists"),
+                    ValidationCheck("Minimum RR", False, "RR unavailable because no structurally valid target exists"),
                 ]
             )
 

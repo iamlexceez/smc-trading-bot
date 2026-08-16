@@ -95,6 +95,20 @@ def test_two_gate_decision_architecture() -> None:
     )
     assert_true(score_only.trading_decision != "TRADE_APPROVED", "feature score alone authorized objective trading")
     assert_true(score_only.final_state == "EXECUTION_BLOCKED", "non-DEMO under-evidenced candidate did not remain blocked outside exploration")
+    normal_low_rr = evaluate_trading_gate(
+        setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
+        objective_permits_exposure=True, evidence=strong, champion_governed=True, demo_mode=True,
+        actual_rr=1.25, minimum_rr=2.0, rr_filter_enabled=True,
+    )
+    assert_true(normal_low_rr.final_state == "NO_TRADE" and "RR_BELOW_MINIMUM" in normal_low_rr.reason_codes, "normal sub-2R setup bypassed the active minimum-RR filter")
+    low_rr_demo = evaluate_trading_gate(
+        setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
+        objective_permits_exposure=True, evidence=strong, champion_governed=True, demo_mode=True,
+        actual_rr=1.25, minimum_rr=2.0, rr_filter_enabled=True,
+        low_rr_experiment=True, setup_quality=84.0, exploratory_threshold=80.0,
+        strategy_quality=84.0, strategy_threshold=80.0,
+    )
+    assert_true(low_rr_demo.final_state == "EXPLORATORY_DEMO" and "LOW_RR_EXPERIMENT" in low_rr_demo.reason_codes, "explicit low-RR DEMO experiment did not remain controlled")
     assert_true(classify_evidence({"evidence_strength": "PROMISING"}) == "PRELIMINARY", "existing evidence label was not normalized")
     assert_true(classify_confidence({"confidence": "UNKNOWN"}) == "UNVALIDATED", "unknown confidence was fabricated into a validated state")
 
@@ -414,11 +428,16 @@ def test_full_precision_rr_validation() -> None:
     risk, reward, rr = calculate_rr("SELL", 4350.274, 4402.92955, 4343.897)
     assert_true(abs(risk - 52.65555) < 1e-6 and abs(reward - 6.377) < 1e-6, "SELL RR distances were calculated incorrectly")
     assert_true(abs(rr - 0.121107841433619) < 1e-9 and rr < 3.0, "exact low-RR SELL fixture was not calculated at full precision")
-    assert_true(rr_filter_passes(rr, 3.0), "a historical 3R value was still allowed to reject the exact low-RR SELL fixture")
-    assert_true(rr_filter_passes(rr, 0.0) and rr_filter_passes(rr, -1.0), "actual RR observation was incorrectly treated as a rejection filter")
+    assert_true(not rr_filter_passes(rr, 3.0), "low RR incorrectly passed an enabled 3R filter")
+    assert_true(rr_filter_passes(rr, 0.0) and rr_filter_passes(rr, -1.0), "zero RR did not disable RR-only filtering")
     buy_risk, buy_reward, buy_rr = calculate_rr("BUY", 100.0, 98.0, 106.0)
     assert_true(buy_risk == 2.0 and buy_reward == 6.0 and buy_rr == 3.0, "BUY RR formula is incorrect")
-    assert_true(rr_filter_passes(buy_rr, 3.0) and rr_filter_passes(buy_rr, 3.1), "historical configured RR values still imposed an execution filter")
+    assert_true(rr_filter_passes(buy_rr, 3.0) and not rr_filter_passes(buy_rr, 3.1), "enabled RR filtering did not compare actual RR")
+    settings = TradeSettings()
+    assert_true(settings.min_rr_ratio == 2.0 and settings.preferred_rr_ratio == 3.0 and settings.rr_filter_enabled, "RR defaults are not 2R minimum and 3R preferred")
+    assert_true(TradeSettings.from_dict({}).min_rr_ratio == 2.0, "missing persisted RR setting did not use the 2R default")
+    disabled = TradeSettings.from_dict({"min_rr_ratio": 0.0, "rr_filter_enabled": False})
+    assert_true(disabled.min_rr_ratio == 0.0 and not disabled.rr_filter_enabled, "explicit persisted MIN_RR=0 was not preserved")
 
 
 async def test_single_flight_scan_guard() -> None:
@@ -803,6 +822,7 @@ async def test_experiment_engine_persistence() -> None:
     assert_true(accepted and not rejected, "policy feature hypotheses were not applied explicitly")
     policies = PolicyGenerator().generate(HypothesisEngine().generate([]), limit=100)
     assert_true(any(item.risk_pct == 7.5 for item in policies), "risk search space omitted aggressive experimental values")
+    assert_true(any(item.low_rr_experiment and item.rr_target is not None and item.rr_target < 2.0 for item in policies), "low-RR target policies were not marked as explicit DEMO experiments")
     assert_true({1, 2, 3}.issubset({item.max_positions for item in policies}), "concentration challenger search space did not include one-, two-, and three-position alternatives")
     evaluation = PolicyEvaluator.evaluate([{"pnl_r": 2.0}, {"pnl_r": -1.0}, {"pnl_r": 1.0}])
     assert_true(evaluation.sample_size == 3 and evaluation.expectancy_r > 0, "policy evaluation did not use actual R outcomes")

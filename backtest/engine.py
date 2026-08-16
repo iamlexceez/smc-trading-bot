@@ -290,12 +290,15 @@ class BacktestEngine:
 
             entry_mode = EntryMode.CONFIRMED if self.policy.entry_model == "confirmation" else EntryMode.AGGRESSIVE
             validator = SetupValidator(
-                min_rr=0.0,
+                min_rr=self.settings.min_rr_ratio,
                 min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
                 displacement_body_ratio=self.settings.displacement_body_ratio_min,
                 displacement_range_ratio=self.settings.displacement_range_ratio_min,
                 stop_atr_buffer=self.policy.stop_atr_buffer if self.policy.stop_atr_buffer is not None else self.settings.structural_stop_atr_buffer,
                 require_ltf_confirmation=False,
+                rr_filter_enabled=self.settings.rr_filter_enabled,
+                preferred_rr=self.settings.preferred_rr_ratio,
+                allow_low_rr_experiment=bool(self.policy.low_rr_experiment),
             )
             candidates = []
             for direction in ("BUY", "SELL"):
@@ -318,9 +321,7 @@ class BacktestEngine:
                 quality = score_setup_quality(
                     validation, structure, min_score=0.0,
                     extreme_score=self.settings.extreme_setup_score,
-                    # RR remains descriptive evidence in replay as it does in the
-                    # live research path; it is never a hidden execution filter.
-                    rr_reference=0.0,
+                    rr_reference=(self.settings.min_rr_ratio if self.settings.rr_filter_enabled else 0.0),
                 )
                 features = {check.name.lower().replace("/", "_").replace(" ", "_"): check.passed for check in validation.checks}
                 features.update({

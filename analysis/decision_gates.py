@@ -221,6 +221,11 @@ def evaluate_trading_gate(
     strategy_quality: float | None = None,
     strategy_threshold: float | None = None,
     risk_valid: bool = True,
+    actual_rr: float | None = None,
+    minimum_rr: float = 0.0,
+    rr_filter_enabled: bool = False,
+    low_rr_experiment: bool = False,
+    target_source: str = "",
     setup_confidence: str | None = None,
     strategy_status: str | None = None,
 ) -> GateDecision:
@@ -282,6 +287,9 @@ def evaluate_trading_gate(
     ]
     objective_status = "PASS" if objective_permits_exposure else "BLOCKED"
     broker_status = "PASS" if broker_symbol_valid and valid_market_data else "BLOCKED"
+    observed_rr = float(actual_rr or 0.0)
+    normal_rr_floor = float(minimum_rr or 0.0) if rr_filter_enabled and float(minimum_rr or 0.0) > 0.0 else 2.0
+    experimental_low_rr = bool(low_rr_experiment and observed_rr > 0.0 and observed_rr < normal_rr_floor)
     portfolio_status = "PASS" if portfolio_approved else "BLOCKED"
     risk_status = "PASS" if risk_valid else "BLOCKED"
 
@@ -303,6 +311,49 @@ def evaluate_trading_gate(
             hard_gate_results=hard_gate_results,
             objective_status=objective_status,
             exploration_status="BLOCKED_BY_HARD_GATE",
+            broker_status=broker_status,
+            portfolio_status=portfolio_status,
+            risk_status=risk_status,
+        )
+
+    if low_rr_experiment and not demo_mode:
+        return _decision(
+            trading_decision="EXECUTION_BLOCKED",
+            final_state="EXECUTION_BLOCKED",
+            reason="LOW_RR_EXPERIMENT is DEMO-only and cannot authorize live or non-DEMO execution",
+            reason_codes=["LOW_RR_DEMO_ONLY"],
+            failures=["LOW_RR_EXPERIMENT requires DEMO mode"],
+            advisories=[],
+            evidence_classification=evidence_classification,
+            confidence_classification=confidence_classification,
+            sample_size=sample_size,
+            setup_quality=setup_quality,
+            setup_confidence=current_setup_confidence,
+            strategy_status=current_strategy_status,
+            hard_gate_results=hard_gate_results,
+            objective_status=objective_status,
+            exploration_status="BLOCKED",
+            broker_status=broker_status,
+            portfolio_status=portfolio_status,
+            risk_status=risk_status,
+        )
+    if rr_filter_enabled and observed_rr > 0.0 and observed_rr < float(minimum_rr) and not experimental_low_rr:
+        return _decision(
+            trading_decision="NO_TRADE",
+            final_state="NO_TRADE",
+            reason=f"Actual RR 1:{observed_rr:.8f} is below the active minimum 1:{float(minimum_rr):.8f}",
+            reason_codes=["RR_BELOW_MINIMUM"],
+            failures=["Actual RR below active minimum"],
+            advisories=[],
+            evidence_classification=evidence_classification,
+            confidence_classification=confidence_classification,
+            sample_size=sample_size,
+            setup_quality=setup_quality,
+            setup_confidence=current_setup_confidence,
+            strategy_status=current_strategy_status,
+            hard_gate_results=hard_gate_results,
+            objective_status=objective_status,
+            exploration_status="BLOCKED_BY_RR",
             broker_status=broker_status,
             portfolio_status=portfolio_status,
             risk_status=risk_status,
@@ -394,8 +445,12 @@ def evaluate_trading_gate(
             return _decision(
                 trading_decision="CONTROLLED_FORWARD_DEMO",
                 final_state="EXPLORATORY_DEMO",
-                reason="Current setup passed all hard gates and the controlled DEMO exploration standard; insufficient evidence and strategy governance remain informational and will be updated from the broker-realized outcome.",
-                reason_codes=["CONTROLLED_DEMO_EXPLORATION", "EVIDENCE_COLLECTION_REQUIRED"],
+                reason=(
+                    "Current setup passed all hard gates and the controlled DEMO exploration standard; "
+                    + ("this is an explicit LOW_RR_EXPERIMENT and remains experimental. " if experimental_low_rr else "")
+                    + "insufficient evidence and strategy governance remain informational and will be updated from the broker-realized outcome."
+                ),
+                reason_codes=["CONTROLLED_DEMO_EXPLORATION", "EVIDENCE_COLLECTION_REQUIRED"] + (["LOW_RR_EXPERIMENT"] if experimental_low_rr else []),
                 failures=[],
                 advisories=advisories,
                 evidence_classification=evidence_classification,
@@ -432,7 +487,31 @@ def evaluate_trading_gate(
             risk_status=risk_status,
         )
 
-    # Positive completed evidence can authorize normal execution.  Champion /
+    # Positive completed evidence can authorize normal execution. An explicit
+    # low-RR hypothesis remains experimental even after positive evidence; the
+    # existing governance process must promote it before it can become normal.
+    if experimental_low_rr:
+        return _decision(
+            trading_decision="CONTROLLED_FORWARD_DEMO",
+            final_state="EXPLORATORY_DEMO",
+            reason="Positive evidence exists, but the lower-than-normal RR policy remains an explicit controlled DEMO experiment pending promotion.",
+            reason_codes=["LOW_RR_EXPERIMENT", "PROMOTION_REQUIRED"],
+            failures=[],
+            advisories=advisories,
+            evidence_classification=evidence_classification,
+            confidence_classification=confidence_classification,
+            sample_size=sample_size,
+            setup_quality=setup_quality,
+            setup_confidence=current_setup_confidence,
+            strategy_status=current_strategy_status,
+            hard_gate_results=hard_gate_results,
+            objective_status=objective_status,
+            exploration_status="PASS",
+            broker_status=broker_status,
+            portfolio_status=portfolio_status,
+            risk_status=risk_status,
+        )
+    # Positive completed evidence can authorize normal execution. Champion /
     # challenger status is deliberately reported, never used as a hidden block.
     return _decision(
         trading_decision="TRADE_APPROVED",

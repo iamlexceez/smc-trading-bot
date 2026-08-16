@@ -2089,7 +2089,7 @@ class BotHandlers:
             f"Loss-streak breaker: `{streak}/{self.settings.max_consecutive_losses}`\n"
             f"Max positions: `{self.settings.max_open_positions}`\n"
             f"Max layers/setup: `{self.settings.max_layers}`\n"
-            f"Minimum RR: `1:{self.settings.min_rr_ratio}`\n"
+            f"Minimum RR: `{'DISABLED' if not self.settings.rr_filter_enabled else '1:' + format(self.settings.min_rr_ratio, 'g')}` | Preferred RR: `1:{self.settings.preferred_rr_ratio:g}`\n"
             f"Minimum quality: `{self.settings.min_setup_score}` / 100\n"
             f"Signal TTL: `{self.settings.max_signal_age_minutes} min`"
         )
@@ -2166,11 +2166,33 @@ class BotHandlers:
 
     @admin_only
     async def cmd_rr(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Report the actual-RR policy without exposing an execution threshold."""
-        self.settings.min_rr_ratio = 0.0
+        """Configure minimum/preferred RR; zero disables only the RR filter."""
+        args = list(context.args or [])
+        if not args:
+            minimum = "DISABLED" if not self.settings.rr_filter_enabled or self.settings.min_rr_ratio <= 0 else f"1:{self.settings.min_rr_ratio:g}"
+            await update.message.reply_text(
+                f"RR POLICY\nMinimum RR: {minimum}\nPreferred RR: 1:{self.settings.preferred_rr_ratio:g}\n"
+                "Actual RR is always calculated and displayed.\nUsage: /rr 2 3 or /rr 0 to disable RR-only filtering."
+            )
+            return
+        try:
+            minimum = float(args[0])
+            if minimum < 0:
+                raise ValueError
+            preferred = float(args[1]) if len(args) > 1 else self.settings.preferred_rr_ratio
+            if preferred < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Usage: /rr 2 3 or /rr 0 to disable RR-only filtering")
+            return
+        self.settings.min_rr_ratio = minimum
+        self.settings.rr_filter_enabled = minimum > 0.0
+        self.settings.preferred_rr_ratio = preferred
         await db.save_settings(self.settings)
+        minimum_text = "DISABLED" if not self.settings.rr_filter_enabled else f"1:{minimum:g}"
         await update.message.reply_text(
-            "✅ **RR OBSERVATION MODE**\n\nActual RR is calculated and reported for every setup, including after broker stop normalization. It is not a required minimum and cannot reject an otherwise valid DEMO trade. Structural SL/TP selection and active management remain in control."
+            f"✅ RR policy saved\nMinimum RR: {minimum_text}\nPreferred RR: 1:{preferred:g}\n"
+            "Actual RR remains calculated. Structural targets remain authoritative; preferred RR does not manufacture TP."
         )
 
     @admin_only
@@ -2416,7 +2438,7 @@ class BotHandlers:
                 f"Daily stop: `-{self.settings.max_daily_loss_pct}%` / `+{self.settings.daily_profit_stop_pct}%`\n"
                 f"Loss streak: `{streak}/{self.settings.max_consecutive_losses}`\n"
                 f"Positions/layers: `{self.settings.max_open_positions}/{self.settings.max_layers}`\n"
-                f"Min RR / quality: `1:{self.settings.min_rr_ratio}` / `{self.settings.min_setup_score}`\n"
+                f"Min RR / preferred / quality: `{'DISABLED' if not self.settings.rr_filter_enabled else '1:' + format(self.settings.min_rr_ratio, 'g')}` / `1:{self.settings.preferred_rr_ratio:g}` / `{self.settings.min_setup_score}`\n"
                 f"Signal TTL: `{self.settings.max_signal_age_minutes} min`",
                 reply_markup=keyboards.main_menu(),
                 parse_mode="Markdown",
@@ -2629,7 +2651,7 @@ class BotHandlers:
             )
         elif data == "set_rr":
             await query.edit_message_text(
-                f"Current min RR: {'DISABLED' if self.settings.min_rr_ratio == 0 else '1:' + format(self.settings.min_rr_ratio, 'g')}\nUse command: /rr 0 to disable filtering, or /rr 3.0\n(Range: 0 or any positive value)",
+                f"Current min RR: {'DISABLED' if not self.settings.rr_filter_enabled else '1:' + format(self.settings.min_rr_ratio, 'g')} | Preferred RR: 1:{self.settings.preferred_rr_ratio:g}\nUse command: /rr 2 3, or /rr 0 to disable filtering\n(Range: 0 or any positive values)",
                 reply_markup=keyboards.settings_menu()
             )
         elif data == "set_score":

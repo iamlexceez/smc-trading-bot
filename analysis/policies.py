@@ -30,6 +30,13 @@ class ExperimentalPolicy:
     # absent means the experiment does not impose an additional quality threshold.
     exploratory_setup_threshold: Optional[float] = None
     rr_target: Optional[float] = None
+    # These are policy observations/constraints, not universal TP values.
+    minimum_rr: Optional[float] = None
+    preferred_rr: Optional[float] = None
+    rr_filter_enabled: Optional[bool] = None
+    # A lower-than-normal-RR policy must be explicit and remains DEMO-only
+    # until the existing chronological governance promotes it.
+    low_rr_experiment: bool = False
     risk_model: str = "fixed_pct"
     risk_pct: Optional[float] = 0.75
     fixed_volume: Optional[float] = None
@@ -92,9 +99,9 @@ class ExperimentalPolicy:
         """Policy-level decision only; it does not validate operational safety."""
         if self.score_floor is not None and score < self.score_floor:
             return False, f"Policy score floor {self.score_floor:.2f} not met"
-        # ``rr_target`` is an experimental target-construction input, not an
-        # execution filter. The configured TradeSettings.min_rr_ratio is the
-        # sole authoritative RR filter and may be disabled at zero.
+        # ``rr_target`` is an experimental target-construction input, not a
+        # universal TP rule. Final RR filtering is resolved by the active
+        # TradeSettings/objective policy and the target validator.
         required = set(self.required_features)
         entry_requirements = {
             "confirmation": {"ltf_confirmation"},
@@ -258,6 +265,10 @@ class PolicyGenerator:
                 entry_model=entry_models[index % len(entry_models)],
                 required_features=feature_variants[index % len(feature_variants)],
                 rr_target=rr_values[index % len(rr_values)],
+                low_rr_experiment=(
+                    rr_values[index % len(rr_values)] is not None
+                    and float(rr_values[index % len(rr_values)]) < 2.0
+                ),
                 risk_model=risk_model,
                 risk_pct=risk_values[index % len(risk_values)],
                 fixed_volume=(0.01 if risk_model == "fixed_volume" else None),

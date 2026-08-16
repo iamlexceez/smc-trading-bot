@@ -453,9 +453,36 @@ class MarketScheduler:
         }
         return selected
 
+    def _rr_policy(self, policy: Optional[ExperimentalPolicy] = None) -> dict[str, Any]:
+        """Resolve the single active RR policy without letting challengers rewrite global defaults."""
+        operational = dict(self._operational_objective or {})
+        objective_min = operational.get("minimum_rr")
+        minimum = self.settings.min_rr_ratio if objective_min is None else float(objective_min)
+        filter_enabled = bool(self.settings.rr_filter_enabled) and minimum > 0.0
+        if objective_min == 0:
+            filter_enabled = False
+        if policy is not None and policy.rr_filter_enabled is True and policy.minimum_rr is not None:
+            # A policy may opt into a stricter scoped floor, never silently lower
+            # the normal global floor. Lower-RR challengers need explicit mode.
+            candidate = max(0.0, float(policy.minimum_rr))
+            if candidate >= minimum:
+                minimum = candidate
+                filter_enabled = candidate > 0.0
+        preferred = float(
+            policy.preferred_rr if policy is not None and policy.preferred_rr is not None
+            else self.settings.preferred_rr_ratio
+        )
+        return {
+            "minimum_rr": max(0.0, float(minimum)),
+            "preferred_rr": max(0.0, preferred),
+            "filter_enabled": filter_enabled,
+            "filter_status": "ENABLED" if filter_enabled else "DISABLED",
+            "low_rr_experiment": bool(policy and policy.low_rr_experiment),
+        }
+
     def _objective_min_rr(self) -> float:
-        """Compatibility accessor: RR is observational and has no execution floor."""
-        return 0.0
+        """Compatibility accessor for the active objective/settings RR floor."""
+        return float(self._rr_policy().get("minimum_rr") or 0.0)
 
     async def refresh_research_governance(self, broker_usable_symbols: list[str] | tuple[str, ...]) -> dict:
         """Build historical evidence rankings and the full objective analysis scope.
@@ -1347,6 +1374,14 @@ class MarketScheduler:
             "target_source": str(getattr(validation, "target_source", "") or ""),
             "target_reason": str(getattr(validation, "target_reason", "") or ""),
             "target_candidates": list(getattr(validation, "target_candidates", []) or []),
+            "structural_target": float(getattr(validation, "structural_target", 0.0) or 0.0),
+            "structural_rr": float(getattr(validation, "structural_rr", 0.0) or 0.0),
+            "actual_rr": float(getattr(validation, "rr_ratio", 0.0) or 0.0),
+            "minimum_rr": float(getattr(validation, "minimum_rr", 0.0) or 0.0),
+            "preferred_rr": float(getattr(validation, "preferred_rr", 0.0) or 0.0),
+            "rr_filter_enabled": bool(getattr(validation, "rr_filter_enabled", True)),
+            "rr_filter_status": str(getattr(validation, "rr_filter_status", "ENABLED") or "ENABLED"),
+            "low_rr_experiment": bool(getattr(validation, "low_rr_experiment", False)),
         }
 
     @staticmethod
@@ -1597,9 +1632,8 @@ class MarketScheduler:
         if atr_val <= 0 or (isinstance(atr_val, float) and atr_val != atr_val):
             atr_val = current_price * 0.002
 
-        # The persisted setting is the sole RR filter. An experimental policy's
-        # rr_target remains a TP-model input and never raises the filter floor.
-        required_rr = self._objective_min_rr()
+        rr_policy = self._rr_policy(policy)
+        required_rr = float(rr_policy["minimum_rr"])
         validator = SetupValidator(
             min_rr=required_rr,
             min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
@@ -1607,6 +1641,9 @@ class MarketScheduler:
             displacement_range_ratio=self.settings.displacement_range_ratio_min,
             stop_atr_buffer=policy.stop_atr_buffer if policy.stop_atr_buffer is not None else self.settings.structural_stop_atr_buffer,
             require_ltf_confirmation=False,
+            rr_filter_enabled=bool(rr_policy["filter_enabled"]),
+            preferred_rr=float(rr_policy["preferred_rr"]),
+            allow_low_rr_experiment=bool(rr_policy["low_rr_experiment"]),
         )
         validation = validator.observe(
             symbol=symbol,
@@ -1651,7 +1688,13 @@ class MarketScheduler:
             # execution, broker sizing, or margin validation.
             rr_check = next((check for check in validation.checks if check.name == "Minimum RR"), None)
             if rr_check is not None and not rr_check.passed:
-                reason = "RR_BELOW_MINIMUM"
+                reason = (
+                    "STRUCTURAL_TARGET_BELOW_MIN_RR"
+                    if "STRUCTURAL_TARGET_BELOW_MIN_RR" in rr_check.detail
+                    else "POLICY_TARGET_BELOW_NORMAL_RR"
+                    if "POLICY_TARGET_BELOW_NORMAL_RR" in rr_check.detail
+                    else "RR_BELOW_MINIMUM"
+                )
                 self.telemetry.increment("setups_rr_checked")
                 self.telemetry.increment("setups_rr_rejected")
                 self.telemetry.increment("setups_rejected")
@@ -1793,7 +1836,7 @@ class MarketScheduler:
         )
         await self._chart_activity(
             "setup_validated", symbol,
-            f"✅ **EXPERIMENT CANDIDATE ACCEPTED — {symbol}**\nPolicy: `{policy_version or self.settings.active_model_version}` | Direction: `{direction}` | Timeframe: `{primary_tf}`\nTP source: `{validation.target_source or 'none'}` | TP price: `{validation.take_profit:.5f}`\nEntry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}`\nRisk distance: `{abs(validation.entry_price - validation.stop_loss):.5f}` | Reward distance: `{abs(validation.take_profit - validation.entry_price):.5f}`\nActual RR: `1:{validation.rr_ratio:.8f}` | Configured minimum RR: `1:{required_rr:.8f}`\nResearch decision: `RESEARCH_ACCEPTED` | Objective trading: `PENDING`\nEvidence: `{evidence_classification}` | Confidence: `{confidence_classification}` | Feature rank: `{quality.score:.1f}/100`\nWhy tested: candidate is measurable for research; objective exposure requires independent evidence and governance.\nTP detail: {validation.target_reason or 'No target detail recorded'}",
+            f"✅ **EXPERIMENT CANDIDATE ACCEPTED — {symbol}**\nPolicy: `{policy_version or self.settings.active_model_version}` | Direction: `{direction}` | Timeframe: `{primary_tf}`\nTP source: `{validation.target_source or 'none'}` | TP price: `{validation.take_profit:.5f}`\nEntry: `{validation.entry_price:.5f}` | SL: `{validation.stop_loss:.5f}`\nRisk distance: `{abs(validation.entry_price - validation.stop_loss):.5f}` | Reward distance: `{abs(validation.take_profit - validation.entry_price):.5f}`\nActual RR: `1:{validation.rr_ratio:.8f}` | Minimum RR: `{'DISABLED' if not validation.rr_filter_enabled else '1:' + format(validation.minimum_rr, '.8f')}` | Preferred RR: `1:{validation.preferred_rr:.8f}`\nStructural target: `{validation.structural_target:.8f}` | Structural RR: `1:{validation.structural_rr:.8f}` | RR filter: `{validation.rr_filter_status}`\nLow-RR experiment: `{'YES' if validation.low_rr_experiment else 'NO'}`\nResearch decision: `RESEARCH_ACCEPTED` | Objective trading: `PENDING`\nEvidence: `{evidence_classification}` | Confidence: `{confidence_classification}` | Feature rank: `{quality.score:.1f}/100`\nWhy tested: candidate is measurable for research; objective exposure requires independent evidence and governance.\nTP detail: {validation.target_reason or 'No target detail recorded'}",
             fingerprint=f"{bar_time}:{direction}:{policy.fingerprint}:{validation.entry_price}:{validation.stop_loss}:{validation.take_profit}",
         )
 
@@ -1941,6 +1984,8 @@ class MarketScheduler:
             and not bool(operational.get("terminal"))
         )
         policy = dict(signal.experimental_policy or {})
+        policy_object = ExperimentalPolicy.from_dict(policy)
+        active_rr_policy = self._rr_policy(policy_object)
         required_timeframes = list(policy.get("required_timeframes") or [])
         strategy_definition = get_strategy(str(getattr(signal, "selected_strategy", "") or signal.setup_type))
         registry_requires_htf = bool(strategy_definition and "htf_alignment" in strategy_definition.required_features)
@@ -1998,6 +2043,11 @@ class MarketScheduler:
                 str(signal.experimental_policy.get("risk_model", "fixed_pct")) != "fixed_volume"
                 or not exploration_authorized
             ),
+            actual_rr=float(signal.rr_ratio or 0.0),
+            minimum_rr=float(active_rr_policy["minimum_rr"]),
+            rr_filter_enabled=bool(active_rr_policy["filter_enabled"]),
+            low_rr_experiment=bool(policy_object.low_rr_experiment),
+            target_source=str(getattr(signal, "target_source", "") or ""),
         )
 
     async def _execute_signal(self, signal: TradeSignal, df: pd.DataFrame = None) -> bool:

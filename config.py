@@ -73,9 +73,11 @@ class TradeSettings:
     max_consecutive_losses: int = 3
     max_trades_per_day: int = 10
     max_open_positions: int = 2
-    # Actual RR is always calculated and reported. There is no minimum-RR
-    # execution filter; this retained field is display/history compatibility.
-    min_rr_ratio: float = 0.0
+    # RR policy is explicit and configurable. Actual RR is always calculated;
+    # a zero minimum is a deliberate request to disable RR-only filtering.
+    rr_filter_enabled: bool = True
+    min_rr_ratio: float = 2.0
+    preferred_rr_ratio: float = 3.0
     # Quality ranks already-valid setups; it never replaces or relaxes a
     # structural validity gate. A zero floor allows DEMO research to observe
     # all structurally valid archetypes before evidence sets a soft threshold.
@@ -302,7 +304,9 @@ class TradeSettings:
             max_consecutive_losses=int(d.get("max_consecutive_losses", 3)),
             max_trades_per_day=int(d.get("max_trades_per_day", 10)),
             max_open_positions=int(d.get("max_open_positions", 2)),
-            min_rr_ratio=0.0,
+            rr_filter_enabled=parse_bool(d.get("rr_filter_enabled", "true"), True),
+            min_rr_ratio=max(0.0, float(d.get("min_rr_ratio", 2.0))),
+            preferred_rr_ratio=max(0.0, float(d.get("preferred_rr_ratio", 3.0))),
             score_threshold=max(0.0, float(d.get("score_threshold", 0.0))),
             min_setup_score=max(0.0, float(d.get("min_setup_score", 0.0))),
             extreme_setup_score=float(d.get("extreme_setup_score", 90.0)),
