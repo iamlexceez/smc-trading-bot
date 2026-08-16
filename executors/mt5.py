@@ -10,6 +10,7 @@ If MT5 is not available, the bot logs a clear error and exits in live mode.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, InvalidOperation
 from datetime import datetime, timedelta, timezone
