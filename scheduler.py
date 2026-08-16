@@ -16,6 +16,7 @@ from typing import Optional
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+from telegram.error import RetryAfter
 import pandas as pd
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -85,6 +86,13 @@ class MarketScheduler:
         # In-memory delivery ledger: a chart-stage alert is sent once per
         # closed candle/fingerprint and is throttled independently per symbol.
         self._chart_activity_ledger: dict[str, tuple[str, float]] = {}
+        # Telegram applies per-chat flood limits. Keep notification delivery
+        # serialized and back off immediately when Telegram returns RetryAfter;
+        # never retry thousands of queued chart messages during the ban window.
+        self._telegram_notify_lock = asyncio.Lock()
+        self._telegram_next_allowed_at = 0.0
+        self._telegram_backoff_until = 0.0
+        self._telegram_last_backoff_log_at = 0.0
         # Initialize Self-Optimizer
         self.optimizer = SelfOptimizer(self.settings)
         self.research_governance = ResearchGovernance(self.settings)
@@ -3726,17 +3734,48 @@ class MarketScheduler:
         return True
 
     async def _notify(self, message: str, photo: bytes = None, *, include_whatsapp: bool = True):
-        """Send notification to Telegram and, for material events, WhatsApp."""
+        """Send notification to Telegram and, for material events, WhatsApp.
+
+        Telegram notifications are deliberately serialized and rate-limited per
+        process. A broker scan can produce many distinct research events, but
+        Telegram must not receive them as an unrestricted burst. RetryAfter is
+        treated as a server-directed circuit breaker, not as an invitation to
+        retry immediately.
+        """
         # Telegram
         if self.bot_app and self.admin_chat_id:
-            try:
-                if photo:
-                    await self.bot_app.bot.send_photo(self.admin_chat_id, photo, caption=message)
-                else:
-                    await self.bot_app.bot.send_message(self.admin_chat_id, message)
-            except Exception as e:
-                logger.error(f"Failed to send Telegram notification: {e}")
+            now = monotonic()
+            if now < self._telegram_backoff_until:
+                if now - self._telegram_last_backoff_log_at >= 60:
+                    remaining = int(self._telegram_backoff_until - now)
+                    logger.warning("Telegram notifications paused by flood control; retry window remains about %ss", remaining)
+                    self._telegram_last_backoff_log_at = now
+            else:
+                async with self._telegram_notify_lock:
+                    now = monotonic()
+                    if now < self._telegram_backoff_until:
+                        return await self._notify_whatsapp(message, include_whatsapp)
+                    wait_for = max(0.0, self._telegram_next_allowed_at - now)
+                    if wait_for:
+                        await asyncio.sleep(wait_for)
+                    try:
+                        if photo:
+                            await self.bot_app.bot.send_photo(self.admin_chat_id, photo, caption=message)
+                        else:
+                            await self.bot_app.bot.send_message(self.admin_chat_id, message)
+                        self._telegram_next_allowed_at = monotonic() + 1.05
+                    except RetryAfter as exc:
+                        retry_after = max(1.0, float(getattr(exc, "retry_after", 60.0)))
+                        self._telegram_backoff_until = monotonic() + retry_after
+                        self._telegram_last_backoff_log_at = monotonic()
+                        logger.error("Telegram flood control engaged; suppressing notifications for %ss", int(retry_after))
+                    except Exception as e:
+                        logger.error(f"Failed to send Telegram notification: {e}")
         
+        return await self._notify_whatsapp(message, include_whatsapp)
+
+    async def _notify_whatsapp(self, message: str, include_whatsapp: bool):
+        """Send only the optional WhatsApp relay portion of a notification."""
         # Chart-study detail stays on Telegram. WhatsApp receives material
         # execution, safety, and management events only.
         if not include_whatsapp:

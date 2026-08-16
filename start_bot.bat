@@ -1,5 +1,7 @@
 @echo off
 setlocal EnableExtensions
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
 
 REM Start exactly one foreground bot process from the repository root and retain
 REM all startup/runtime errors for VPS diagnosis.

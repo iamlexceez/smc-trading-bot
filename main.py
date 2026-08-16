@@ -28,6 +28,14 @@ from risk.manager import RiskManager
 from scheduler import MarketScheduler
 
 # ─── Logging ──────────────────────────────────────────────
+# Windows VPS consoles may default to CP1252, which cannot encode the emoji
+# used in operational messages. Reconfigure streams so logging never crashes
+# the event loop while trying to display a diagnostic.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass
 
 structlog.configure(
     processors=[
