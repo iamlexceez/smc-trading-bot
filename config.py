@@ -191,6 +191,7 @@ class TradeSettings:
     market_ranking_lookback_days: int = 365
     strategy_ranking_limit: int = 3
     strategy_ranking_min_sample_size: int = 10
+    ranking_tie_threshold: float = 2.0
     daily_report_hour_utc: int = 7
     daily_report_minute_utc: int = 0
     last_optimization_date: Optional[str] = None
@@ -398,6 +399,7 @@ class TradeSettings:
             market_ranking_lookback_days=max(1, int(d.get("market_ranking_lookback_days", 365))),
             strategy_ranking_limit=max(1, min(3, int(d.get("strategy_ranking_limit", 3)))),
             strategy_ranking_min_sample_size=max(1, int(d.get("strategy_ranking_min_sample_size", 10))),
+            ranking_tie_threshold=max(0.0, float(d.get("ranking_tie_threshold", 2.0))),
             daily_report_hour_utc=max(0, min(23, int(d.get("daily_report_hour_utc", 7)))),
             daily_report_minute_utc=max(0, min(59, int(d.get("daily_report_minute_utc", 0)))),
             last_optimization_date=d.get("last_optimization_date"),
@@ -417,7 +419,9 @@ class TradeSettings:
             max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3")),
             max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "10")),
             max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "2")),
-            min_rr_ratio=0.0,
+            rr_filter_enabled=os.getenv("RR_FILTER_ENABLED", "true").lower() == "true",
+            min_rr_ratio=max(0.0, float(os.getenv("MIN_RR", "2.0"))),
+            preferred_rr_ratio=max(0.0, float(os.getenv("PREFERRED_RR", "3.0"))),
             score_threshold=float(os.getenv("SCORE_THRESHOLD", "0.0")),
             min_setup_score=float(os.getenv("MIN_SETUP_SCORE", "0.0")),
             extreme_setup_score=float(os.getenv("EXTREME_SETUP_SCORE", "90.0")),
@@ -460,6 +464,7 @@ class TradeSettings:
             market_ranking_lookback_days=max(1, int(os.getenv("MARKET_RANKING_LOOKBACK_DAYS", "365"))),
             strategy_ranking_limit=max(1, min(3, int(os.getenv("STRATEGY_RANKING_LIMIT", "3")))),
             strategy_ranking_min_sample_size=max(1, int(os.getenv("STRATEGY_RANKING_MIN_SAMPLE_SIZE", "10"))),
+            ranking_tie_threshold=max(0.0, float(os.getenv("RANKING_TIE_THRESHOLD", "2.0"))),
             trading_mode="demo",
             magic_number=20260807,
             require_zone_retest=os.getenv("REQUIRE_ZONE_RETEST", "true").lower() == "true",

@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.decision_gates import classify_evidence
+from strategy.registry import get_strategy
 
 
 def _finite(value: Any, default: float = 0.0) -> float:
@@ -144,6 +145,21 @@ class Opportunity:
     context: dict[str, Any]
     portfolio_conflict: float
     details: dict[str, Any] = field(default_factory=dict)
+    execution_class: str = "RESEARCH_ONLY"
+
+
+def score_band(score: float) -> str:
+    """Return a conservative descriptive score band; it never authorizes execution."""
+    value = max(0.0, min(100.0, float(score)))
+    if value < 50.0:
+        return "WEAK"
+    if value < 65.0:
+        return "MARGINAL"
+    if value < 80.0:
+        return "GOOD"
+    if value < 90.0:
+        return "STRONG"
+    return "EXCEPTIONAL"
 
 
 def _return_correlation(first: Any, second: Any) -> float | None:
@@ -179,6 +195,9 @@ def rank_opportunities(
     low_capital = bool(capacity.get("low_capital"))
     exploration_enabled = bool(capacity.get("exploration_enabled"))
     minimum_evidence_sample = max(0, int(_finite(capacity.get("minimum_evidence_sample"), 0)))
+    exploration_setup_threshold = _finite(capacity.get("exploration_setup_threshold"), 80.0)
+    exploration_strategy_threshold = _finite(capacity.get("exploration_strategy_threshold"), 80.0)
+    minimum_quality_threshold = _finite(capacity.get("minimum_quality_threshold"), 0.0)
     new_exposure_allowed = bool(capacity.get("new_exposure_allowed", True))
     open_position_count = max(0, int(_finite(capacity.get("open_position_count"), 0)))
     ranked: list[Opportunity] = []
@@ -230,13 +249,19 @@ def rank_opportunities(
         expected_value = None if sample < 1 else conservative_ev
         htf_context = list(getattr(signal, "htf_context", []) or [])
         htf_biases = {str(item.get("bias") or "").upper() for item in htf_context}
+        if not htf_biases:
+            htf_biases = {str(item or "").upper() for item in (getattr(signal, "htf_bias", []) or []) if str(item or "").strip()}
         htf_bias_status = str(getattr(signal, "htf_bias_status", "") or "UNKNOWN").upper()
         direction_bias = "BULLISH" if direction == "BUY" else "BEARISH"
         htf_relationship = (
             "CONFLICTED" if htf_bias_status == "CONFLICTED" or {"BULLISH", "BEARISH"}.issubset(htf_biases)
-            else "ALIGNED" if direction_bias in htf_biases
-            else "COUNTER_TREND" if htf_biases else "UNAVAILABLE"
+            else "UNAVAILABLE" if not htf_biases
+            else "ALIGNED" if all(item == direction_bias for item in htf_biases)
+            else "PARTIAL" if direction_bias in htf_biases
+            else "COUNTER_TREND"
         )
+        strategy_definition = get_strategy(selected_strategy)
+        continuation_requires_htf = bool(strategy_definition and "htf_alignment" in strategy_definition.required_features)
         target_conflict = bool(getattr(validation, "target_conflict", False))
         evidence_classification = classify_evidence(strategy_evidence or evidence)
         completed_confidence = str(strategy_evidence.get("confidence") or "UNKNOWN").upper()
@@ -248,10 +273,9 @@ def rank_opportunities(
         technical_high_confidence = quality >= 80.0 and strategy_score >= 70.0
         evidence_high_confidence = sample >= minimum_evidence_sample and conservative_ev > 0.0 if minimum_evidence_sample > 0 else conservative_ev > 0.0
         confidence_class = (
-            "CONFLICTED" if conflict else
-            "A_PLUS_HIGH_CONFIDENCE" if technical_high_confidence and evidence_high_confidence else
-            "GOOD" if quality >= 60.0 and geometry_valid else
-            "MARGINAL" if geometry_valid else
+            "CONFLICTED" if htf_relationship == "CONFLICTED" or conflict else
+            "A_PLUS_HIGH_CONFIDENCE" if technical_high_confidence and evidence_high_confidence and htf_relationship == "ALIGNED" else
+            score_band(quality) if geometry_valid else
             "INSUFFICIENT_EVIDENCE"
         )
         policy = dict(getattr(signal, "experimental_policy", {}) or {})
@@ -276,6 +300,41 @@ def rank_opportunities(
         ):
             capacity_reasons.append("low-capital policy requires A+ / high-confidence evidence")
         capacity_allowed = not capacity_reasons
+        minimum_rr = _finite(getattr(validation, "minimum_rr", 0.0))
+        rr_filter_enabled = bool(getattr(validation, "rr_filter_enabled", True))
+        target_source_is_legitimate = target_source not in {"", "UNKNOWN", "policy_rr_target", "policy_rr_fallback"}
+        mandatory_reasons: list[str] = []
+        if not geometry_valid:
+            mandatory_reasons.append("invalid execution geometry")
+        if not target_source_is_legitimate:
+            mandatory_reasons.append("no legitimate structural or strategy-specific target")
+        if rr_filter_enabled and minimum_rr > 0.0 and actual_rr < minimum_rr:
+            mandatory_reasons.append(f"actual RR 1:{actual_rr:.2f} below minimum 1:{minimum_rr:.2f}")
+        if continuation_requires_htf and htf_relationship != "ALIGNED":
+            mandatory_reasons.append(f"continuation HTF condition {htf_relationship}")
+        if minimum_quality_threshold > 0.0 and quality < minimum_quality_threshold:
+            mandatory_reasons.append(f"setup score {quality:.1f} below minimum {minimum_quality_threshold:.1f}")
+        if htf_relationship == "CONFLICTED":
+            mandatory_reasons.append("HTF conflict is unresolved")
+        current_setup_eligible = not mandatory_reasons
+        evidence_gap = evidence_classification in {"INSUFFICIENT", "EMERGING", "PRELIMINARY"} or completed_confidence in {"UNKNOWN", "UNVALIDATED", "LOW"}
+        exploration_quality_ok = quality >= exploration_setup_threshold and strategy_score >= exploration_strategy_threshold
+        if not current_setup_eligible or not capacity_allowed or evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"}:
+            execution_class = "RESEARCH_ONLY"
+            execution_class_reason = "; ".join(mandatory_reasons or capacity_reasons) or f"evidence state {evidence_classification} is not executable"
+        elif evidence_gap:
+            if exploration_enabled and exploration_quality_ok:
+                execution_class = "EXPLORATION"
+                execution_class_reason = "Insufficient completed evidence, but current setup and strategy thresholds pass controlled DEMO exploration"
+            else:
+                execution_class = "RESEARCH_ONLY"
+                execution_class_reason = (
+                    f"Evidence is {evidence_classification}; exploration requires setup >= {exploration_setup_threshold:.1f} "
+                    f"and strategy >= {exploration_strategy_threshold:.1f}"
+                )
+        else:
+            execution_class = "PROVEN"
+            execution_class_reason = "Completed evidence and all current mandatory eligibility conditions pass"
         peer_correlations = []
         signature = context.get("return_signature")
         for other_symbol, other_context in contexts.items():
@@ -285,7 +344,8 @@ def rank_opportunities(
             if correlation is not None:
                 peer_correlations.append(correlation)
         max_peer_correlation = max(peer_correlations, default=None)
-        score = quality * 0.45 + strategy_score * 0.10 + adx * 8.0 + volatility_fit * 7.0 + momentum * 6.0 + evidence_strength * 12.0 + target_reach_fit * 4.0 + profile_expectancy * 4.0 + geometry_fit * 4.0 - conflict * 18.0
+        htf_conflict_penalty = 12.0 if htf_relationship == "CONFLICTED" else 0.0
+        score = quality * 0.45 + strategy_score * 0.10 + adx * 8.0 + volatility_fit * 7.0 + momentum * 6.0 + evidence_strength * 12.0 + target_reach_fit * 4.0 + profile_expectancy * 4.0 + geometry_fit * 4.0 - conflict * 18.0 - htf_conflict_penalty
         rationale = [f"setup quality {quality:.1f}/100", f"{context.get('regime', 'UNKNOWN').lower()} regime", f"strategy {selected_strategy} score {strategy_score:.1f}/100"]
         if evidence_strength > 0:
             rationale.append(f"positive conservative completed-outcome evidence n={sample}, EV={conservative_ev:+.2f}R")
@@ -304,7 +364,7 @@ def rank_opportunities(
                 rationale.append("controlled DEMO exploration defers evidence selectivity to the final exploration gate")
         if capacity_reasons:
             rationale.append("capacity decision: " + "; ".join(capacity_reasons))
-        classification = "BEST_OPPORTUNITY" if score >= 65.0 else ("GOOD_OPPORTUNITY" if score >= 45.0 else "WATCHLIST")
+        classification = execution_class
         details = {
             "instrument": symbol,
             "regime": context.get("regime", "UNKNOWN"),
@@ -344,6 +404,17 @@ def rank_opportunities(
             "target_reason": str(getattr(validation, "target_reason", "") or ""),
             "setup_score": quality,
             "setup_status": "VALID" if bool(getattr(getattr(signal, "validation", None), "valid", False)) else "INVALID_OR_UNAVAILABLE",
+            "score_components": dict(getattr(signal, "setup_quality_components", {}) or {}),
+            "score_breakdown": {
+                "setup_quality": quality,
+                "strategy_match": strategy_score,
+                "evidence_strength": evidence_strength,
+                "target_reach_fit": target_reach_fit,
+                "profile_expectancy": profile_expectancy,
+                "geometry_fit": geometry_fit,
+                "portfolio_penalty": conflict * 18.0,
+                "htf_conflict_penalty": htf_conflict_penalty,
+            },
             "strategy_score": strategy_score,
             "historical_expectancy_r": strategy_evidence.get("expectancy_r"),
             "expected_value_r": expected_value,
@@ -359,6 +430,11 @@ def rank_opportunities(
             "confidence": completed_confidence,
             "uncertainty": uncertainty,
             "confidence_classification": confidence_class,
+            "score_band": score_band(score),
+            "execution_class": execution_class,
+            "execution_class_reason": execution_class_reason,
+            "mandatory_execution_eligible": current_setup_eligible,
+            "mandatory_execution_reasons": list(mandatory_reasons),
             "research_decision": research_decision,
             "analysis_trading_decision": analysis_trading_decision,
             "final_trading_decision": "PENDING_FINAL_VALIDATION",
@@ -383,6 +459,7 @@ def rank_opportunities(
             "layering_suitability": bool(getattr(signal, "layering_suitable", False)),
             "portfolio_conflict": conflict,
             "execution_geometry_present": geometry_valid,
+            "htf_conflict_penalty": htf_conflict_penalty,
             "regime_transition": getattr(signal, "regime_transition", context.get("regime", "UNKNOWN")),
             "primary_thesis": dict(getattr(signal, "primary_thesis", {}) or {}),
             "alternative_theses": list(getattr(signal, "alternative_theses", []) or []),
@@ -390,22 +467,47 @@ def rank_opportunities(
             "why_selected": "Pending comparative ranking; this field is filled after all eligible candidates are ordered.",
             "why_not_selected": "Pending comparative ranking; this field is filled after all eligible candidates are ordered.",
         }
-        ranked.append(Opportunity(symbol, round(score, 4), classification, tuple(rationale), context, conflict, details))
-    ranked.sort(key=lambda item: (-item.score, item.portfolio_conflict, item.symbol))
+        ranked.append(Opportunity(symbol, round(score, 4), classification, tuple(rationale), context, conflict, details, execution_class))
+    ranked.sort(key=lambda item: (
+        0 if item.execution_class in {"PROVEN", "EXPLORATION"} else 1,
+        -float(item.details.get("mandatory_execution_eligible", False)),
+        -item.score,
+        item.portfolio_conflict,
+        item.symbol,
+    ))
     if ranked:
         top = ranked[0]
-        top_details = dict(top.details)
-        top_details["why_selected"] = f"Ranked first at {top.score:.1f}; strongest eligible combination of setup quality, context, evidence, and execution geometry."
-        top_details["why_not_selected"] = ""
-        ranked[0] = Opportunity(top.symbol, top.score, "BEST_OPPORTUNITY", top.rationale, top.context, top.portfolio_conflict, top_details)
-        for index, item in enumerate(ranked[1:], start=2):
+        second_score = ranked[1].score if len(ranked) > 1 else None
+        margin = top.score - second_score if second_score is not None else None
+        tie_threshold = _finite(capacity.get("ranking_tie_threshold"), 2.0)
+        near_tie = margin is not None and margin < tie_threshold
+        executable = [item for item in ranked if item.execution_class in {"PROVEN", "EXPLORATION"}]
+        research = [item for item in ranked if item.execution_class == "RESEARCH_ONLY"]
+        best_executable_symbol = executable[0].symbol if executable else None
+        best_research_symbol = research[0].symbol if research else None
+        for index, item in enumerate(ranked, start=1):
             details = dict(item.details)
-            gap = top.score - item.score
-            details["why_selected"] = ""
-            details["why_not_selected"] = f"Ranked #{index}, {gap:.1f} points behind the leading opportunity; review its uncertainty, evidence, and portfolio impact before selection."
-            details["capacity_allowed"] = bool(details.get("capacity_allowed", True))
-            ranked[index - 1] = Opportunity(item.symbol, item.score, item.classification, item.rationale, item.context, item.portfolio_conflict, details)
+            details["rank"] = index
+            details["ranking_margin_to_next"] = (ranked[index - 1].score - ranked[index].score) if index < len(ranked) else None
+            details["ranking_margin_from_leader"] = top.score - item.score
+            details["ranking_tie"] = near_tie if index <= 2 else False
+            details["best_executable"] = item.symbol == best_executable_symbol
+            details["best_research"] = item.symbol == best_research_symbol
+            details["best_executable_symbol"] = best_executable_symbol
+            details["best_research_symbol"] = best_research_symbol
+            details["ranking_label"] = "RANKING_TIE" if near_tie and index <= 2 else f"RANK_{index}"
+            details["why_selected"] = (
+                f"Best executable candidate at score {item.score:.1f}." if item.symbol == best_executable_symbol
+                else f"Best research candidate at score {item.score:.1f}." if item.symbol == best_research_symbol
+                else ""
+            )
+            details["why_not_selected"] = (
+                ""
+                if item.symbol in {best_executable_symbol, best_research_symbol}
+                else f"Ranked #{index}; execution class is {item.execution_class}."
+            )
+            ranked[index - 1] = Opportunity(item.symbol, item.score, item.classification, item.rationale, item.context, item.portfolio_conflict, details, item.execution_class)
     return ranked
 
 
-__all__ = ["Opportunity", "adx_series", "atr_series", "market_context", "rank_opportunities", "rsi_series", "uncertainty_label"]
+__all__ = ["Opportunity", "adx_series", "atr_series", "market_context", "rank_opportunities", "rsi_series", "score_band", "uncertainty_label"]

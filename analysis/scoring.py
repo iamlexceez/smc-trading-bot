@@ -63,6 +63,7 @@ class TradeSignal:
     research_decision: str = "RESEARCH_REJECTED"
     trading_decision: str = "DEFERRED"
     final_state: str = "PENDING_FINAL_VALIDATION"
+    execution_class: str = "RESEARCH_ONLY"
     evidence_classification: str = "INSUFFICIENT"
     confidence_classification: str = "UNVALIDATED"
     research_reason: str = ""
@@ -72,6 +73,8 @@ class TradeSignal:
     htf_context: list[dict[str, Any]] = field(default_factory=list)
     htf_bias_status: str = "UNKNOWN"
     setup_quality_components: dict[str, Any] = field(default_factory=dict)
+    execution_class_reason: str = ""
+    htf_relationship: str = "UNKNOWN"
 
     @property
     def passed_gates(self) -> bool:
@@ -88,7 +91,8 @@ def format_signal_report(signal: TradeSignal) -> str:
         f"📊 **{signal.symbol}** — `{signal.direction}` ({signal.timeframe})",
         f"Setup: `{signal.setup_type}` | Entry model: `{signal.entry_mode}`",
         f"Quality rank: `{signal.score:.1f}/100` | Market-derived RR: `1:{signal.rr_ratio:.2f}`",
-        f"Research: `{signal.research_decision}` | Objective trading: `{signal.trading_decision}` | Final state: `{signal.final_state}`",
+        f"Classification: `{signal.execution_class}` | Research: `{signal.research_decision}` | Objective trading: `{signal.trading_decision}` | Final state: `{signal.final_state}`",
+        f"Class reason: {signal.execution_class_reason or 'Pending final broker and portfolio validation.'}",
         f"Evidence: `{signal.evidence_classification}` | Confidence: `{signal.confidence_classification}`",
         f"Top-down context: `{signal.htf_bias_status}` | {htf_text}",
         "",

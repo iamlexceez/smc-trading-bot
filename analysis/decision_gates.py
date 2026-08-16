@@ -69,6 +69,7 @@ class GateDecision:
     broker_status: str = "UNKNOWN"
     portfolio_status: str = "UNKNOWN"
     risk_status: str = "UNKNOWN"
+    execution_class: str = "RESEARCH_ONLY"
     advisories: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
@@ -88,6 +89,7 @@ class GateDecision:
             "broker_status": self.broker_status,
             "portfolio_status": self.portfolio_status,
             "risk_status": self.risk_status,
+            "execution_class": self.execution_class,
             "hard_gate_results": dict(self.hard_gate_results),
             "final_state": self.final_state,
             "reason": self.reason,
@@ -175,6 +177,7 @@ def _decision(
     broker_status: str,
     portfolio_status: str,
     risk_status: str,
+    execution_class: str = "RESEARCH_ONLY",
 ) -> GateDecision:
     return GateDecision(
         research_decision="RESEARCH_ACCEPTED",
@@ -192,6 +195,7 @@ def _decision(
         broker_status=broker_status,
         portfolio_status=portfolio_status,
         risk_status=risk_status,
+        execution_class=str(execution_class or "RESEARCH_ONLY"),
         final_state=final_state,
         reason=reason,
         reason_codes=tuple(reason_codes),
@@ -461,12 +465,14 @@ def evaluate_trading_gate(
                 strategy_status=current_strategy_status,
                 hard_gate_results=hard_gate_results,
                 objective_status=objective_status,
-                exploration_status="PASS",
-                broker_status=broker_status,
-                portfolio_status=portfolio_status,
-                risk_status=risk_status,
-            )
+                            exploration_status="PASS",
+            broker_status=broker_status,
+            portfolio_status=portfolio_status,
+            risk_status=risk_status,
+            execution_class="EXPLORATION",
+        )
         return _decision(
+
             trading_decision="NO_TRADE" if "SETUP_TOO_WEAK" in exploration_codes or "STRATEGY_MATCH_TOO_WEAK" in exploration_codes else "EXECUTION_BLOCKED",
             final_state="NO_TRADE" if "SETUP_TOO_WEAK" in exploration_codes or "STRATEGY_MATCH_TOO_WEAK" in exploration_codes else "EXECUTION_BLOCKED",
             reason="; ".join(exploration_failures),
@@ -510,6 +516,7 @@ def evaluate_trading_gate(
             broker_status=broker_status,
             portfolio_status=portfolio_status,
             risk_status=risk_status,
+            execution_class="EXPLORATION",
         )
     # Positive completed evidence can authorize normal execution. Champion /
     # challenger status is deliberately reported, never used as a hidden block.
@@ -532,6 +539,7 @@ def evaluate_trading_gate(
         broker_status=broker_status,
         portfolio_status=portfolio_status,
         risk_status=risk_status,
+        execution_class="PROVEN",
     )
 
 

@@ -134,7 +134,9 @@ def _htf_context_matches(htf_structures: list[MarketStructure], direction: str) 
     ]
     opposing = [structure for structure in htf_structures if structure.trend == opposite_trend]
 
-    if aligned:
+    if aligned and opposing:
+        return False, f"HTF context CONFLICTED: {len(aligned)} aligned and {len(opposing)} opposing timeframe bias(es)"
+    if aligned and len(aligned) == len(htf_structures):
         return True, f"{len(aligned)}/{len(htf_structures)} HTF trends align"
     if reversal and not opposing:
         return True, "Confirmed HTF reversal event without opposing HTF trend"

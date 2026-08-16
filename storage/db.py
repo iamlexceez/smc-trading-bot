@@ -1207,8 +1207,8 @@ async def get_pending_counterfactual_setups(
     timeframe: str,
     db_path: str = DB_PATH,
 ) -> list[dict]:
-    """Return rejected/failed setups with a defined hypothetical SL and TP."""
-    statuses = ("rejected", "risk_rejected", "sizing_rejected", "execution_failed", "invalidated")
+    """Return research-only or failed setups with defined hypothetical SL and TP."""
+    statuses = ("rejected", "research_only", "risk_rejected", "sizing_rejected", "execution_failed", "invalidated")
     placeholders = ", ".join("?" for _ in statuses)
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row

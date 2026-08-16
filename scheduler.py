@@ -1389,6 +1389,12 @@ class MarketScheduler:
         """Capture observable closed-candle state and testable SMC feature flags."""
         event = structure.last_event
         checks = {check.name: bool(check.passed) for check in getattr(validation, "checks", [])}
+        direction = str(getattr(validation, "direction", "") or "").upper()
+        desired_bias = "BULLISH" if direction == "BUY" else "BEARISH"
+        htf_biases = [str(item.trend.value).upper() for item in htf_structures]
+        htf_conflict = "BULLISH" in htf_biases and "BEARISH" in htf_biases
+        htf_aligned = bool(htf_biases) and not htf_conflict and all(item == desired_bias for item in htf_biases)
+        htf_relationship = "CONFLICTED" if htf_conflict else "ALIGNED" if htf_aligned else "COUNTER_TREND" if desired_bias not in htf_biases else "NEUTRAL"
         return {
             "bar_time": str(df.iloc[-1]["time"]),
             "close": float(df.iloc[-1]["close"]),
@@ -1398,6 +1404,9 @@ class MarketScheduler:
             "structure_event": event.event_type.value,
             "structure_event_index": int(event.index),
             "htf_trends": [item.trend.value for item in htf_structures],
+            "htf_alignment": htf_aligned,
+            "htf_conflict": htf_conflict,
+            "htf_relationship": htf_relationship,
             "htf_events": [item.last_event.event_type.value for item in htf_structures],
             "htf_context": checks.get("HTF context", False),
             "meaningful_liquidity": checks.get("Meaningful liquidity", False),
@@ -1427,8 +1436,10 @@ class MarketScheduler:
             observed.add("order_block")
         if features.get("zone_fvg"):
             observed.add("fvg")
-        if features.get("htf_context"):
+        if features.get("htf_alignment") and not features.get("htf_conflict"):
             observed.add("htf_alignment")
+        if features.get("htf_conflict"):
+            observed.add("htf_conflict")
         return observed
 
     async def _evaluate_counterfactuals(self, symbol: str, timeframe: str, df) -> None:
@@ -1901,6 +1912,16 @@ class MarketScheduler:
                     for factor in quality.factors
                 ],
                 "overall_feature_score": quality.score,
+                "raw_score": quality.score,
+                "score_band": "WEAK" if quality.score < 50 else "MARGINAL" if quality.score < 65 else "GOOD" if quality.score < 80 else "STRONG" if quality.score < 90 else "EXCEPTIONAL",
+                "structural_score": sum(
+                    factor.points for factor in quality.factors
+                    if factor.name in {"Structure quality", "Liquidity sweep", "Zone quality", "Displacement"}
+                ),
+                "rr_score": next((factor.points for factor in quality.factors if factor.name == "RR quality"), 0.0),
+                "htf_score": next((factor.points for factor in quality.factors if factor.name == "HTF alignment"), 0.0),
+                "target_quality": {"source": validation.target_source, "structural_rr": validation.structural_rr, "conflict": validation.target_conflict},
+                "execution_quality": {"geometry": bool(validation.entry_price and validation.stop_loss and validation.take_profit), "rr": validation.rr_ratio},
                 "evidence": evidence_classification,
                 "confidence": confidence_classification,
             },
@@ -1916,6 +1937,14 @@ class MarketScheduler:
         signal.htf_context = htf_context
         htf_biases = {item["bias"] for item in signal.htf_context}
         signal.htf_bias_status = "CONFLICTED" if {"BULLISH", "BEARISH"}.issubset(htf_biases) else (next(iter(htf_biases), "UNKNOWN"))
+        desired_bias = "BULLISH" if direction == "BUY" else "BEARISH"
+        signal.htf_relationship = (
+            "CONFLICTED" if signal.htf_bias_status == "CONFLICTED"
+            else "UNAVAILABLE" if not htf_biases
+            else "ALIGNED" if all(item == desired_bias for item in htf_biases)
+            else "PARTIAL" if desired_bias in htf_biases
+            else "COUNTER_TREND"
+        )
         signal.selected_strategy = selected_strategy
         signal.strategy_score = strategy_score
         signal.strategy_evidence = strategy_evidence
@@ -1998,9 +2027,13 @@ class MarketScheduler:
         if exploratory_threshold is None:
             exploratory_threshold = self.settings.exploration_min_setup_score
         strategy_threshold = self.settings.exploration_min_strategy_score
+        target_source = str(getattr(signal, "target_source", "") or getattr(getattr(signal, "validation", None), "target_source", "") or "UNKNOWN")
+        policy_target = target_source in {"policy_rr_target", "policy_rr_fallback"}
+        governed_policy_target = policy_target and bool(policy_object.low_rr_experiment) and self.settings.trading_mode == "demo"
         structural_conflict = (
             str(evidence.get("decision") or "").upper() in {"REJECTED", "CONFLICTED"}
             or str(getattr(signal, "htf_bias_status", "")).upper() == "CONFLICTED"
+            or str(getattr(signal, "htf_relationship", "")).upper() == "CONFLICTED"
         )
         champion_governed = signal.experiment_id is None and not bool(signal.policy_version and signal.policy_version != self.settings.active_model_version)
         forward_demo_experiment_allowed = bool(
@@ -2017,7 +2050,7 @@ class MarketScheduler:
         )
         portfolio_approved = not any(str(getattr(position, "symbol", "")) == str(signal.symbol) for position in open_positions)
         return evaluate_trading_gate(
-            setup_valid=bool(signal.validation and signal.validation.valid),
+            setup_valid=bool(signal.validation and signal.validation.valid and (not policy_target or governed_policy_target)),
             broker_symbol_valid=self._analysis_symbol_is_eligible(signal.symbol),
             valid_market_data=bool(signal.causality.get("decision_index") is not None),
             objective_permits_exposure=objective_permits,
@@ -2122,6 +2155,8 @@ class MarketScheduler:
                         "research_decision": gate.research_decision,
                         "final_trading_decision": gate.trading_decision,
                         "final_state": gate.final_state,
+                        "execution_class": gate.execution_class,
+                        "execution_class_reason": gate.reason,
                         "final_trading_reason": gate.reason,
                         "evidence_classification": gate.evidence_classification,
                         "confidence_classification": gate.confidence_classification,
@@ -2144,6 +2179,8 @@ class MarketScheduler:
             signal.research_decision = gate.research_decision
             signal.trading_decision = gate.trading_decision
             signal.final_state = gate.final_state
+            signal.execution_class = gate.execution_class
+            signal.execution_class_reason = gate.reason
             signal.evidence_classification = gate.evidence_classification
             signal.confidence_classification = gate.confidence_classification
             signal.trading_reason = gate.reason
@@ -2164,10 +2201,10 @@ class MarketScheduler:
             if exploration_active:
                 await self._chart_activity(
                     "controlled_demo_exploration", symbol,
-                    f"🧪 **EXPLORATORY DEMO OPPORTUNITY — {symbol}**\nEvidence: `{gate.evidence_classification}` | Confidence: `{gate.confidence_classification}`\nSetup quality: `{exploration_setup_quality:.1f}/100` | Strategy match: `{exploration_strategy_quality:.1f}/100`\nRisk mode: `CONTROLLED_DEMO` | Risk multiplier: `{min(1.0, max(0.0, float(self.settings.exploration_risk_multiplier))):.2f}`\nReason: {gate.reason}\nThe candidate must still pass broker stops, sizing, margin, portfolio, duplicate-order, and final MT5 validation.",
+                    f"🧪 **EXPLORATION OPPORTUNITY — {symbol}**\nClassification: `{gate.execution_class}` | Evidence: `{gate.evidence_classification}` | Confidence: `{gate.confidence_classification}`\nSetup quality: `{exploration_setup_quality:.1f}/100` | Strategy match: `{exploration_strategy_quality:.1f}/100`\nRisk mode: `CONTROLLED_DEMO` | Risk multiplier: `{min(1.0, max(0.0, float(self.settings.exploration_risk_multiplier))):.2f}`\nReason: {gate.reason}\nThe candidate must still pass broker stops, sizing, margin, portfolio, duplicate-order, and final MT5 validation.",
                     fingerprint=f"{setup_id}:controlled-demo:{gate.evidence_classification}:{exploration_setup_quality:.2f}", essential=True,
                 )
-            if gate.trading_decision not in {"TRADE_APPROVED", "CONTROLLED_FORWARD_DEMO"}:
+            if gate.execution_class not in {"PROVEN", "EXPLORATION"} or gate.trading_decision not in {"TRADE_APPROVED", "CONTROLLED_FORWARD_DEMO"}:
                 self.telemetry.increment("no_trade_decisions")
                 self.telemetry.record_rejection(f"TRADING_GATE: {gate.reason}")
                 if setup_id is not None:
@@ -2179,7 +2216,7 @@ class MarketScheduler:
                     )
                 await self._chart_activity(
                     "execution_rejected", symbol,
-                    f"⛔ **OBJECTIVE TRADING GATE — {symbol}**\nResearch: `{gate.research_decision}`\nDecision state: `{gate.final_state}`\nTrading: `{gate.trading_decision}`\nEvidence: `{gate.evidence_classification}` | Confidence: `{gate.confidence_classification}`\nWhy not traded: {gate.reason}\nThe candidate remains available for research and counterfactual learning. No order was submitted.",
+                    f"🧪 **RESEARCH-ONLY CANDIDATE — {symbol}**\nClassification: `{gate.execution_class}`\nResearch: `{gate.research_decision}`\nDecision state: `{gate.final_state}`\nTrading: `{gate.trading_decision}`\nEvidence: `{gate.evidence_classification}` | Confidence: `{gate.confidence_classification}`\nWhy not traded: {gate.reason}\nCounterfactual monitoring remains separate from broker-realized learning. No order was submitted.",
                     fingerprint=f"{setup_id}:objective-gate:{gate.trading_decision}:{gate.reason}", essential=True,
                 )
                 return False
@@ -2444,6 +2481,10 @@ class MarketScheduler:
                     "target_source": signal.target_source,
                     "initial_layer": initial_layer,
                     "planned_layers": layers,
+                    "execution_class": signal.execution_class,
+                    "execution_class_reason": signal.execution_class_reason,
+                    "htf_bias_status": signal.htf_bias_status,
+                    "htf_relationship": signal.htf_relationship,
                     "sizing": sizing.evidence(),
                     "policy_version": signal.policy_version,
                     "experiment_id": signal.experiment_id,
@@ -2501,6 +2542,11 @@ class MarketScheduler:
                         "trading_decision": signal.trading_decision,
                         "evidence_classification": signal.evidence_classification,
                         "confidence_classification": signal.confidence_classification,
+                        "execution_class": signal.execution_class,
+                        "htf_bias_status": signal.htf_bias_status,
+                        "htf_relationship": signal.htf_relationship,
+                        "target_source": signal.target_source,
+                        "score_components": signal.setup_quality_components,
                         "score_is_non_authoritative": True,
                     },
                 )
@@ -2522,6 +2568,10 @@ class MarketScheduler:
                         "policy_version": signal.policy_version,
                         "experiment_id": signal.experiment_id,
                         "experimental_policy": signal.experimental_policy,
+                        "execution_class": signal.execution_class,
+                        "htf_relationship": signal.htf_relationship,
+                        "target_source": signal.target_source,
+                        "score_components": signal.setup_quality_components,
                         "sizing": sizing.evidence(),
                     },
                     account_mode=self.settings.trading_mode,
@@ -2845,6 +2895,10 @@ class MarketScheduler:
             "open_position_count": len(positions),
             "protected_position_count": protected_count,
             "minimum_evidence_sample": self.settings.market_ranking_min_sample_size,
+            "exploration_setup_threshold": self.settings.exploration_min_setup_score,
+            "exploration_strategy_threshold": self.settings.exploration_min_strategy_score,
+            "minimum_quality_threshold": self.settings.min_setup_score,
+            "ranking_tie_threshold": getattr(self.settings, "ranking_tie_threshold", 2.0),
             "objective_progress": objective_progress,
             "free_margin": free_margin,
         }
@@ -2859,7 +2913,7 @@ class MarketScheduler:
         for rank, opportunity in enumerate(ranked, start=1):
             signal = by_symbol[opportunity.symbol]
             thesis = {
-                "rank": rank, "classification": opportunity.classification, "opportunity_score": opportunity.score,
+                "rank": rank, "classification": opportunity.classification, "execution_class": opportunity.execution_class, "opportunity_score": opportunity.score,
                 "instrument": signal.symbol, "regime": opportunity.context.get("regime", "UNKNOWN"),
                 "strategy": getattr(signal, "selected_strategy", signal.setup_type), "direction": signal.direction, "entry": signal.entry_price,
                 "invalidation": signal.stop_loss, "target": signal.take_profit, "expected_rr": signal.rr_ratio,
@@ -2870,6 +2924,8 @@ class MarketScheduler:
                 "analysis_trading_decision": opportunity.details.get("analysis_trading_decision") or getattr(signal, "trading_decision", "DEFERRED"),
                 "final_trading_decision": "PENDING_FINAL_VALIDATION",
                 "final_state": "PENDING_FINAL_VALIDATION",
+                "execution_class": opportunity.execution_class,
+                "execution_class_reason": opportunity.details.get("execution_class_reason", ""),
                 "evidence_classification": opportunity.details.get("evidence_classification", "INSUFFICIENT"),
                 "completed_confidence": opportunity.details.get("completed_confidence", "UNKNOWN"),
                 "sample_size": opportunity.details.get("sample_size", 0),
@@ -2908,22 +2964,59 @@ class MarketScheduler:
             item.details["why_selected"] = ""
             if item is not ranked[0]:
                 self.telemetry.increment("opportunity_alternatives")
-        eligible = [item for item in ranked if bool(item.details.get("capacity_allowed", True))]
+            if item.execution_class == "RESEARCH_ONLY":
+                research_signal = by_symbol[item.symbol]
+                item.details["counterfactual_monitoring"] = "ACTIVE"
+                if research_signal.setup_id is not None:
+                    await db.update_setup_record(
+                        research_signal.setup_id,
+                        status="research_only",
+                        rejection_reason=item.details.get("execution_class_reason") or "Mandatory execution gate not satisfied",
+                    )
+                    await db.record_execution_event(
+                        account_mode=self.settings.trading_mode,
+                        symbol=item.symbol,
+                        setup_id=research_signal.setup_id,
+                        status="counterfactual_observation",
+                        requested_price=research_signal.entry_price,
+                        reason=item.details.get("execution_class_reason") or "Research-only candidate",
+                        details={
+                            "execution_class": "RESEARCH_ONLY",
+                            "counterfactual_monitoring": "ACTIVE",
+                            "score_is_non_authoritative": True,
+                            "evidence_classification": item.details.get("evidence_classification"),
+                            "htf_relationship": item.details.get("htf_relationship"),
+                            "actual_rr": item.details.get("actual_rr"),
+                        },
+                    )
+        eligible = [
+            item for item in ranked
+            if bool(item.details.get("capacity_allowed", True))
+            and item.execution_class in {"PROVEN", "EXPLORATION"}
+        ]
+        research_only = [item for item in ranked if item.execution_class == "RESEARCH_ONLY"]
         if not eligible:
             self.last_opportunity_ranking = [
                 {"symbol": item.symbol, "score": item.score, "classification": item.classification,
-                 "rationale": list(item.rationale), "context": dict(item.context),
+                 "execution_class": item.execution_class, "rationale": list(item.rationale), "context": dict(item.context),
                  "portfolio_conflict": item.portfolio_conflict, "details": dict(item.details)}
                 for item in ranked
             ]
             reasons = [
                 {"symbol": item.symbol, "score": item.score, "classification": item.classification,
+                 "execution_class": item.execution_class,
+                 "execution_class_reason": item.details.get("execution_class_reason"),
+                 "mandatory_execution_reasons": list(item.details.get("mandatory_execution_reasons") or []),
                  "capacity_reasons": list(item.details.get("capacity_reasons") or []),
                  "confidence_classification": item.details.get("confidence_classification"),
                  "uncertainty": item.details.get("uncertainty")}
                 for item in ranked
             ]
-            reason = "No current opportunity justified additional exposure after account-capacity, evidence, and portfolio checks."
+            best_research = research_only[0] if research_only else None
+            reason = (
+                "No PROVEN or controlled EXPLORATION opportunity passed all mandatory execution gates. "
+                + (f"Best research opportunity: {best_research.symbol} at {best_research.score:.1f}; no order." if best_research else "No research candidate was available.")
+            )
             self.telemetry.increment("no_trade_decisions")
             self.telemetry.increment("capacity_blocks", len(ranked))
             await db.record_execution_event(
@@ -2934,24 +3027,30 @@ class MarketScheduler:
             self._set_scan_disposition("NO_TRADE", reason, symbols_discovered=len(broker_usable_symbols), symbols_targeted=len(scan_symbols), symbols_eligible=len(scan_symbols), symbols_attempted=len(scan_symbols), symbols_analyzed=analyzed_count, symbols_rejected=rejected_count, symbols_failed=failed_count)
             await self._chart_activity(
                 "no_trade_decision", "PORTFOLIO",
-                f"🟡 **NO TRADE — CURRENT CAPACITY DECISION**\nAnalyzed: `{len(scan_symbols)}` | Candidates: `{len(ranked)}` | Account state: `{account_state}`\nReason: {reason}\nExisting positions remain under broker-confirmed protection.",
+                f"🧪 **BEST RESEARCH OPPORTUNITY — NO ORDER**\nAnalyzed: `{len(scan_symbols)}` | Candidates: `{len(ranked)}` | Account state: `{account_state}`\nReason: {reason}\nCounterfactual monitoring remains active; existing positions remain under broker-confirmed protection.",
                 fingerprint=f"{account_state}:{len(ranked)}:{len(positions)}:{objective_progress}", essential=True,
             )
             logger.info("[NO TRADE] %s details=%s", reason, reasons)
             self.telemetry.component_waiting("execution_engine", "All ranked candidates were blocked by capacity, evidence, or portfolio interaction")
             return {"state": "NO_TRADE", "reason": reason}
         best = eligible[0]
-        best.details["why_selected"] = f"Highest-ranked capacity-eligible opportunity at {best.score:.1f}; account state, evidence, uncertainty, and existing exposure were considered."
+        best.details["why_selected"] = (
+            f"BEST EXECUTABLE OPPORTUNITY at {best.score:.1f}; execution class {best.execution_class}; "
+            "all mandatory current-setup, objective, portfolio, and capacity gates passed to final broker validation."
+        )
         for item in ranked:
             if item is not best:
                 item.details["why_not_selected"] = item.details.get("why_not_selected") or f"Not selected because the capacity-eligible leader ranked above it; candidate capacity reasons: {', '.join(item.details.get('capacity_reasons') or []) or 'none recorded'}."
         self.last_opportunity_ranking = [
             {"symbol": item.symbol, "score": item.score, "classification": item.classification,
-             "rationale": list(item.rationale), "context": dict(item.context),
+             "execution_class": item.execution_class, "rationale": list(item.rationale), "context": dict(item.context),
              "portfolio_conflict": item.portfolio_conflict, "details": dict(item.details)}
             for item in ranked
         ]
         selected = by_symbol[best.symbol]
+        selected.execution_class = best.execution_class
+        selected.execution_class_reason = str(best.details.get("execution_class_reason") or "")
+        selected.htf_relationship = str(best.details.get("htf_relationship") or selected.htf_relationship or "UNKNOWN")
         self._set_scan_gate(
             "FINAL_EXECUTION_GATE", "Strongest current thesis is undergoing final broker, sizing, and portfolio validation.",
             analysis_symbols=len(scan_symbols), candidates=len(candidates), selected_symbol=selected.symbol,
@@ -2967,8 +3066,8 @@ class MarketScheduler:
         ) or "UNKNOWN"
         await self._chart_activity(
             "best_opportunity", selected.symbol,
-            f"🎯 **BEST CURRENT OPPORTUNITY — {selected.symbol}**\n"
-            f"Rank: `1/{len(ranked)}` | Opportunity score: `{best.score:.1f}` | Confidence: `{best.details.get('confidence_classification', 'UNKNOWN')}`\n"
+            f"🎯 **BEST EXECUTABLE OPPORTUNITY — {selected.symbol}**\n"
+            f"Rank: `1/{len(ranked)}` | Opportunity score: `{best.score:.1f}` | Score band: `{best.details.get('score_band', 'UNKNOWN')}` | Execution class: `{best.execution_class}` | Ranking: `{best.details.get('ranking_label', 'RANK_1')}`\n"
             f"Setup: `{best.details.get('setup_status', 'UNKNOWN')}` ({float(best.details.get('setup_score') or 0.0):.1f}/100) | Research decision: `{best.details.get('research_decision', 'RESEARCH_ACCEPTED')}` | Final state: `PENDING_FINAL_VALIDATION`\n"
             f"Evidence: `{best.details.get('evidence_classification', 'INSUFFICIENT')}` | Completed confidence: `{best.details.get('completed_confidence', 'UNKNOWN')}` | Sample size: `{int(best.details.get('sample_size') or 0)}` | Expected value: `{best.details.get('expected_value_r') if best.details.get('expected_value_r') is not None else 'UNKNOWN'}`\n"
             f"Regime: `{best.context.get('regime', 'UNKNOWN')}` | Strategy: `{getattr(selected, 'selected_strategy', selected.setup_type)}` | Direction: `{selected.direction}` | Timeframe: `{getattr(selected, 'timeframe', 'UNKNOWN')}`\n"

@@ -152,7 +152,7 @@ def test_opportunity_context_and_ranking() -> None:
     profiles = {item.symbol: SimpleNamespace(expectancy_r=0.2) for item in candidates}
     historical = {item.symbol: {"sample_size": 20, "expectancy_r": 0.2} for item in candidates}
     ranked = rank_opportunities(candidates, profiles=profiles, contexts=contexts, historical=historical, open_symbols=["Boom 500 Index"])
-    assert_true(ranked[0].symbol == "Boom 100 Index" and ranked[0].classification == "BEST_OPPORTUNITY", "portfolio-aware ranking did not penalize duplicate same-instrument exposure")
+    assert_true(ranked[0].symbol == "Boom 100 Index" and ranked[0].classification == "RESEARCH_ONLY" and ranked[0].execution_class == "RESEARCH_ONLY", "portfolio-aware ranking did not preserve the best research candidate class")
     assert_true("existing same-instrument exposure" in ranked[-1].rationale, "portfolio conflict was not retained in the opportunity thesis rationale")
     assert_true("strategy" in ranked[0].details and "confidence" in ranked[0].details and "thesis" in ranked[0].details, "opportunity board did not retain complete strategy thesis details")
     assert_true(ranked[0].details["research_decision"] == "RESEARCH_ACCEPTED", "ranked candidate was not explicitly research-accepted")

@@ -240,3 +240,85 @@ def test_challenger_without_isolated_demo_authority_is_not_a_hidden_execution_bl
     assert decision.final_state == "EXECUTION_APPROVED"
     assert decision.strategy_status == "CHALLENGER"
     assert not decision.failures
+
+
+def test_execution_classes_and_gated_ranking_are_explicit() -> None:
+    from analysis.decision_gates import evaluate_trading_gate
+    from analysis.opportunity import rank_opportunities, score_band
+
+    exploration = evaluate_trading_gate(
+        setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
+        objective_permits_exposure=True, evidence={"evidence_classification": "INSUFFICIENT"},
+        champion_governed=False, portfolio_approved=True, required_htf_context_available=True,
+        setup_quality=85.0, exploratory_threshold=80.0, strategy_quality=85.0,
+        strategy_threshold=80.0, demo_mode=True, exploration_authorized=True,
+    )
+    assert exploration.execution_class == "EXPLORATION"
+
+    proven = evaluate_trading_gate(
+        setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
+        objective_permits_exposure=True, evidence={"evidence_classification": "VALIDATED", "confidence_classification": "HIGH", "sample_size": 50, "expectancy_r": 0.4},
+        champion_governed=True, portfolio_approved=True, required_htf_context_available=True,
+    )
+    assert proven.execution_class == "PROVEN"
+
+    blocked = evaluate_trading_gate(
+        setup_valid=False, broker_symbol_valid=True, valid_market_data=True,
+        objective_permits_exposure=True, evidence={"evidence_classification": "VALIDATED"},
+        champion_governed=True, portfolio_approved=True, required_htf_context_available=True,
+    )
+    assert blocked.execution_class == "RESEARCH_ONLY"
+    assert score_band(59.1) == "MARGINAL"
+    assert score_band(74.0) == "GOOD"
+
+    validation = SimpleNamespace(
+        minimum_rr=2.0, rr_filter_enabled=True, target_source="policy_rr_target",
+        structural_target=0.0, structural_rr=0.0, target_conflict=False,
+        target_candidates=[],
+    )
+    candidate = SimpleNamespace(
+        symbol="PolicyTarget", score=95.0, selected_strategy="bos_choch_continuation",
+        strategy_score=95.0, strategy_evidence={"sample_size": 50, "expectancy_r": 0.5, "confidence": "VALIDATED"},
+        expected_value_r=0.5, entry_price=100.0, stop_loss=99.0, take_profit=101.0,
+        direction="BUY", timeframe="M15", htf_bias=["BULLISH"], htf_context=[],
+        target_source="policy_rr_target", validation=validation, layering_suitable=False,
+        experimental_policy={}, research_decision="RESEARCH_ACCEPTED", trading_decision="DEFERRED",
+    )
+    ranked = rank_opportunities(
+        [candidate], profiles={},
+        contexts={"PolicyTarget": {"regime": "TRENDING", "adx": 30.0, "atr_ratio": 1.0, "momentum": 0.4}},
+        historical={}, capacity_context={"new_exposure_allowed": True, "exploration_enabled": True},
+    )
+    assert ranked[0].execution_class == "RESEARCH_ONLY"
+    assert "legitimate" in ranked[0].details["execution_class_reason"]
+
+
+def test_htf_conflict_and_near_tie_are_visible() -> None:
+    from analysis.opportunity import rank_opportunities
+
+    def candidate(symbol: str) -> SimpleNamespace:
+        validation = SimpleNamespace(
+            minimum_rr=2.0, rr_filter_enabled=True, target_source="liquidity:swing_high",
+            structural_target=103.0, structural_rr=3.0, target_conflict=False,
+            target_candidates=[{"level": 103.0, "rr_ratio": 3.0}],
+        )
+        return SimpleNamespace(
+            symbol=symbol, score=80.0, selected_strategy="bos_choch_continuation", strategy_score=85.0,
+            strategy_evidence={"sample_size": 50, "expectancy_r": 0.4, "confidence": "VALIDATED"},
+            expected_value_r=0.4, entry_price=100.0, stop_loss=99.0, take_profit=103.0,
+            direction="BUY", timeframe="M15", htf_bias=["BULLISH", "BEARISH"], htf_context=[{"timeframe": "H1", "bias": "BEARISH"}, {"timeframe": "H4", "bias": "BULLISH"}],
+            htf_bias_status="CONFLICTED", target_source="liquidity:swing_high", validation=validation,
+            layering_suitable=False, experimental_policy={}, research_decision="RESEARCH_ACCEPTED", trading_decision="DEFERRED",
+        )
+
+    ranked = rank_opportunities(
+        [candidate("A"), candidate("B")], profiles={},
+        contexts={"A": {"regime": "TRENDING", "adx": 30.0, "atr_ratio": 1.0, "momentum": 0.4}, "B": {"regime": "TRENDING", "adx": 30.0, "atr_ratio": 1.0, "momentum": 0.4}},
+        historical={}, capacity_context={"new_exposure_allowed": True, "exploration_enabled": True, "ranking_tie_threshold": 2.0},
+    )
+    assert all(item.execution_class == "RESEARCH_ONLY" for item in ranked)
+    assert ranked[0].details["htf_relationship"] == "CONFLICTED"
+    assert ranked[0].details["ranking_label"] == "RANKING_TIE"
+    assert ranked[1].details["ranking_label"] == "RANKING_TIE"
+    assert ranked[0].details["best_executable_symbol"] is None
+    assert ranked[0].details["best_research_symbol"] in {"A", "B"}

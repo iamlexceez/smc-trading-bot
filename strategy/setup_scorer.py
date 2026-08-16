@@ -73,6 +73,28 @@ def _event_strength(structure: MarketStructure, direction: str) -> tuple[float, 
     return 0.0, "No directional structural event"
 
 
+def _htf_quality(validation: SetupValidationResult) -> tuple[float, str]:
+    check = next((item for item in validation.checks if item.name == "HTF context"), None)
+    detail = str(check.detail if check else "Unavailable")
+    upper = detail.upper()
+    if "CONFLICTED" in upper:
+        return 0.0, f"HTF_ALIGNMENT=CONFLICTED; {detail}"
+    if "NO HIGHER" in upper or "UNAVAILABLE" in upper or not check:
+        return 0.0, f"HTF_ALIGNMENT=UNAVAILABLE; {detail}"
+    if "REVERSAL" in upper:
+        return 0.65, f"HTF_ALIGNMENT=REVERSAL_CONTEXT; {detail}"
+    try:
+        ratio = detail.split("/")[0]
+        aligned = float(ratio)
+        total = float(detail.split("/")[1].split()[0])
+        if total > 0:
+            normalized = 1.0 if aligned >= total else 0.65 if aligned > 0 else 0.0
+            return normalized, f"HTF_ALIGNMENT={'ALIGNED' if normalized == 1.0 else 'PARTIAL'}; {detail}"
+    except (IndexError, ValueError):
+        pass
+    return (1.0 if check.passed else 0.0), detail
+
+
 def _rr_quality(rr_ratio: float, minimum_rr: float) -> tuple[float, str]:
     if rr_ratio < minimum_rr:
         return 0.0, f"RR 1:{rr_ratio:.2f} is below 1:{minimum_rr:.2f}"
@@ -96,8 +118,8 @@ def score_setup_quality(
     required_score = extreme_score if mode == EntryMode.EXTREME else min_score
     factors: list[QualityFactor] = []
 
-    htf_check = next((check for check in validation.checks if check.name == "HTF context"), None)
-    factors.append(_factor("HTF alignment", 1.0 if htf_check and htf_check.passed else 0.0, 15.0, htf_check.detail if htf_check else "Unavailable"))
+    htf_quality, htf_detail = _htf_quality(validation)
+    factors.append(_factor("HTF alignment", htf_quality, 15.0, htf_detail))
 
     structure_strength, structure_detail = _event_strength(structure, validation.direction)
     factors.append(_factor("Structure quality", structure_strength, 15.0, structure_detail))
