@@ -93,6 +93,8 @@ class MarketScheduler:
         self._telegram_next_allowed_at = 0.0
         self._telegram_backoff_until = 0.0
         self._telegram_last_backoff_log_at = 0.0
+        self._slack_notify_lock = asyncio.Lock()
+        self._slack_next_allowed_at = 0.0
         # Initialize Self-Optimizer
         self.optimizer = SelfOptimizer(self.settings)
         self.research_governance = ResearchGovernance(self.settings)
@@ -3772,7 +3774,38 @@ class MarketScheduler:
                     except Exception as e:
                         logger.error(f"Failed to send Telegram notification: {e}")
         
+        # Slack receives the same material events as the WhatsApp fallback.
+        # Detailed chart-study traffic remains Telegram-only by design.
+        if include_whatsapp:
+            await self._notify_slack(message)
         return await self._notify_whatsapp(message, include_whatsapp)
+
+    async def _notify_slack(self, message: str) -> None:
+        """Post an essential event to an official Slack incoming webhook.
+
+        Slack failures are isolated from trading and from Telegram delivery.
+        The webhook URL is read only from the environment and is never logged.
+        """
+        webhook_url = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+        if not webhook_url:
+            return
+        async with self._slack_notify_lock:
+            wait_for = max(0.0, self._slack_next_allowed_at - monotonic())
+            if wait_for:
+                await asyncio.sleep(wait_for)
+            try:
+                import requests
+                response = await asyncio.to_thread(
+                    requests.post,
+                    webhook_url,
+                    json={"text": message.replace("**", "").replace("`", "")},
+                    timeout=10,
+                )
+                if response.status_code >= 400:
+                    logger.error("Slack webhook rejected notification: HTTP %s", response.status_code)
+                self._slack_next_allowed_at = monotonic() + 1.05
+            except Exception as exc:
+                logger.error("Slack notification failed without affecting bot operation: %s", exc)
 
     async def _notify_whatsapp(self, message: str, include_whatsapp: bool):
         """Send only the optional WhatsApp relay portion of a notification."""
