@@ -147,6 +147,7 @@ async def main():
         executor=executor,
         risk_manager=risk_manager,
         scheduler=scheduler,
+        command_bus=command_bus,
     )
     handlers.setup(app)
 

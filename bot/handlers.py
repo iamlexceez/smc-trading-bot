@@ -46,6 +46,7 @@ from bot.account_views import LiveAccountViews
 from bot.capital_views import capital_actions_view, capital_test_view, demo_session_report_view
 from risk.manager import RiskManager
 from executors.mt5 import MT5Executor
+from communication.command_bus import CommandBus, CommandRequest
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +91,12 @@ def admin_only(func):
 class BotHandlers:
     """Holds shared state for bot handlers."""
 
-    def __init__(self, settings: TradeSettings, executor, risk_manager: RiskManager, scheduler=None):
+    def __init__(self, settings: TradeSettings, executor, risk_manager: RiskManager, scheduler=None, command_bus: CommandBus | None = None):
         self.settings = settings
         self._executor = executor
         self.risk_manager = risk_manager
         self.scheduler = scheduler
+        self.command_bus = command_bus
         self.app: Optional[Application] = None
 
     @property
@@ -562,6 +564,20 @@ class BotHandlers:
             "`/emergency` — pause new execution and optionally close positions\n\n"
             "Capital reduction is DEMO-only, requires an explicit confirmation, and uses direct MT5 broker-mode verification. Its isolated activity is excluded from strategy statistics and optimizer evidence. Trading-policy controls are intentionally not manual commands. Broker validity, synchronization, and emergency controls remain mandatory.",
         )
+
+    async def cmd_bus_dispatch(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Adapt Telegram transport into the shared command bus."""
+        if not self.command_bus or not update.effective_user or not update.effective_chat:
+            await update.effective_message.reply_text("Command bus is unavailable; use /engine for diagnostics.")
+            return
+        request = CommandRequest(
+            platform="telegram",
+            user_id=str(update.effective_user.id),
+            channel_id=str(update.effective_chat.id),
+            text=update.effective_message.text or "",
+        )
+        response = await self.command_bus.dispatch(request)
+        await update.effective_message.reply_text(response.text)
 
     @admin_only
     async def cmd_activity(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2770,15 +2786,16 @@ class BotHandlers:
         app.add_handler(CommandHandler("markets", self.cmd_markets))
         app.add_handler(CommandHandler("brokercheck", self.cmd_brokercheck))
         app.add_handler(CommandHandler("sizingtest", self.cmd_sizingtest))
-        app.add_handler(CommandHandler("engine", self.cmd_engine))
+        app.add_handler(CommandHandler("status", self.cmd_bus_dispatch))
+        app.add_handler(CommandHandler("engine", self.cmd_bus_dispatch))
         app.add_handler(CommandHandler("account", self.cmd_account))
-        app.add_handler(CommandHandler("positions", self.cmd_positions))
+        app.add_handler(CommandHandler("positions", self.cmd_bus_dispatch))
         app.add_handler(CommandHandler("position", self.cmd_position))
         app.add_handler(CommandHandler("orders", self.cmd_orders))
         app.add_handler(CommandHandler("scan", self.cmd_scan))
         app.add_handler(CommandHandler("history", self.cmd_history))
         app.add_handler(CommandHandler("exposure", self.cmd_exposure))
-        app.add_handler(CommandHandler("health", self.cmd_health))
+        app.add_handler(CommandHandler("health", self.cmd_bus_dispatch))
         app.add_handler(CommandHandler("capital_test", self.cmd_capital_test))
         app.add_handler(CommandHandler("capital_target", self.cmd_capital_target))
         app.add_handler(CommandHandler("capital_start", self.cmd_capital_start))
@@ -2793,7 +2810,7 @@ class BotHandlers:
         app.add_handler(CommandHandler("learning", self.cmd_learning))
         app.add_handler(CommandHandler("learned", self.cmd_learned))
         app.add_handler(CommandHandler("knowledge", self.cmd_knowledge))
-        app.add_handler(CommandHandler("opportunities", self.cmd_opportunities))
+        app.add_handler(CommandHandler("opportunities", self.cmd_bus_dispatch))
         app.add_handler(CommandHandler("session", self.cmd_session))
         app.add_handler(CommandHandler("experiments", self.cmd_experiments))
         app.add_handler(CommandHandler("champion", self.cmd_champion))
@@ -2801,8 +2818,8 @@ class BotHandlers:
         app.add_handler(CommandHandler("research", self.cmd_research))
         app.add_handler(CommandHandler("performance", self.cmd_performance))
         app.add_handler(CommandHandler("settings", self.cmd_settings))
-        app.add_handler(CommandHandler("pause", self.cmd_pause))
-        app.add_handler(CommandHandler("resume", self.cmd_resume))
+        app.add_handler(CommandHandler("pause", self.cmd_bus_dispatch))
+        app.add_handler(CommandHandler("resume", self.cmd_bus_dispatch))
         app.add_handler(CommandHandler("activity", self.cmd_activity))
         app.add_handler(CommandHandler("emergency", self.cmd_emergency))
         app.add_handler(CommandHandler("backtest", self.cmd_backtest))

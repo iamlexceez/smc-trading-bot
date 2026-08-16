@@ -66,6 +66,18 @@ class CommandBus:
 
     async def dispatch(self, request: CommandRequest) -> CommandResponse:
         command = request.command
+        pending = self._pending_confirmations.get(request.user_id)
+        if command == "confirm" and pending and request.arguments and request.arguments[0] == pending[0]:
+            token, pending_command, _deadline = pending
+            request = CommandRequest(
+                platform=request.platform,
+                user_id=request.user_id,
+                channel_id=request.channel_id,
+                text=f"/{pending_command} --confirm {token}",
+                command_id=request.command_id,
+                received_at=request.received_at,
+            )
+            command = request.command
         handler_entry = self._handlers.get(command)
         if handler_entry is None:
             response = CommandResponse(f"Unknown command: `/{command or 'empty'}`", ok=False)
@@ -83,7 +95,7 @@ class CommandBus:
 
         if dangerous and not self._is_confirmed(request):
             token = str(uuid4())
-            self._pending_confirmations[request.user_id] = (token, asyncio.get_running_loop().time() + 120.0)
+            self._pending_confirmations[request.user_id] = (token, command, asyncio.get_running_loop().time() + 120.0)
             response = CommandResponse(
                 f"⚠️ Confirmation required for `/{command}`. Reply with `/confirm {token}` within 120 seconds.",
                 ok=False,
@@ -111,7 +123,9 @@ class CommandBus:
         pending = self._pending_confirmations.get(request.user_id)
         if not pending:
             return False
-        token, deadline = pending
+        token, pending_command, deadline = pending
+        if pending_command != request.command and request.command != "confirm":
+            return False
         if asyncio.get_running_loop().time() > deadline:
             self._pending_confirmations.pop(request.user_id, None)
             return False

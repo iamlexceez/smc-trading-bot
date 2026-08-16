@@ -59,6 +59,10 @@ def test_dangerous_command_requires_confirmation_and_then_serializes():
         assert second.ok
         assert max_active == 1
 
+        pending_three = await bus.dispatch(CommandRequest("telegram", "admin-3", "1", "/pause"))
+        confirmed = await bus.dispatch(CommandRequest("telegram", "admin-3", "1", f"/confirm {pending_three.confirmation_token}"))
+        assert confirmed.ok
+
     asyncio.run(scenario())
 
 
