@@ -72,13 +72,22 @@ class SlackWebhookAdapter:
     channel = DeliveryChannel.SLACK
 
     def __init__(self, webhook_url: str | None = None):
-        self.webhook_url = (webhook_url or os.getenv("SLACK_WEBHOOK_URL", "")).strip()
+        fallback = (webhook_url or os.getenv("SLACK_WEBHOOK_URL", "")).strip()
+        self.webhook_url = fallback
+        self.webhook_urls = {
+            "alerts": os.getenv("SLACK_ALERTS_WEBHOOK_URL", fallback).strip(),
+            "operations": os.getenv("SLACK_OPERATIONS_WEBHOOK_URL", fallback).strip(),
+            "learning": os.getenv("SLACK_LEARNING_WEBHOOK_URL", fallback).strip(),
+            "research": os.getenv("SLACK_RESEARCH_WEBHOOK_URL", fallback).strip(),
+            "errors": os.getenv("SLACK_ERRORS_WEBHOOK_URL", fallback).strip(),
+        }
         self._lock = asyncio.Lock()
         self._next_allowed_at = 0.0
         self._backoff_until = 0.0
 
     async def send(self, event: NotificationEvent) -> DeliveryResult:
-        if not self.webhook_url:
+        webhook_url = self.webhook_urls.get(event.slack_route, self.webhook_url)
+        if not webhook_url:
             return DeliveryResult(self.channel, False, "slack_not_configured")
         async with self._lock:
             now = monotonic()
@@ -92,7 +101,7 @@ class SlackWebhookAdapter:
 
                 response = await asyncio.to_thread(
                     requests.post,
-                    self.webhook_url,
+                    webhook_url,
                     json={"text": event.message.replace("**", "").replace("`", "")},
                     timeout=10,
                 )
@@ -148,7 +157,10 @@ class NotificationManager:
             self._prune_dedupe(now)
             if event.persistent and self.db and hasattr(self.db, "record_notification_event"):
                 kwargs = {"db_path": self.db_path} if self.db_path else {}
-                await self.db.record_notification_event(event, **kwargs)
+                try:
+                    await self.db.record_notification_event(event, **kwargs)
+                except Exception:
+                    logger.exception("Critical notification persistence failed; trading remains isolated")
 
         results: list[DeliveryResult] = []
         # Deliver independently. A failure in one platform must not prevent the
@@ -165,14 +177,17 @@ class NotificationManager:
             results.append(result)
             if persist_delivery:
                 kwargs = {"db_path": self.db_path} if self.db_path else {}
-                await self.db.record_notification_delivery(
-                    event.event_id,
-                    channel.value,
-                    result.delivered,
-                    result.error,
-                    result.retry_after,
-                    **kwargs,
-                )
+                try:
+                    await self.db.record_notification_delivery(
+                        event.event_id,
+                        channel.value,
+                        result.delivered,
+                        result.error,
+                        result.retry_after,
+                        **kwargs,
+                    )
+                except Exception:
+                    logger.exception("Notification delivery-state persistence failed")
         return results
 
     def _prune_dedupe(self, now: float) -> None:
@@ -184,7 +199,11 @@ class NotificationManager:
         if not self.db or not hasattr(self.db, "get_pending_notification_events"):
             return 0
         kwargs = {"db_path": self.db_path} if self.db_path else {}
-        pending = await self.db.get_pending_notification_events(limit=limit, **kwargs)
+        try:
+            pending = await self.db.get_pending_notification_events(limit=limit, **kwargs)
+        except Exception:
+            logger.exception("Could not load pending critical notifications")
+            return 0
         count = 0
         for item in pending:
             event = NotificationEvent(

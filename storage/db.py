@@ -419,6 +419,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 dedupe_key TEXT NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 channels_json TEXT NOT NULL DEFAULT '[]',
+                slack_route TEXT NOT NULL DEFAULT 'alerts',
                 created_at TEXT NOT NULL,
                 persistent INTEGER NOT NULL DEFAULT 1
             )
@@ -490,6 +491,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 FOREIGN KEY(basket_id) REFERENCES trade_baskets(id)
             )
         """)
+        await _ensure_column(db, "notification_events", "slack_route", "TEXT NOT NULL DEFAULT 'alerts'")
         await _ensure_column(db, "research_hypotheses", "classification", "TEXT NOT NULL DEFAULT 'HYPOTHESIS'")
         await _ensure_column(db, "research_hypotheses", "why_proposed", "TEXT NOT NULL DEFAULT ''")
         await _ensure_column(db, "research_hypotheses", "data_tested_json", "TEXT NOT NULL DEFAULT '[]'")
@@ -575,12 +577,12 @@ async def record_notification_event(event: Any, db_path: str = DB_PATH) -> None:
         await db.execute(
             """INSERT OR IGNORE INTO notification_events
                (event_id, event_type, severity, message, dedupe_key, payload_json,
-                channels_json, created_at, persistent)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                channels_json, slack_route, created_at, persistent)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (event.event_id, event.event_type, event.severity.value, event.message,
              event.resolved_dedupe_key, json.dumps(event.payload, default=str),
              json.dumps([channel.value for channel in event.target_channels]),
-             event.created_at.isoformat(), 1 if event.persistent else 0),
+             event.slack_route, event.created_at.isoformat(), 1 if event.persistent else 0),
         )
         for channel in event.target_channels:
             await db.execute(
@@ -622,7 +624,7 @@ async def get_pending_notification_events(limit: int = 50, db_path: str = DB_PAT
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT e.event_id, e.event_type, e.severity, e.message,
-                      e.dedupe_key, e.payload_json, d.channel
+                      e.dedupe_key, e.payload_json, e.slack_route, d.channel
                FROM notification_events e
                JOIN notification_deliveries d ON d.event_id = e.event_id
                WHERE e.persistent = 1 AND d.status != 'DELIVERED'
@@ -640,6 +642,7 @@ async def get_pending_notification_events(limit: int = 50, db_path: str = DB_PAT
             "dedupe_key": row["dedupe_key"],
             "payload": json.loads(row["payload_json"] or "{}"),
             "channels": [],
+            "slack_route": row["slack_route"],
         })
         item["channels"].append(row["channel"])
     return list(grouped.values())

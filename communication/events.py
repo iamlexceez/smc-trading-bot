@@ -58,6 +58,7 @@ class NotificationEvent:
     dedupe_key: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
     channels: tuple[DeliveryChannel, ...] | None = None
+    slack_route: str = "alerts"
     event_id: str = field(default_factory=lambda: str(uuid4()))
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     photo: bytes | None = field(default=None, repr=False, compare=False)
@@ -91,5 +92,6 @@ class NotificationEvent:
             "dedupe_key": self.resolved_dedupe_key,
             "payload": self.payload,
             "channels": [channel.value for channel in self.target_channels],
+            "slack_route": self.slack_route,
             "created_at": self.created_at.isoformat(),
         }
