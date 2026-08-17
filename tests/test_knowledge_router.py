@@ -220,3 +220,24 @@ def test_core_portfolio_selection_rejects_highly_correlated_candidates():
     )
     assert selection.selected == ("A", "C")
     assert selection.rejected[0]["instrument"] == "B"
+
+
+def test_feature_importance_records_classify_unknown_redundant_and_supported():
+    from analysis.research_governance import ResearchGovernance
+    from config import TradeSettings
+
+    governance = ResearchGovernance(TradeSettings.defaults())
+    rows = []
+    for index in range(20):
+        rows.append({
+            "symbol": "Boom 500 Index", "strategy_id": "s1", "regime": "TRENDING", "timeframe": "M15",
+            "pnl_r": 0.8 if index < 10 else 0.1,
+            "features": {"displacement": index < 10, "redundant_feature": index < 5 or 10 <= index < 15},
+        })
+    records = governance.feature_importance_records(rows)
+    by_feature = {row["feature_name"]: row for row in records}
+    assert by_feature["displacement"]["evidence_state"] == "SUPPORTED"
+    assert by_feature["redundant_feature"]["evidence_state"] == "REDUNDANT"
+
+    sparse = governance.feature_importance_records(rows[:6])
+    assert all(row["evidence_state"] == "INSUFFICIENT_EVIDENCE" for row in sparse)

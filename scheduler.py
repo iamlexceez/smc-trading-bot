@@ -589,6 +589,23 @@ class MarketScheduler:
             except Exception as exc:
                 # Profile telemetry cannot block universe refresh or execution.
                 logger.warning("Could not persist specialization profile for %s: %s", profile.get("instrument"), exc)
+        for evidence in self.research_governance.feature_importance_records(outcomes):
+            try:
+                await db.upsert_feature_importance_evidence(
+                    account_mode=self.settings.trading_mode,
+                    symbol=str(evidence.get("symbol") or ""),
+                    strategy_id=str(evidence.get("strategy_id") or "UNKNOWN"),
+                    regime=str(evidence.get("regime") or "UNKNOWN"),
+                    timeframe=str(evidence.get("timeframe") or "UNKNOWN"),
+                    feature_name=str(evidence.get("feature_name") or ""),
+                    importance=evidence.get("importance"),
+                    stability=evidence.get("stability"),
+                    incremental_value=evidence.get("incremental_value"),
+                    sample_size=int(evidence.get("sample_size") or 0),
+                    evidence_state=str(evidence.get("evidence_state") or "UNKNOWN"),
+                )
+            except Exception as exc:
+                logger.warning("Could not persist feature-importance evidence for %s/%s: %s", evidence.get("symbol"), evidence.get("feature_name"), exc)
         selected = await self._apply_operational_objective(broker_usable_symbols, snapshot)
         self._set_execution_selected_symbols(selected)
         self.settings.enabled_symbols = selected

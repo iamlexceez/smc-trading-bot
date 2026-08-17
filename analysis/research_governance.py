@@ -78,6 +78,53 @@ class ResearchGovernance:
         except (TypeError, ValueError):
             return None
 
+    def feature_importance_records(self, outcomes: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Compare realized expectancy with and without each observed feature."""
+        groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        for row in outcomes:
+            if row.get("pnl_r") is None:
+                continue
+            key = (
+                str(row.get("symbol") or ""),
+                str(row.get("strategy_id") or row.get("setup_type") or "UNKNOWN"),
+                str(row.get("regime") or "UNKNOWN"),
+                str(row.get("timeframe") or "UNKNOWN"),
+            )
+            groups[key].append(row)
+        records: list[dict[str, Any]] = []
+        for (symbol, strategy_id, regime, timeframe), rows in groups.items():
+            feature_names = sorted({
+                str(name) for row in rows for name, value in dict(row.get("features") or {}).items()
+                if isinstance(value, bool)
+            })
+            for feature_name in feature_names:
+                present = [row for row in rows if bool((row.get("features") or {}).get(feature_name))]
+                absent = [row for row in rows if not bool((row.get("features") or {}).get(feature_name))]
+                sample_size = len(rows)
+                if len(present) < 5 or len(absent) < 5:
+                    records.append({
+                        "symbol": symbol, "strategy_id": strategy_id, "regime": regime, "timeframe": timeframe,
+                        "feature_name": feature_name, "importance": None, "stability": None,
+                        "incremental_value": None, "sample_size": sample_size,
+                        "evidence_state": "INSUFFICIENT_EVIDENCE",
+                    })
+                    continue
+                present_metric = PolicyEvaluator.evaluate(present).to_dict()
+                absent_metric = PolicyEvaluator.evaluate(absent).to_dict()
+                present_expectancy = float(present_metric.get("expectancy_r") or 0.0)
+                absent_expectancy = float(absent_metric.get("expectancy_r") or 0.0)
+                incremental = present_expectancy - absent_expectancy
+                combined_volatility = (float(present_metric.get("return_volatility_r") or 0.0) + float(absent_metric.get("return_volatility_r") or 0.0)) / 2.0
+                stability = max(0.0, min(1.0, 1.0 / (1.0 + abs(combined_volatility))))
+                importance = max(0.0, min(1.0, abs(incremental) / 2.0))
+                state = "REDUNDANT" if abs(incremental) < 0.05 else "SUPPORTED" if incremental > 0 else "HARMFUL"
+                records.append({
+                    "symbol": symbol, "strategy_id": strategy_id, "regime": regime, "timeframe": timeframe,
+                    "feature_name": feature_name, "importance": importance, "stability": stability,
+                    "incremental_value": incremental, "sample_size": sample_size, "evidence_state": state,
+                })
+        return records
+
     def rank_instrument_specialization(
         self,
         broker_usable_symbols: Iterable[str],
