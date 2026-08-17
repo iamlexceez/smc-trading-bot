@@ -15,20 +15,20 @@ The specification also requires preservation of DEMO/LIVE separation, broker and
 | Specification area | Current repository components | Initial assessment |
 |---|---|---|
 | Data and broker | `data/provider.py`, `data/universe.py`, `executors/mt5.py` | Present; broker-authoritative universe and MT5 isolation exist |
-| Context and regime | `analysis/market_state.py`, `analysis/sessions.py`, order-flow and structure modules | Present but requires contract audit against the specified vocabulary |
+| Context and regime | `analysis/market_state.py`, `analysis/sessions.py`, order-flow and structure modules, `knowledge/context.py` | Present; normalized `MarketContext` contract and controlled regime vocabulary are now available |
 | Structure/liquidity | `analysis/structure.py`, `analysis/liquidity.py`, `analysis/displacement.py`, `analysis/supply_demand.py` | Present; deterministic event metadata and timing require verification |
-| Knowledge | `analysis/expert_knowledge.py`, `strategy/registry.py` | Present in partial form; a unified machine-readable knowledge registry is not yet proven |
-| Strategy routing | `strategy/selection.py`, `strategy/registry.py`, `analysis/opportunity.py` | Present; routing and strategy-combination authority require integration audit |
-| Evidence | `analysis/evidence.py`, `analysis/decision_gates.py`, `analysis/research_governance.py`, `storage/db.py` | Present; evidence classes and counterfactual persistence exist in partial form |
-| Meta-decision | `analysis/decision_gates.py`, scheduler handoff | Present; final thesis/decision record completeness requires audit |
+| Knowledge | `analysis/expert_knowledge.py`, `strategy/registry.py`, `knowledge/registry.py` | Unified machine-readable registry added; expert priors remain hypotheses until evidence supports them |
+| Strategy routing | `strategy/selection.py`, `strategy/registry.py`, `analysis/opportunity.py`, `knowledge/router.py` | Context-aware descriptive router is integrated; it never authorizes orders |
+| Evidence | `analysis/evidence.py`, `analysis/decision_gates.py`, `analysis/research_governance.py`, `knowledge/combinations.py`, `storage/db.py` | Independent combination comparison and additive feature/combination persistence added; live learning integration remains partial |
+| Meta-decision | `analysis/decision_gates.py`, scheduler handoff, `decision_records` | Complete structured decision records now persist for trade and no-trade outcomes; final gate remains authoritative |
 | Risk and sizing | `risk/manager.py`, `strategy/setup_validator.py`, `executors/mt5.py`, `analysis/capital_state.py` | Present; broker economics and small-account behavior require end-to-end tests |
 | Execution | `execution/manager.py`, `executors/mt5.py`, `execution/capital_reduction.py` | Present; deterministic broker validation is retained |
 | Position management | `analysis/adaptive_management.py`, `analysis/capital_protection.py`, scheduler position jobs | Present and independent of scanner state |
-| Outcomes and learning | `analysis/optimizer.py`, `analysis/research_governance.py`, `storage/db.py` | Present; promotion, rollback, drift, and feature/combo evidence require completion audit |
+| Outcomes and learning | `analysis/optimizer.py`, `analysis/drift.py`, `analysis/research_governance.py`, `storage/db.py` | Chronological promotion and DEMO rollback exist; explicit drift classification and feature/combo evidence storage are added |
 | Objective | `analysis/objectives.py`, `analysis/objective_phases.py`, scheduler and handlers | Present and must remain separate from intelligence |
 | Communication | `communication/events.py`, `communication/notification_manager.py`, `communication/command_bus.py`, `communication/control_service.py`, `communication/slack_control.py`, Telegram handlers | Shared notification and command foundations present; legacy command migration remains partial |
 | Persistence | `storage/db.py` | Present; notification and command audit tables added |
-| Testing | `tests/*.py`, `tests/smoke_upgrade.py` | Present; broad subsystem and end-to-end coverage remains incomplete |
+| Testing | `tests/*.py`, `tests/smoke_upgrade.py` | 38 tests pass plus smoke; broker-mock, walk-forward, and full cross-subsystem coverage remain incomplete |
 | Startup/recovery | `main.py`, `scheduler.py`, autonomous DEMO recovery | Present; latest resume fix is commit `25484ee` and requires VPS validation |
 
 ## Confirmed existing strengths
@@ -38,12 +38,12 @@ The repository already has explicit decision gates, broker-authoritative symbol 
 ## Initial gaps to verify before implementation
 
 1. Whether all strategy decisions pass through one authoritative context-aware router.
-2. Whether knowledge concepts, combinations, conflicts, and incremental value are represented as persistent machine-readable evidence.
-3. Whether every trade and rejected trade has the complete structured decision record required by the specification.
+2. Whether knowledge concepts, combinations, conflicts, and incremental value are represented as persistent machine-readable evidence. **Combination comparison and persistence are now implemented; broader live population is pending.**
+3. Whether every trade and rejected trade has the complete structured decision record required by the specification. **The `decision_records` table and scheduler write path now cover this boundary.**
 4. Whether regime vocabulary and top-down alignment are normalized across all analysis paths.
 5. Whether small-account economics are enforced consistently from theoretical sizing through broker-normalized volume and margin.
-6. Whether champion/challenger/core/quarantined promotion has explicit out-of-sample, forward-DEMO, drawdown, robustness, and rollback criteria.
-7. Whether model drift and feature importance are persisted and can reduce authority without silently changing production behavior.
+6. Whether champion/challenger/core/quarantined promotion has explicit out-of-sample, forward-DEMO, drawdown, robustness, and rollback criteria. **Instrument-role classification and model rollback exist; deeper promotion metrics remain to be wired into live governance.**
+7. Whether model drift and feature importance are persisted and can reduce authority without silently changing production behavior. **Drift classification and feature-importance storage now exist; automatic authority reduction remains bounded by the existing DEMO-only governance path.**
 8. Whether individual symbol, strategy, and messaging failures remain isolated from the rest of the system.
 9. Whether all research and backtest paths are chronological and free of future-data leakage.
 10. Whether the running scheduler actually invokes every newly introduced module rather than leaving dead interfaces.
@@ -70,4 +70,4 @@ Current contradictions requiring resolution or explicit compatibility treatment 
 
 ## Audit status
 
-The repository is sufficiently mapped to begin a first implementation slice, but the full specification is substantially broader than a single patch. Work should proceed by adding explicit contracts and tests, then migrating live scheduler calls so no new module remains unused.
+The first implementation slices are validated and pushed. The repository now has explicit context, knowledge, decision-record, combination-evidence, economic-regime, instrument-role, and drift contracts. The full specification is still broader than these slices: feature-importance population, complete walk-forward/backtesting, weekend research orchestration, and end-to-end broker-mock coverage remain open. Work should continue by wiring each new contract to durable evidence producers and tests before any claim of institutional completeness.
