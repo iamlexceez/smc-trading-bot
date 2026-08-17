@@ -46,3 +46,39 @@ def test_structured_decision_record_persists_trade_and_no_trade_fields(tmp_path:
         assert '"sample_size": 0' in row["evidence_json"]
 
     asyncio.run(scenario())
+
+
+def test_feature_and_combination_evidence_upsert(tmp_path: Path):
+    async def scenario():
+        path = tmp_path / "evidence.db"
+        await db.init_db(str(path))
+        await db.upsert_feature_importance_evidence(
+            account_mode="demo", symbol="Boom 500 Index", strategy_id="s1",
+            regime="TRENDING_BULLISH", timeframe="M15", feature_name="displacement",
+            importance=0.7, stability=0.8, incremental_value=0.2, sample_size=30,
+            evidence_state="SUPPORTED", db_path=str(path),
+        )
+        await db.record_strategy_combination_evidence(
+            account_mode="demo", symbol="Boom 500 Index", regime="TRENDING_BULLISH",
+            timeframe="M15", combination_id="a+b", concepts=["a", "b"],
+            single_a_expectancy_r=0.2, single_b_expectancy_r=0.1,
+            combined_expectancy_r=0.5, incremental_expectancy_r=0.3,
+            sample_size=30, state="PROMOTABLE_CANDIDATE", reason="incremental value",
+            db_path=str(path),
+        )
+        async with db.aiosqlite.connect(str(path)) as conn:
+            conn.row_factory = db.aiosqlite.Row
+            feature = await (await conn.execute(
+                "SELECT importance, evidence_state FROM feature_importance_evidence WHERE feature_name = ?",
+                ("displacement",),
+            )).fetchone()
+            combination = await (await conn.execute(
+                "SELECT combined_expectancy_r, state FROM strategy_combination_evidence WHERE combination_id = ?",
+                ("a+b",),
+            )).fetchone()
+        assert feature["importance"] == 0.7
+        assert feature["evidence_state"] == "SUPPORTED"
+        assert combination["combined_expectancy_r"] == 0.5
+        assert combination["state"] == "PROMOTABLE_CANDIDATE"
+
+    asyncio.run(scenario())

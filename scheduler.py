@@ -3831,20 +3831,26 @@ class MarketScheduler:
         only execution-critical events. A symbol/stage event is emitted once per
         fingerprint; a short time throttle protects Telegram from M1 bursts.
         """
-        # System-critical messages and essential updates bypass the global notification 
-        # toggle to ensure the user is never left without feedback during manual actions.
-        if not self.settings.chart_activity_notifications and not essential:
+        # A fully initialized runtime always has settings. Diagnostic probes and
+        # recovery paths may construct a scheduler shell before configuration is
+        # attached; reporting must never turn that into a scanner failure.
+        settings = getattr(self, "settings", None)
+        if settings is None:
             return False
-        level = self.settings.chart_activity_level
+        # System-critical messages and essential updates bypass the global notification
+        # toggle to ensure the user is never left without feedback during manual actions.
+        if not settings.chart_activity_notifications and not essential:
+            return False
+        level = settings.chart_activity_level
         if (level == "off" or (level == "essential" and not essential)) and not essential:
             return False
-        if stage == "validation_rejected" and not self.settings.chart_activity_include_rejections:
+        if stage == "validation_rejected" and not settings.chart_activity_include_rejections:
             return False
 
         key = f"{symbol}:{stage}"
         now = monotonic()
         prior = self._chart_activity_ledger.get(key)
-        cooldown = max(30, int(self.settings.chart_activity_cooldown_seconds))
+        cooldown = max(30, int(settings.chart_activity_cooldown_seconds))
         if prior and prior[0] == fingerprint:
             return False
         

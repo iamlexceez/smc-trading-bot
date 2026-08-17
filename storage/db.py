@@ -118,6 +118,44 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS feature_importance_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_mode TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                regime TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                feature_name TEXT NOT NULL,
+                importance REAL,
+                stability REAL,
+                incremental_value REAL,
+                sample_size INTEGER NOT NULL DEFAULT 0,
+                evidence_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                updated_at TEXT NOT NULL,
+                UNIQUE(account_mode, symbol, strategy_id, regime, timeframe, feature_name)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_combination_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_mode TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                regime TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                combination_id TEXT NOT NULL,
+                concepts_json TEXT NOT NULL DEFAULT '[]',
+                single_a_expectancy_r REAL,
+                single_b_expectancy_r REAL,
+                combined_expectancy_r REAL,
+                incremental_expectancy_r REAL,
+                sample_size INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'INSUFFICIENT_EVIDENCE',
+                reason TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                UNIQUE(account_mode, symbol, regime, timeframe, combination_id)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS strategy_transition_evidence (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_mode TEXT NOT NULL,
@@ -577,6 +615,8 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode_status ON trades(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_decision_records_context ON decision_records(account_mode, instrument, regime, strategy, created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_evidence_context ON strategy_evidence(account_mode, symbol, regime, strategy_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_feature_importance_context ON feature_importance_evidence(account_mode, symbol, regime, strategy_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_combination_evidence_context ON strategy_combination_evidence(account_mode, symbol, regime, timeframe)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_transition_context ON strategy_transition_evidence(account_mode, symbol, previous_regime, regime, strategy_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_demo_session ON trades(demo_session_id, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_objective_phase ON trades(objective_phase_id, status)")
@@ -936,6 +976,79 @@ async def record_decision_record(
                 json.dumps(execution_state or {}, sort_keys=True), decision, reason,
                 json.dumps(thesis or {}, sort_keys=True), now,
             ),
+        )
+        await conn.commit()
+
+
+async def upsert_feature_importance_evidence(
+    *,
+    account_mode: str,
+    symbol: str,
+    strategy_id: str,
+    regime: str,
+    timeframe: str,
+    feature_name: str,
+    importance: Optional[float] = None,
+    stability: Optional[float] = None,
+    incremental_value: Optional[float] = None,
+    sample_size: int = 0,
+    evidence_state: str = "UNKNOWN",
+    db_path: str = DB_PATH,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """INSERT INTO feature_importance_evidence
+               (account_mode, symbol, strategy_id, regime, timeframe, feature_name,
+                importance, stability, incremental_value, sample_size, evidence_state, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(account_mode, symbol, strategy_id, regime, timeframe, feature_name)
+               DO UPDATE SET importance=excluded.importance, stability=excluded.stability,
+                 incremental_value=excluded.incremental_value, sample_size=excluded.sample_size,
+                 evidence_state=excluded.evidence_state, updated_at=excluded.updated_at""",
+            (account_mode, symbol, strategy_id, regime, timeframe, feature_name,
+             importance, stability, incremental_value, max(0, int(sample_size)), evidence_state, now),
+        )
+        await conn.commit()
+
+
+async def record_strategy_combination_evidence(
+    *,
+    account_mode: str,
+    symbol: str,
+    regime: str,
+    timeframe: str,
+    combination_id: str,
+    concepts: list | tuple,
+    single_a_expectancy_r: Optional[float] = None,
+    single_b_expectancy_r: Optional[float] = None,
+    combined_expectancy_r: Optional[float] = None,
+    incremental_expectancy_r: Optional[float] = None,
+    sample_size: int = 0,
+    state: str = "INSUFFICIENT_EVIDENCE",
+    reason: str = "",
+    db_path: str = DB_PATH,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """INSERT INTO strategy_combination_evidence
+               (account_mode, symbol, regime, timeframe, combination_id, concepts_json,
+                single_a_expectancy_r, single_b_expectancy_r, combined_expectancy_r,
+                incremental_expectancy_r, sample_size, state, reason, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(account_mode, symbol, regime, timeframe, combination_id)
+               DO UPDATE SET concepts_json=excluded.concepts_json,
+                 single_a_expectancy_r=excluded.single_a_expectancy_r,
+                 single_b_expectancy_r=excluded.single_b_expectancy_r,
+                 combined_expectancy_r=excluded.combined_expectancy_r,
+                 incremental_expectancy_r=excluded.incremental_expectancy_r,
+                 sample_size=excluded.sample_size, state=excluded.state,
+                 reason=excluded.reason, updated_at=excluded.updated_at""",
+            (account_mode, symbol, regime, timeframe, combination_id,
+             json.dumps(list(concepts or []), sort_keys=True), single_a_expectancy_r,
+             single_b_expectancy_r, combined_expectancy_r, incremental_expectancy_r,
+             max(0, int(sample_size)), state, reason, now),
         )
         await conn.commit()
 
