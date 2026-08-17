@@ -106,7 +106,7 @@ def test_insufficient_evidence_can_be_controlled_forward_demo_exploration() -> N
     assert decision.hard_gate_results == {
         "broker_symbol": True, "market_data": True, "setup_geometry": True,
         "objective": True, "portfolio": True, "required_htf_context": True,
-        "risk_policy": True,
+        "risk_policy": True, "capital_efficiency": True,
     }
 
 

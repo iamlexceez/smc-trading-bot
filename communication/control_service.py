@@ -89,7 +89,7 @@ class SharedControlService:
 
     async def positions(self, request: CommandRequest) -> str:
         try:
-            positions = await self.scheduler.executor.get_positions()
+            positions = await self.scheduler.executor.get_open_positions()
         except Exception as exc:
             return f"POSITIONS UNAVAILABLE\nReason: {type(exc).__name__}"
         if not positions:

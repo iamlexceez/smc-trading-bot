@@ -281,6 +281,7 @@ def evaluate_trading_gate(
         "portfolio": "Portfolio context",
         "required_htf_context": "Required top-down context",
         "risk_policy": "Risk policy validity",
+        "capital_efficiency": "Capital efficiency",
     }
     failures = [hard_labels[name] for name in hard_failures]
     reason_codes = [

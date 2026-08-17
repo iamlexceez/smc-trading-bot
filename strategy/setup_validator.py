@@ -246,7 +246,7 @@ class SetupValidator:
         stop_atr_buffer: float = 0.15,
         require_ltf_confirmation: bool = True,
         rr_filter_enabled: bool = True,
-        preferred_rr: float = 3.0,
+        preferred_rr: float = 2.0,
         allow_low_rr_experiment: bool = False,
     ):
         self.min_rr = max(0.0, float(min_rr))
@@ -322,9 +322,9 @@ class SetupValidator:
             return
 
         policy_target = result.target_source == "policy_rr_target"
-        normal_floor = self.min_rr if self.rr_filter_enabled else 2.0
+        normal_floor = self.min_rr if self.rr_filter_enabled else 0.0
         rr_pass = rr_filter_passes(result.rr_ratio, self.min_rr) if self.rr_filter_enabled else True
-        if policy_target and result.rr_ratio < normal_floor and not self.allow_low_rr_experiment:
+        if policy_target and self.rr_filter_enabled and result.rr_ratio < normal_floor and not self.allow_low_rr_experiment:
             rr_pass = False
             rr_detail = (
                 f"POLICY_TARGET_BELOW_NORMAL_RR: policy target produced 1:{result.rr_ratio:.8f}; "
