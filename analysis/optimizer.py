@@ -17,6 +17,7 @@ from statistics import mean
 from typing import Any, Optional
 
 from analysis.drift import detect_model_drift
+from analysis.walk_forward import build_walk_forward_split
 from analysis.research_governance import ResearchGovernance
 from analysis.policies import (
     ExperimentalPolicy,
@@ -51,28 +52,19 @@ class SelfOptimizer:
         """Backward-compatible multi-metric evaluation based on completed R outcomes."""
         return PolicyEvaluator.evaluate(rows).to_dict()
 
-    def _windows(self, rows: list[dict]) -> Optional[tuple[list[dict], list[dict], list[dict], dict]]:
-        """Split chronological outcomes into training, validation, and unseen OOS data."""
-        ordered = sorted(rows, key=lambda item: item["timestamp"])
-        minimum = max(self.settings.optimization_min_sample_size, self.settings.optimization_min_split_size * 3)
-        if len(ordered) < minimum:
+    def _windows(self, rows: list[dict]) -> Optional[tuple[list[dict], list[dict], list[dict], list[dict], dict]]:
+        """Split outcomes into strictly chronological Train/Validate/Test/Forward windows."""
+        split = build_walk_forward_split(
+            rows,
+            minimum_split_size=self.settings.optimization_min_split_size,
+            fractions=(0.50, 0.20, 0.15, 0.15),
+        )
+        if split is None or len(rows) < self.settings.optimization_min_sample_size:
             return None
-        train_end = int(len(ordered) * 0.60)
-        validation_end = int(len(ordered) * 0.80)
-        train = ordered[:train_end]
-        validation = ordered[train_end:validation_end]
-        out_of_sample = ordered[validation_end:]
-        min_split = self.settings.optimization_min_split_size
-        if min(len(train), len(validation), len(out_of_sample)) < min_split:
-            return None
-        return train, validation, out_of_sample, {
-            "training_start": train[0]["timestamp"],
-            "training_end": train[-1]["timestamp"],
-            "validation_start": validation[0]["timestamp"],
-            "validation_end": validation[-1]["timestamp"],
-            "out_of_sample_start": out_of_sample[0]["timestamp"],
-            "out_of_sample_end": out_of_sample[-1]["timestamp"],
-        }
+        windows = dict(split.windows)
+        windows["chronological"] = True
+        windows["leakage_audit"] = "strict_timestamp_order_and_non_overlapping_windows"
+        return list(split.training), list(split.validation), list(split.test), list(split.forward), windows
 
     @staticmethod
     def _policy_rows(rows: list[dict], policy: ExperimentalPolicy) -> list[dict]:
@@ -122,8 +114,17 @@ class SelfOptimizer:
         evaluation["risk_pct"] = risk_pct
         return evaluation
 
-    def _evaluate_policy(self, policy: ExperimentalPolicy, train: list[dict], validation: list[dict], oos: list[dict]) -> dict:
+    def _evaluate_policy(
+        self,
+        policy: ExperimentalPolicy,
+        train: list[dict],
+        validation: list[dict],
+        oos: list[dict],
+        historical_forward: Optional[list[dict]] = None,
+    ) -> dict:
         slices = {"training": train, "validation": validation, "out_of_sample": oos}
+        if historical_forward is not None:
+            slices["historical_forward"] = historical_forward
         evidence: dict[str, Any] = {"policy": policy.to_dict(), "policy_fingerprint": policy.fingerprint}
         for name, rows in slices.items():
             eligible = self._policy_rows(rows, policy)
@@ -296,7 +297,7 @@ class SelfOptimizer:
         hypotheses = await self._persist_hypotheses("demo", rows)
         split = self._windows(rows)
         if split is None:
-            required = max(self.settings.optimization_min_sample_size, self.settings.optimization_min_split_size * 3)
+            required = max(self.settings.optimization_min_sample_size, self.settings.optimization_min_split_size * 4)
             result = {
                 "decision": "no_change_insufficient_evidence",
                 "champion": champion["version"],
@@ -308,14 +309,14 @@ class SelfOptimizer:
             await db.log_optimization_run(account_mode="demo", decision=result["decision"], details=result, champion_version=champion["version"])
             return result
 
-        train, validation, oos, windows = split
+        train, validation, oos, historical_forward, windows = split
         champion_policy = ExperimentalPolicy.from_dict(champion["parameters"])
-        baseline = self._evaluate_policy(champion_policy, train, validation, oos)
+        baseline = self._evaluate_policy(champion_policy, train, validation, oos, historical_forward)
         research_budget = {
             "candidate_limit": 24,
-            "minimum_total_samples": max(self.settings.optimization_min_sample_size, self.settings.optimization_min_split_size * 3),
+            "minimum_total_samples": max(self.settings.optimization_min_sample_size, self.settings.optimization_min_split_size * 4),
             "minimum_split_size": self.settings.optimization_min_split_size,
-            "chronological_windows": {"training": 0.60, "validation": 0.20, "locked_out_of_sample": 0.20},
+            "chronological_windows": {"training": 0.50, "validation": 0.20, "test": 0.15, "historical_forward": 0.15},
             "random_cross_validation": False,
         }
         candidates = self.generator.generate([hypothesis for hypothesis, _ in hypotheses], limit=research_budget["candidate_limit"])
@@ -326,8 +327,8 @@ class SelfOptimizer:
             if policy.fingerprint == champion_policy.fingerprint:
                 continue
             policies_evaluated += 1
-            evidence = self._evaluate_policy(policy, train, validation, oos)
-            if min(evidence[name]["sample_size"] for name in ("training", "validation", "out_of_sample")) < min_split:
+            evidence = self._evaluate_policy(policy, train, validation, oos, historical_forward)
+            if min(evidence[name]["sample_size"] for name in ("training", "validation", "out_of_sample", "historical_forward")) < min_split:
                 continue
             validation_metric = evidence["validation_hypothetical_risk_simulation"]
             if self._finite_objective(validation_metric) <= 0:

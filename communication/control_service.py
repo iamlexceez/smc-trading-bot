@@ -74,6 +74,8 @@ class SharedControlService:
     async def engine(self, request: CommandRequest) -> str:
         runtime = self.scheduler.telemetry.snapshot(include_lifetime=True)
         components = runtime.get("components") or {}
+        tracker = getattr(self.scheduler, "invocation_tracker", None)
+        invocation = tracker.summary() if tracker is not None else {}
         return "\n".join([
             "ENGINE",
             f"Market scanner: {(components.get('market_scanner') or {}).get('state', 'UNKNOWN')}",
@@ -82,6 +84,7 @@ class SharedControlService:
             f"Position manager: {(components.get('position_manager') or {}).get('state', 'UNKNOWN')}",
             f"Learning: {(components.get('learning_engine') or {}).get('state', 'UNKNOWN')}",
             f"Last scan: {getattr(self.scheduler, '_last_scan_disposition', {}).get('state', 'UNKNOWN')}",
+            f"Invocation matrix: {invocation.get('complete_modules', 0)}/{invocation.get('total_modules', 0)} complete",
         ])
 
     async def positions(self, request: CommandRequest) -> str:
