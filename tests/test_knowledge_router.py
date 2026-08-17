@@ -107,3 +107,20 @@ def test_instrument_roles_distinguish_unknown_negative_and_core_evidence():
         evidence={"sample_size": 30, "expectancy_r": 0.3, "max_drawdown_r": 1.0, "execution_reliability": 0.99},
         minimum_sample_size=30, max_manageable_drawdown_r=2.0, minimum_execution_reliability=0.95,
     ).role == "CORE"
+
+
+def test_model_drift_distinguishes_sparse_data_from_deterioration():
+    from analysis.drift import detect_model_drift
+
+    assert detect_model_drift(
+        {"expectancy_r": 0.4, "sample_size": 30}, {"expectancy_r": -0.5, "sample_size": 2},
+        minimum_sample_size=10, max_expectancy_decline_r=0.2,
+    ).state == "INSUFFICIENT_EVIDENCE"
+    assert detect_model_drift(
+        {"expectancy_r": 0.4, "sample_size": 30}, {"expectancy_r": 0.1, "sample_size": 10},
+        minimum_sample_size=10, max_expectancy_decline_r=0.2,
+    ).state == "DRIFT"
+    assert detect_model_drift(
+        {"expectancy_r": 0.4, "sample_size": 30}, {"expectancy_r": 0.3, "sample_size": 10},
+        minimum_sample_size=10, max_expectancy_decline_r=0.2,
+    ).state == "STABLE"

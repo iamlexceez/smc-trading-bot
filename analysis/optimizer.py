@@ -16,6 +16,7 @@ from datetime import datetime
 from statistics import mean
 from typing import Any, Optional
 
+from analysis.drift import detect_model_drift
 from analysis.research_governance import ResearchGovernance
 from analysis.policies import (
     ExperimentalPolicy,
@@ -408,8 +409,15 @@ class SelfOptimizer:
             return None
         champion_policy = ExperimentalPolicy.from_dict(champion.get("parameters") or {})
         realized = self._historical_simulation(rows, champion_policy)
-        benchmark = float((champion.get("performance") or {}).get("forward_demo", {}).get("expectancy_r", 0.0))
-        if realized["expectancy_r"] >= benchmark - self.settings.optimization_rollback_tolerance and realized["expectancy_r"] >= 0:
+        benchmark_metric = dict((champion.get("performance") or {}).get("forward_demo", {}) or {})
+        benchmark = float(benchmark_metric.get("expectancy_r", 0.0))
+        drift = detect_model_drift(
+            {"expectancy_r": benchmark, "sample_size": benchmark_metric.get("sample_size") or len(rows)},
+            {"expectancy_r": realized.get("expectancy_r"), "sample_size": len(rows)},
+            minimum_sample_size=self.settings.optimization_min_split_size,
+            max_expectancy_decline_r=self.settings.optimization_rollback_tolerance,
+        )
+        if drift.state != "DRIFT" or realized["expectancy_r"] >= 0:
             return None
         previous = await db.get_model_version(champion["previous_version"], "demo")
         if not previous:
@@ -419,7 +427,7 @@ class SelfOptimizer:
         await db.save_settings(self.settings)
         result = {
             "decision": "rolled_back", "from_version": champion["version"], "to_version": previous["version"],
-            "realized": realized, "benchmark_expectancy_r": benchmark,
+            "realized": realized, "benchmark_expectancy_r": benchmark, "drift": drift.to_dict(),
             "reason": "Post-promotion actual DEMO evidence deteriorated relative to the approved forward-DEMO benchmark.",
         }
         await db.log_optimization_run(
