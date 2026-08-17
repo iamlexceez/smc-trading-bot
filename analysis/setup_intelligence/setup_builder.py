@@ -17,7 +17,15 @@ from analysis.setup_intelligence.setup_validator import validate_setup
 from analysis.setup_intelligence.setup_quality import calculate_quality
 
 
-def build_setup(symbol: str, timeframe: str, df: pd.DataFrame) -> TradeSetup | None:
+def build_setup(
+    symbol: str,
+    timeframe: str,
+    df: pd.DataFrame,
+    *,
+    preferred_rr: float = 2.0,
+    min_rr: float = 1.5,
+    stop_atr_buffer_multiplier: float = 0.0,
+) -> TradeSetup | None:
     # 1. Market State
     ctx = analyze_market_context(symbol, df)
     regime = ctx["regime"]
@@ -50,7 +58,7 @@ def build_setup(symbol: str, timeframe: str, df: pd.DataFrame) -> TradeSetup | N
     sl = calculate_stop_loss(direction, entry_price, poi["low"], poi["high"], atr)
 
     # 7. Target (TP)
-    tp = calculate_target(direction, entry_price, sl, preferred_rr=2.0)
+    tp = calculate_target(direction, entry_price, sl, preferred_rr=preferred_rr)
 
     risk_dist = abs(entry_price - sl)
     reward_dist = abs(tp - entry_price)
@@ -87,7 +95,7 @@ def build_setup(symbol: str, timeframe: str, df: pd.DataFrame) -> TradeSetup | N
         updated_at=now_iso,
     )
 
-    valid, reason = validate_setup(setup)
+    valid, reason = validate_setup(setup, min_rr=min_rr)
     setup.final_eligibility = valid
     setup.decision_reason = reason
     setup.quality_score = calculate_quality(setup)

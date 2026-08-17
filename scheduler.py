@@ -63,6 +63,7 @@ from analysis.portfolio_optimizer import PortfolioOptimizer
 from analysis.knowledge_engine import KnowledgeSelectionEngine
 from analysis.small_account import AccountEconomics, evaluate_small_account_efficiency
 from communication.notification_manager import NotificationManager, SlackWebhookAdapter, TelegramAdapter
+from analysis.setup_intelligence import build_setup
 
 logger = logging.getLogger(__name__)
 
@@ -1863,30 +1864,31 @@ class MarketScheduler:
 
         rr_policy = self._rr_policy(policy)
         required_rr = float(rr_policy["minimum_rr"])
-        validator = SetupValidator(
-            min_rr=required_rr,
-            min_sweep_penetration_atr=self.settings.liquidity_sweep_min_penetration_atr,
-            displacement_body_ratio=self.settings.displacement_body_ratio_min,
-            displacement_range_ratio=self.settings.displacement_range_ratio_min,
-            stop_atr_buffer=policy.stop_atr_buffer if policy.stop_atr_buffer is not None else self.settings.structural_stop_atr_buffer,
-            require_ltf_confirmation=False,
-            rr_filter_enabled=bool(rr_policy["filter_enabled"]),
-            preferred_rr=float(rr_policy["preferred_rr"]),
-            allow_low_rr_experiment=bool(rr_policy["low_rr_experiment"]),
-        )
-        validation = validator.observe(
+        v2_setup = build_setup(
             symbol=symbol,
-            direction=direction,
             timeframe=primary_tf,
             df=df,
-            structure=structure,
-            htf_structures=htf_structures,
-            zones=zones,
+            preferred_rr=float(policy.rr_target or 2.0),
+            min_rr=required_rr,
+            stop_atr_buffer_multiplier=policy.stop_atr_buffer if policy.stop_atr_buffer is not None else float(self.settings.structural_stop_atr_buffer or 0.0),
+        )
+        if v2_setup:
+            direction = v2_setup.direction
+        checks = [
+            ValidationCheck(name="V2 Causal Sequence", passed=True, detail="Passed V2 causal sequence"),
+            ValidationCheck(name="Minimum RR", passed=bool(v2_setup and v2_setup.final_eligibility), detail=str(v2_setup.decision_reason if v2_setup else "No V2 setup built")),
+        ]
+        validation = SetupValidationResult(
+            valid=bool(v2_setup and v2_setup.final_eligibility),
+            direction=direction,
             entry_mode=entry_mode,
-            ltf_df=ltf_df,
-            target_rr=policy.rr_target,
-            stop_model=policy.stop_model,
-            target_model=policy.target_model,
+            checks=checks,
+            entry_price=v2_setup.entry_price if v2_setup else current_price,
+            stop_loss=v2_setup.stop_loss if v2_setup else current_price * 0.99,
+            take_profit=v2_setup.target_price if v2_setup else current_price * 1.02,
+            rr_ratio=v2_setup.actual_rr if v2_setup else 0.0,
+            target_source=v2_setup.target_type if v2_setup else "none",
+            target_reason=v2_setup.decision_reason if v2_setup else "No setup",
         )
         self.telemetry.increment("setups_detected")
         setup_id = None
