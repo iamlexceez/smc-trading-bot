@@ -337,9 +337,20 @@ class ResearchGovernance:
     ) -> dict[str, Any]:
         """Return the complete auditable selection and non-revenge state."""
         outcome_rows = list(outcomes)
+        market_selection = self.rank_markets(broker_usable_symbols, outcome_rows)
+        instrument_specialization = self.rank_instrument_specialization(broker_usable_symbols, outcome_rows, instrument_metadata)
+        research_limit = max(1, int(self.settings.research_market_limit))
+        core_symbols = list(instrument_specialization.get("core_symbols") or [])
+        opportunity_symbols = list(market_selection.get("selected_symbols") or [])
+        research_cohort = list(dict.fromkeys(core_symbols + opportunity_symbols))[:research_limit]
+        market_selection["research_cohort_symbols"] = research_cohort
+        market_selection["research_cohort_explanation"] = (
+            "Earned Core instruments are prioritized in the bounded research cohort; remaining capacity is filled only by the separate current-opportunity research ranking."
+            if core_symbols else "No earned Core instruments are available; the bounded research cohort remains the separate provisional/evidence-ranked opportunity cohort."
+        )
         return {
-            "market_selection": self.rank_markets(broker_usable_symbols, outcome_rows),
-            "instrument_specialization": self.rank_instrument_specialization(broker_usable_symbols, outcome_rows, instrument_metadata),
+            "market_selection": market_selection,
+            "instrument_specialization": instrument_specialization,
             "top_strategies": self.rank_strategies(model_versions),
             "anti_revenge": {
                 "loss_streak_is_not_a_sizing_input": True,

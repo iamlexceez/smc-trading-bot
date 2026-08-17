@@ -410,7 +410,7 @@ class MarketScheduler:
         active = await db.get_active_objective(self.settings.trading_mode)
         if not active:
             self._operational_objective = {}
-            return list(snapshot["market_selection"]["selected_symbols"])
+            return list(snapshot["market_selection"].get("research_cohort_symbols") or snapshot["market_selection"]["selected_symbols"])
         context = dict(active.get("context") or {})
         operational = dict(context.get("operational") or {})
         if operational.get("scope_disabled"):
@@ -418,7 +418,7 @@ class MarketScheduler:
             # VPS overload and extremely slow scan cycles.  We use the top-ranked
             # markets from the evidence-first research governance.
             limit = max(1, int(self.settings.research_market_limit))
-            selected = list(snapshot["market_selection"]["selected_symbols"])
+            selected = list(snapshot["market_selection"].get("research_cohort_symbols") or snapshot["market_selection"]["selected_symbols"])
             self._operational_objective = {
                 "id": active.get("id"), "version": active.get("version"),
                 "status": "STANDALONE", "scope_disabled": True,
@@ -446,7 +446,7 @@ class MarketScheduler:
         operational = dict(context.get("operational") or {})
         if not operational:
             self._operational_objective = {}
-            return list(snapshot["market_selection"]["selected_symbols"])
+            return list(snapshot["market_selection"].get("research_cohort_symbols") or snapshot["market_selection"]["selected_symbols"])
         if operational.get("phase_boundary_pending"):
             reason = "Phase-boundary position protection/closure is pending broker confirmation. New exposure is paused; existing positions remain under the independent protection manager."
             self._operational_objective = {
