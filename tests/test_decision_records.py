@@ -82,3 +82,28 @@ def test_feature_and_combination_evidence_upsert(tmp_path: Path):
         assert combination["state"] == "PROMOTABLE_CANDIDATE"
 
     asyncio.run(scenario())
+
+
+def test_instrument_specialization_profile_persists_and_reads_back(tmp_path: Path):
+    async def scenario():
+        path = tmp_path / "instrument_profiles.db"
+        await db.init_db(str(path))
+        await db.upsert_instrument_specialization_profile(
+            account_mode="demo", instrument="Boom 500 Index",
+            profile={
+                "specialization": {"adjusted_score": 82.5, "raw_score": 91.0, "evidence_factor": 0.91, "sample_size": 200},
+                "role": "CORE", "role_reason": "complete evidence",
+                "sample_size": 200, "out_of_sample_sample": 100, "forward_sample": 100,
+                "metrics": {"expectancy_r": 0.4, "profit_factor": 2.1, "max_drawdown_r": 1.0},
+                "best_strategies": ["bos_choch_continuation"], "best_regimes": ["TRENDING"],
+                "best_timeframes": ["M15"], "execution_quality": 90.0,
+                "account_size_suitability": 85.0,
+            }, db_path=str(path),
+        )
+        profile = await db.get_instrument_specialization_profile("Boom 500 Index", "demo", str(path))
+        assert profile["current_status"] == "CORE"
+        assert profile["specialization_score"] == 82.5
+        assert profile["best_strategies"] == ["bos_choch_continuation"]
+        assert profile["profile"]["role"] == "CORE"
+
+    asyncio.run(scenario())

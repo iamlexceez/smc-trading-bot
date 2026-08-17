@@ -119,9 +119,29 @@ class SharedControlService:
         return "\n".join(lines)
 
     async def core(self, request: CommandRequest) -> str:
-        records = list(getattr(getattr(self.scheduler, "market_universe", None), "accepted_records", []) or [])
-        names = [str(getattr(record, "symbol", record)) for record in records[:8]]
-        return "CORE / BROKER UNIVERSE\n" + ("\n".join(f"{index}. {name}" for index, name in enumerate(names, 1)) if names else "No broker-verified core candidates are available.")
+        governance = dict(getattr(self.scheduler, "last_research_governance", {}) or {})
+        specialization = dict(governance.get("instrument_specialization") or {})
+        core_symbols = list(specialization.get("core_symbols") or [])
+        rankings = {str(row.get("instrument")): row for row in specialization.get("rankings", [])}
+        lines = ["CORE INSTRUMENT REVIEW"]
+        if core_symbols:
+            for index, symbol in enumerate(core_symbols, 1):
+                row = rankings.get(str(symbol), {})
+                score = dict(row.get("specialization") or {}).get("adjusted_score")
+                lines.append(f"{index}. {symbol} | adjusted specialization={float(score or 0.0):.2f} | role={row.get('role', 'CORE')}")
+                lines.append(f"   Reason: {row.get('role_reason', 'Earned through evidence governance.')}")
+        else:
+            lines.append("No instrument currently qualifies for CORE.")
+            lines.append(str(specialization.get("core_selection_explanation") or "Fresh broker-verified specialization evidence is not yet sufficient."))
+        non_core = [row for row in specialization.get("rankings", []) if not row.get("selected_core")]
+        if non_core:
+            lines.append("")
+            lines.append("WHY NOT SELECTED")
+            for row in non_core[:5]:
+                score = dict(row.get("specialization") or {}).get("adjusted_score")
+                lines.append(f"{row.get('instrument', '?')} | adjusted specialization={float(score or 0.0):.2f} | role={row.get('role', 'RESEARCH')}")
+                lines.append(f"   Reason: {row.get('role_reason', 'Not selected by Core governance.')}")
+        return "\n".join(lines)
 
     async def learning(self, request: CommandRequest) -> str:
         kwargs = {"db_path": self.db_path} if self.db_path else {}

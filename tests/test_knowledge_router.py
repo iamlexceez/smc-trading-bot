@@ -124,3 +124,80 @@ def test_model_drift_distinguishes_sparse_data_from_deterioration():
         {"expectancy_r": 0.4, "sample_size": 30}, {"expectancy_r": 0.3, "sample_size": 10},
         minimum_sample_size=10, max_expectancy_decline_r=0.2,
     ).state == "STABLE"
+
+
+def test_instrument_specialization_score_is_not_opportunity_score():
+    from knowledge.specialization import evidence_tier, expectancy_r, score_specialization
+
+    assert round(expectancy_r(0.5, 2.0, 1.0), 6) == 0.5
+    assert evidence_tier(0) == "UNVALIDATED"
+    assert evidence_tier(19) == "VERY_WEAK"
+    assert evidence_tier(20) == "PRELIMINARY"
+    assert evidence_tier(100) == "ESTABLISHED"
+    assert evidence_tier(200) == "STRONG"
+
+    components = {
+        "statistical_performance": 90,
+        "out_of_sample_performance": 85,
+        "forward_demo_performance": 80,
+        "stability": 75,
+        "regime_coverage": 70,
+        "execution_quality": 95,
+        "account_size_suitability": 90,
+        "portfolio_contribution": 80,
+    }
+    mature = score_specialization(
+        "Boom 500 Index", components=components, sample_size=200,
+        out_of_sample_sample=100, forward_sample=100, recency_factor=1.0,
+        data_quality_factor=1.0,
+    )
+    weak = score_specialization(
+        "Boom 500 Index", components=components, sample_size=2,
+        out_of_sample_sample=0, forward_sample=0, recency_factor=1.0,
+        data_quality_factor=1.0,
+    )
+    assert mature.raw_score > 80
+    assert mature.adjusted_score > weak.adjusted_score
+    assert weak.evidence_tier == "VERY_WEAK"
+    assert "opportunity" not in " ".join(mature.reasons).lower()
+
+
+def test_specialization_governance_requires_complete_core_evidence_and_does_not_pad_slots():
+    from analysis.research_governance import ResearchGovernance
+    from config import TradeSettings
+
+    settings = TradeSettings.defaults()
+    settings.max_core_instruments = 1
+    settings.core_min_sample_size = 50
+    settings.core_adjusted_score_threshold = 75.0
+    governance = ResearchGovernance(settings)
+    outcomes = [
+        {"symbol": "Boom 500 Index", "pnl_r": 1.0, "regime": "TRENDING"}
+        for _ in range(200)
+    ] + [
+        {"symbol": "Boom 100 Index", "pnl_r": 1.0, "regime": "TRENDING"}
+        for _ in range(200)
+    ]
+    incomplete = governance.rank_instrument_specialization(
+        ["Boom 500 Index", "Boom 100 Index"], outcomes,
+        instrument_metadata={"Boom 500 Index": {"broker_eligible": True, "data_quality_factor": 1.0}},
+    )
+    assert incomplete["core_symbols"] == []
+    assert "account-economics" in incomplete["core_selection_explanation"]
+
+    complete_metadata = {
+        symbol: {
+            "broker_eligible": True, "data_quality_factor": 1.0,
+            "out_of_sample_sample": 100, "forward_sample": 100,
+            "out_of_sample_score": 90.0, "forward_demo_score": 90.0,
+            "stability_score": 90.0, "execution_quality_score": 90.0,
+            "account_size_suitability_score": 90.0, "portfolio_contribution_score": 90.0,
+            "execution_reliability": 0.99,
+        }
+        for symbol in ("Boom 500 Index", "Boom 100 Index")
+    }
+    complete = governance.rank_instrument_specialization(
+        ["Boom 500 Index", "Boom 100 Index"], outcomes, instrument_metadata=complete_metadata,
+    )
+    assert len(complete["core_symbols"]) == 1
+    assert complete["core_symbols"][0] in {"Boom 500 Index", "Boom 100 Index"}

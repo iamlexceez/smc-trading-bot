@@ -561,9 +561,34 @@ class MarketScheduler:
             account_mode="demo", days=self.settings.market_ranking_lookback_days
         )
         models = await db.list_model_versions("demo", limit=50)
+        specialization_metadata = {}
+        for record in getattr(self.market_universe, "accepted_records", []) or []:
+            has_volume_contract = all(
+                getattr(record, field, None) is not None
+                for field in ("volume_min", "volume_max", "volume_step", "contract_size")
+            )
+            specialization_metadata[str(record.symbol)] = {
+                "broker_eligible": bool(record.is_tradeable),
+                "data_quality_factor": 1.0,
+                "execution_quality_score": 75.0 if has_volume_contract else None,
+                # Execution reliability and small-account suitability require
+                # realized broker/margin observations; absence is UNKNOWN.
+                "execution_reliability": None,
+                "account_size_suitability_score": None,
+            }
         snapshot = self.research_governance.governance_snapshot(
-            broker_usable_symbols, outcomes, models
+            broker_usable_symbols, outcomes, models, instrument_metadata=specialization_metadata
         )
+        for profile in snapshot.get("instrument_specialization", {}).get("rankings", []):
+            try:
+                await db.upsert_instrument_specialization_profile(
+                    account_mode=self.settings.trading_mode,
+                    instrument=str(profile.get("instrument") or ""),
+                    profile=profile,
+                )
+            except Exception as exc:
+                # Profile telemetry cannot block universe refresh or execution.
+                logger.warning("Could not persist specialization profile for %s: %s", profile.get("instrument"), exc)
         selected = await self._apply_operational_objective(broker_usable_symbols, snapshot)
         self._set_execution_selected_symbols(selected)
         self.settings.enabled_symbols = selected

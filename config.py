@@ -183,10 +183,15 @@ class TradeSettings:
     preferred_risk_pct: float = 0.75
     preferred_max_trades_per_day: int = 10
     active_model_version: str = ""
-    # Research governance. A maximum of ten broker-verified names may be in
-    # the active execution cohort; all other broker-valid markets remain
-    # visible in the audit but are disabled for new strategy scans.
+    # Research governance. The research cohort and earned Core universe are
+    # separate concepts: a research cohort may explore several names, while
+    # Core is capped at ten and may contain fewer than ten instruments.
     research_market_limit: int = 10
+    max_core_instruments: int = 10
+    core_min_sample_size: int = 50
+    core_adjusted_score_threshold: float = 75.0
+    core_max_drawdown_r: float = 2.0
+    core_min_execution_reliability: float = 0.95
     market_ranking_min_sample_size: int = 10
     market_ranking_lookback_days: int = 365
     strategy_ranking_limit: int = 3
@@ -395,6 +400,11 @@ class TradeSettings:
             preferred_max_trades_per_day=max(1, int(d.get("preferred_max_trades_per_day", d.get("max_trades_per_day", 10)))),
             active_model_version=d.get("active_model_version", ""),
             research_market_limit=max(1, int(d.get("research_market_limit", 10))),
+            max_core_instruments=max(0, min(10, int(d.get("max_core_instruments", 10)))),
+            core_min_sample_size=max(1, int(d.get("core_min_sample_size", 50))),
+            core_adjusted_score_threshold=max(0.0, min(100.0, float(d.get("core_adjusted_score_threshold", 75.0)))),
+            core_max_drawdown_r=max(0.0, float(d.get("core_max_drawdown_r", 2.0))),
+            core_min_execution_reliability=max(0.0, min(1.0, float(d.get("core_min_execution_reliability", 0.95)))),
             market_ranking_min_sample_size=max(1, int(d.get("market_ranking_min_sample_size", 10))),
             market_ranking_lookback_days=max(1, int(d.get("market_ranking_lookback_days", 365))),
             strategy_ranking_limit=max(1, min(3, int(d.get("strategy_ranking_limit", 3)))),
@@ -460,6 +470,11 @@ class TradeSettings:
             timeframes=[s.strip() for s in os.getenv("TIMEFRAMES", "M15,H1,H4").split(",")],
             htf_timeframes=[s.strip() for s in os.getenv("HTF_TIMEFRAMES", "H1,H4,D1").split(",")],
             research_market_limit=max(1, int(os.getenv("RESEARCH_MARKET_LIMIT", "10"))),
+            max_core_instruments=max(0, min(10, int(os.getenv("MAX_CORE_INSTRUMENTS", "10")))),
+            core_min_sample_size=max(1, int(os.getenv("CORE_MIN_SAMPLE_SIZE", "50"))),
+            core_adjusted_score_threshold=max(0.0, min(100.0, float(os.getenv("CORE_ADJUSTED_SCORE_THRESHOLD", "75.0")))),
+            core_max_drawdown_r=max(0.0, float(os.getenv("CORE_MAX_DRAWDOWN_R", "2.0"))),
+            core_min_execution_reliability=max(0.0, min(1.0, float(os.getenv("CORE_MIN_EXECUTION_RELIABILITY", "0.95")))),
             market_ranking_min_sample_size=max(1, int(os.getenv("MARKET_RANKING_MIN_SAMPLE_SIZE", "10"))),
             market_ranking_lookback_days=max(1, int(os.getenv("MARKET_RANKING_LOOKBACK_DAYS", "365"))),
             strategy_ranking_limit=max(1, min(3, int(os.getenv("STRATEGY_RANKING_LIMIT", "3")))),

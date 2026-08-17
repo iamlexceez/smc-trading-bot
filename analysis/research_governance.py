@@ -24,6 +24,8 @@ from typing import Any, Iterable
 
 from analysis.policies import PolicyEvaluator
 from config import TradeSettings
+from knowledge.instruments import classify_instrument
+from knowledge.specialization import score_specialization
 
 
 class ResearchGovernance:
@@ -64,6 +66,101 @@ class ResearchGovernance:
             "profit_factor": ResearchGovernance._finite(metric.get("profit_factor"), 0.0),
             "max_drawdown_r": ResearchGovernance._finite(metric.get("max_drawdown_r"), 0.0),
             "return_volatility_r": ResearchGovernance._finite(metric.get("return_volatility_r"), 0.0),
+        }
+
+    @staticmethod
+    def _score_component(value: float | None, *, center: float = 0.0, scale: float = 1.0) -> float | None:
+        if value is None:
+            return None
+        try:
+            return max(0.0, min(100.0, 50.0 + (float(value) - center) * 25.0 / max(abs(scale), 1e-9)))
+        except (TypeError, ValueError):
+            return None
+
+    def rank_instrument_specialization(
+        self,
+        broker_usable_symbols: Iterable[str],
+        outcomes: Iterable[dict[str, Any]],
+        instrument_metadata: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Rank long-horizon instrument specialization separately from opportunity rank."""
+        universe = sorted({str(symbol).strip() for symbol in broker_usable_symbols if str(symbol).strip()})
+        metadata = instrument_metadata or {}
+        by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in outcomes:
+            symbol = str(row.get("symbol") or "").strip()
+            if symbol in universe and row.get("pnl_r") is not None:
+                by_symbol[symbol].append(row)
+        rankings: list[dict[str, Any]] = []
+        for symbol in universe:
+            rows = by_symbol.get(symbol, [])
+            metric = PolicyEvaluator.evaluate(rows).to_dict()
+            meta = dict(metadata.get(symbol) or {})
+            regimes = {str(row.get("regime") or "UNKNOWN").upper() for row in rows}
+            statistical = self._score_component(metric.get("expectancy_r"), center=0.0, scale=2.0)
+            if statistical is not None and metric.get("profit_factor") is not None:
+                pf_raw = float(metric["profit_factor"])
+                pf_score = 100.0 if math.isinf(pf_raw) else max(0.0, min(100.0, pf_raw * 25.0))
+                win_rate = max(0.0, min(100.0, float(metric.get("win_rate") or 0.0) * 100.0))
+                consistency = max(0.0, min(100.0, 100.0 / (1.0 + abs(float(metric.get("return_volatility_r") or 0.0)))))
+                statistical = 0.45 * statistical + 0.25 * pf_score + 0.15 * win_rate + 0.15 * consistency
+            components = {
+                "statistical_performance": statistical,
+                "out_of_sample_performance": meta.get("out_of_sample_score"),
+                "forward_demo_performance": meta.get("forward_demo_score") if meta.get("forward_demo_score") is not None else (statistical if rows else None),
+                "stability": meta.get("stability_score"),
+                "regime_coverage": meta.get("regime_coverage_score") if meta.get("regime_coverage_score") is not None else (min(100.0, len(regimes - {"UNKNOWN"}) / 6.0 * 100.0) if rows else None),
+                "execution_quality": meta.get("execution_quality_score"),
+                "account_size_suitability": meta.get("account_size_suitability_score"),
+                "portfolio_contribution": meta.get("portfolio_contribution_score"),
+            }
+            score = score_specialization(
+                symbol, components=components, sample_size=len(rows),
+                out_of_sample_sample=int(meta.get("out_of_sample_sample") or 0),
+                forward_sample=int(meta.get("forward_sample") or len(rows)),
+                recency_factor=float(meta.get("recency_factor", 1.0)),
+                data_quality_factor=float(meta.get("data_quality_factor", 0.0 if not meta else 1.0)),
+            )
+            broker_eligible = bool(meta.get("broker_eligible", True))
+            base_role = classify_instrument(
+                symbol, broker_eligible=broker_eligible,
+                evidence={
+                    "sample_size": len(rows), "expectancy_r": metric.get("expectancy_r"),
+                    "max_drawdown_r": metric.get("max_drawdown_r"),
+                    "execution_reliability": meta.get("execution_reliability"),
+                },
+                minimum_sample_size=self.settings.core_min_sample_size,
+                max_manageable_drawdown_r=self.settings.core_max_drawdown_r,
+                minimum_execution_reliability=self.settings.core_min_execution_reliability,
+            )
+            if base_role.role == "RESEARCH" and score.adjusted_score >= self.settings.core_adjusted_score_threshold:
+                role, role_reason = "CORE_CANDIDATE", "Score is promising but evidence depth is not sufficient for Core promotion."
+            elif base_role.role == "CORE" and score.adjusted_score < self.settings.core_adjusted_score_threshold:
+                role, role_reason = "CHALLENGER", "Evidence exists but adjusted specialization score is below the Core threshold."
+            else:
+                role, role_reason = base_role.role, base_role.reason
+            rankings.append({
+                "instrument": symbol, "specialization": score.to_dict(),
+                "role": role, "role_reason": role_reason,
+                "expectancy_r": metric.get("expectancy_r"), "max_drawdown_r": metric.get("max_drawdown_r"),
+                "sample_size": len(rows), "out_of_sample_sample": int(meta.get("out_of_sample_sample") or 0),
+                "forward_sample": int(meta.get("forward_sample") or len(rows)), "broker_eligible": broker_eligible,
+            })
+        rankings.sort(key=lambda item: (-float(item["specialization"]["adjusted_score"]), item["instrument"]))
+        core = [item for item in rankings if item["role"] in {"CORE", "CORE_STRONG"}][:max(0, min(10, int(self.settings.max_core_instruments)))]
+        core_symbols = [item["instrument"] for item in core]
+        core_set = set(core_symbols)
+        for rank, item in enumerate(rankings, 1):
+            item["rank"] = rank
+            item["selected_core"] = item["instrument"] in core_set
+        return {
+            "maximum_core_instruments": max(0, min(10, int(self.settings.max_core_instruments))),
+            "core_symbols": core_symbols,
+            "rankings": rankings,
+            "core_selection_explanation": (
+                "Core instruments were earned through adjusted specialization score, evidence depth, broker eligibility, drawdown, and execution requirements."
+                if core_symbols else "No instrument currently satisfies the complete Core evidence, execution, and account-economics requirements; empty Core slots remain empty."
+            ),
         }
 
     def rank_markets(self, broker_usable_symbols: Iterable[str], outcomes: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -190,10 +287,13 @@ class ResearchGovernance:
         broker_usable_symbols: Iterable[str],
         outcomes: Iterable[dict[str, Any]],
         model_versions: Iterable[dict[str, Any]],
+        instrument_metadata: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Return the complete auditable selection and non-revenge state."""
+        outcome_rows = list(outcomes)
         return {
-            "market_selection": self.rank_markets(broker_usable_symbols, outcomes),
+            "market_selection": self.rank_markets(broker_usable_symbols, outcome_rows),
+            "instrument_specialization": self.rank_instrument_specialization(broker_usable_symbols, outcome_rows, instrument_metadata),
             "top_strategies": self.rank_strategies(model_versions),
             "anti_revenge": {
                 "loss_streak_is_not_a_sizing_input": True,

@@ -228,6 +228,38 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS instrument_specialization_profiles (
+                account_mode TEXT NOT NULL,
+                instrument TEXT NOT NULL,
+                specialization_score REAL,
+                raw_score REAL,
+                evidence_score REAL,
+                mastery_score REAL,
+                best_strategies_json TEXT NOT NULL DEFAULT '[]',
+                best_regimes_json TEXT NOT NULL DEFAULT '[]',
+                best_timeframes_json TEXT NOT NULL DEFAULT '[]',
+                worst_strategies_json TEXT NOT NULL DEFAULT '[]',
+                worst_regimes_json TEXT NOT NULL DEFAULT '[]',
+                worst_timeframes_json TEXT NOT NULL DEFAULT '[]',
+                expectancy_r REAL,
+                profit_factor REAL,
+                max_drawdown_r REAL,
+                win_rate REAL,
+                average_win_r REAL,
+                average_loss_r REAL,
+                sample_size INTEGER NOT NULL DEFAULT 0,
+                out_of_sample_sample INTEGER NOT NULL DEFAULT 0,
+                forward_sample INTEGER NOT NULL DEFAULT 0,
+                execution_quality REAL,
+                account_size_suitability REAL,
+                current_status TEXT NOT NULL DEFAULT 'RESEARCH',
+                reason TEXT NOT NULL DEFAULT '',
+                profile_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (account_mode, instrument)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS symbol_profiles (
                 account_mode TEXT NOT NULL,
                 symbol TEXT NOT NULL,
@@ -615,6 +647,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode_status ON trades(account_mode, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_decision_records_context ON decision_records(account_mode, instrument, regime, strategy, created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_evidence_context ON strategy_evidence(account_mode, symbol, regime, strategy_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_instrument_specialization_status ON instrument_specialization_profiles(account_mode, current_status, specialization_score)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_feature_importance_context ON feature_importance_evidence(account_mode, symbol, regime, strategy_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_combination_evidence_context ON strategy_combination_evidence(account_mode, symbol, regime, timeframe)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_transition_context ON strategy_transition_evidence(account_mode, symbol, previous_regime, regime, strategy_id)")
@@ -1112,6 +1145,80 @@ async def get_latest_sizing_rejection(
         result["details"] = json.loads(result.pop("details_json") or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         result["details"] = {}
+    return result
+
+
+async def upsert_instrument_specialization_profile(
+    *,
+    account_mode: str,
+    instrument: str,
+    profile: dict,
+    db_path: str = DB_PATH,
+) -> None:
+    """Persist one explainable instrument-specialization profile."""
+    specialization = dict(profile.get("specialization") or {})
+    metrics = dict(profile.get("metrics") or profile)
+    now = datetime.now(timezone.utc).isoformat()
+    def _json(key: str) -> str:
+        return json.dumps(list(profile.get(key) or []), sort_keys=True)
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """INSERT INTO instrument_specialization_profiles
+               (account_mode, instrument, specialization_score, raw_score, evidence_score, mastery_score,
+                best_strategies_json, best_regimes_json, best_timeframes_json, worst_strategies_json,
+                worst_regimes_json, worst_timeframes_json, expectancy_r, profit_factor, max_drawdown_r,
+                win_rate, average_win_r, average_loss_r, sample_size, out_of_sample_sample, forward_sample,
+                execution_quality, account_size_suitability, current_status, reason, profile_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(account_mode, instrument) DO UPDATE SET
+                specialization_score=excluded.specialization_score, raw_score=excluded.raw_score,
+                evidence_score=excluded.evidence_score, mastery_score=excluded.mastery_score,
+                best_strategies_json=excluded.best_strategies_json, best_regimes_json=excluded.best_regimes_json,
+                best_timeframes_json=excluded.best_timeframes_json, worst_strategies_json=excluded.worst_strategies_json,
+                worst_regimes_json=excluded.worst_regimes_json, worst_timeframes_json=excluded.worst_timeframes_json,
+                expectancy_r=excluded.expectancy_r, profit_factor=excluded.profit_factor,
+                max_drawdown_r=excluded.max_drawdown_r, win_rate=excluded.win_rate,
+                average_win_r=excluded.average_win_r, average_loss_r=excluded.average_loss_r,
+                sample_size=excluded.sample_size, out_of_sample_sample=excluded.out_of_sample_sample,
+                forward_sample=excluded.forward_sample, execution_quality=excluded.execution_quality,
+                account_size_suitability=excluded.account_size_suitability, current_status=excluded.current_status,
+                reason=excluded.reason, profile_json=excluded.profile_json, updated_at=excluded.updated_at""",
+            (
+                account_mode, instrument, specialization.get("adjusted_score"), specialization.get("raw_score"),
+                specialization.get("evidence_factor"), profile.get("mastery_score"),
+                _json("best_strategies"), _json("best_regimes"), _json("best_timeframes"),
+                _json("worst_strategies"), _json("worst_regimes"), _json("worst_timeframes"),
+                metrics.get("expectancy_r"), metrics.get("profit_factor"), metrics.get("max_drawdown_r"),
+                metrics.get("win_rate"), metrics.get("average_win_r"), metrics.get("average_loss_r"),
+                int(profile.get("sample_size") or specialization.get("sample_size") or 0),
+                int(profile.get("out_of_sample_sample") or 0), int(profile.get("forward_sample") or 0),
+                profile.get("execution_quality"), profile.get("account_size_suitability"),
+                profile.get("role") or profile.get("current_status") or "RESEARCH", profile.get("role_reason") or "",
+                json.dumps(profile, sort_keys=True), now,
+            ),
+        )
+        await conn.commit()
+
+
+async def get_instrument_specialization_profile(
+    instrument: str, account_mode: str = "demo", db_path: str = DB_PATH,
+) -> Optional[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM instrument_specialization_profiles WHERE account_mode = ? AND instrument = ?",
+            (account_mode, instrument),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    for key in (
+        "best_strategies_json", "best_regimes_json", "best_timeframes_json",
+        "worst_strategies_json", "worst_regimes_json", "worst_timeframes_json",
+    ):
+        result[key[:-5]] = json.loads(result.pop(key) or "[]")
+    result["profile"] = json.loads(result.pop("profile_json") or "{}")
     return result
 
 

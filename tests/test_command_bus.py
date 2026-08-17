@@ -131,3 +131,33 @@ def test_blocked_demo_resume_keeps_auto_trade_disabled():
         assert settings.is_paused is True
 
     asyncio.run(scenario())
+
+
+def test_core_command_reports_earned_specialization_not_broker_availability():
+    from types import SimpleNamespace
+    from communication.control_service import SharedControlService
+    from config import TradeSettings
+
+    async def scenario():
+        settings = TradeSettings.defaults()
+        scheduler = SimpleNamespace(
+            market_universe=SimpleNamespace(accepted_records=[SimpleNamespace(symbol="Boom 500 Index")]),
+            last_research_governance={
+                "instrument_specialization": {
+                    "core_symbols": [],
+                    "core_selection_explanation": "No instrument currently satisfies the complete Core evidence requirements.",
+                    "rankings": [{
+                        "instrument": "Boom 500 Index", "role": "RESEARCH", "selected_core": False,
+                        "role_reason": "No completed evidence is available.",
+                        "specialization": {"adjusted_score": 0.0},
+                    }],
+                },
+            },
+        )
+        service = SharedControlService(settings, scheduler)
+        result = await service.core(CommandRequest("telegram", "admin", "1", "/core"))
+        assert "No instrument currently qualifies for CORE" in result
+        assert "No completed evidence is available" in result
+        assert "BROKER UNIVERSE" not in result
+
+    asyncio.run(scenario())
