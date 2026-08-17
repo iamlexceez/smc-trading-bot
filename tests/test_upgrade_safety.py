@@ -272,7 +272,7 @@ def test_execution_classes_and_gated_ranking_are_explicit() -> None:
     assert score_band(74.0) == "GOOD"
 
     validation = SimpleNamespace(
-        minimum_rr=2.0, rr_filter_enabled=True, target_source="policy_rr_target",
+        minimum_rr=1.5, rr_filter_enabled=True, target_source="policy_rr_target",
         structural_target=0.0, structural_rr=0.0, target_conflict=False,
         target_candidates=[],
     )

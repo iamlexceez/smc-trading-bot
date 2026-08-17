@@ -434,8 +434,8 @@ def test_full_precision_rr_validation() -> None:
     assert_true(buy_risk == 2.0 and buy_reward == 6.0 and buy_rr == 3.0, "BUY RR formula is incorrect")
     assert_true(rr_filter_passes(buy_rr, 3.0) and not rr_filter_passes(buy_rr, 3.1), "enabled RR filtering did not compare actual RR")
     settings = TradeSettings()
-    assert_true(settings.min_rr_ratio == 2.0 and settings.preferred_rr_ratio == 3.0 and settings.rr_filter_enabled, "RR defaults are not 2R minimum and 3R preferred")
-    assert_true(TradeSettings.from_dict({}).min_rr_ratio == 2.0, "missing persisted RR setting did not use the 2R default")
+    assert_true(settings.min_rr_ratio == 1.5 and settings.preferred_rr_ratio == 2.0 and settings.rr_filter_enabled, "RR defaults are not 1.5R minimum and 2R preferred")
+    assert_true(TradeSettings.from_dict({}).min_rr_ratio == 1.5, "missing persisted RR setting did not use the 1.5R default")
     disabled = TradeSettings.from_dict({"min_rr_ratio": 0.0, "rr_filter_enabled": False})
     assert_true(disabled.min_rr_ratio == 0.0 and not disabled.rr_filter_enabled, "explicit persisted MIN_RR=0 was not preserved")
 

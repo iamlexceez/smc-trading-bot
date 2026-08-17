@@ -69,6 +69,7 @@ class GateDecision:
     broker_status: str = "UNKNOWN"
     portfolio_status: str = "UNKNOWN"
     risk_status: str = "UNKNOWN"
+    capital_efficiency_status: str = "UNKNOWN"
     execution_class: str = "RESEARCH_ONLY"
     advisories: tuple[str, ...] = field(default_factory=tuple)
 
@@ -89,6 +90,7 @@ class GateDecision:
             "broker_status": self.broker_status,
             "portfolio_status": self.portfolio_status,
             "risk_status": self.risk_status,
+            "capital_efficiency_status": self.capital_efficiency_status,
             "execution_class": self.execution_class,
             "hard_gate_results": dict(self.hard_gate_results),
             "final_state": self.final_state,
@@ -177,6 +179,7 @@ def _decision(
     broker_status: str,
     portfolio_status: str,
     risk_status: str,
+    capital_efficiency_status: str = "UNKNOWN",
     execution_class: str = "RESEARCH_ONLY",
 ) -> GateDecision:
     return GateDecision(
@@ -195,6 +198,7 @@ def _decision(
         broker_status=broker_status,
         portfolio_status=portfolio_status,
         risk_status=risk_status,
+        capital_efficiency_status=capital_efficiency_status,
         execution_class=str(execution_class or "RESEARCH_ONLY"),
         final_state=final_state,
         reason=reason,
@@ -232,6 +236,7 @@ def evaluate_trading_gate(
     target_source: str = "",
     setup_confidence: str | None = None,
     strategy_status: str | None = None,
+    capital_efficiency_approved: bool = True,
 ) -> GateDecision:
     """Return the one authoritative pre-order policy decision.
 
@@ -265,6 +270,7 @@ def evaluate_trading_gate(
         "portfolio": bool(portfolio_approved),
         "required_htf_context": bool(required_htf_context_available),
         "risk_policy": bool(risk_valid),
+        "capital_efficiency": bool(capital_efficiency_approved),
     }
     hard_failures = [name for name, passed in hard_gate_results.items() if not passed]
     hard_labels = {
@@ -284,9 +290,11 @@ def evaluate_trading_gate(
             "setup_geometry": "SETUP_INVALID",
             "objective": "OBJECTIVE_INCOMPATIBLE",
             "portfolio": "PORTFOLIO_LIMIT",
-            "required_htf_context": "HTF_CONTEXT_UNAVAILABLE",
-            "risk_policy": "RISK_POLICY_INVALID",
-        }[name]
+                    "required_htf_context": "HTF_CONTEXT_UNAVAILABLE",
+        "risk_policy": "RISK_POLICY_INVALID",
+        "capital_efficiency": "CAPITAL_INEFFICIENT",
+    }[name]
+
         for name in hard_failures
     ]
     objective_status = "PASS" if objective_permits_exposure else "BLOCKED"
@@ -296,6 +304,7 @@ def evaluate_trading_gate(
     experimental_low_rr = bool(low_rr_experiment and observed_rr > 0.0 and observed_rr < normal_rr_floor)
     portfolio_status = "PASS" if portfolio_approved else "BLOCKED"
     risk_status = "PASS" if risk_valid else "BLOCKED"
+    capital_efficiency_status = "PASS" if capital_efficiency_approved else "BLOCKED"
 
     # Hard safety and current-setup gates always win over evidence or governance.
     if hard_failures:

@@ -56,6 +56,12 @@ from data.universe import DerivMarketUniverse
 from communication.events import DeliveryChannel, EventSeverity, NotificationEvent
 from knowledge.context import build_context, normalize_regime
 from knowledge.router import route_context
+from analysis.market_state_engine import MarketStateEngine
+from analysis.regime_engine import RegimeEngine
+from analysis.ev_engine import ExpectedValueEngine
+from analysis.portfolio_optimizer import PortfolioOptimizer
+from analysis.knowledge_engine import KnowledgeSelectionEngine
+from analysis.small_account import AccountEconomics, evaluate_small_account_efficiency
 from communication.notification_manager import NotificationManager, SlackWebhookAdapter, TelegramAdapter
 
 logger = logging.getLogger(__name__)
@@ -1787,6 +1793,11 @@ class MarketScheduler:
             account_mode=self.settings.trading_mode,
         )
         regime_context = market_context(df)
+        
+        # V2: Regime Engine
+        regime_engine = RegimeEngine()
+        regime_classification = regime_engine.classify(symbol, {"adx": regime_context.get("adx", 0), "atr_ratio": regime_context.get("atr_ratio", 1.0)})
+        regime = regime_classification.regime
 
         # Fetch HTF structures for confluence
         htf_structures = []
@@ -1947,6 +1958,19 @@ class MarketScheduler:
         regime = profile.regime or str(regime_context.get("regime") or "UNKNOWN")
         previous_regime = profile.previous_regime or "UNKNOWN"
         regime_transition = profile.regime_transition or regime
+        # V2: Market State Engine
+        market_state = MarketStateEngine.build_state(
+            symbol,
+            {"price": current_price, "spread": atr_val * 0.1, "quote_age": 0.1},
+            {"volatility": atr_val, "trend": structure.trend.value, "range_state": "NORMAL", "liquidity": {}, "structure": {}, "events": [], "zones": []},
+            {"regime": regime, "session": "LONDON"}
+        )
+
+        # V2: Knowledge Selection Engine
+        from knowledge.registry import all_items
+        knowledge_library = [item.to_dict() for item in all_items()]
+        knowledge_selection = KnowledgeSelectionEngine.select_knowledge(market_state.to_dict(), {}, knowledge_library)
+
         intelligence_context = build_context(
             symbol=symbol,
             timeframe=primary_tf,
@@ -1995,6 +2019,19 @@ class MarketScheduler:
             strategy_evidence["transition"] = dict(transition_evidence.get(selected_strategy) or {})
             strategy_evidence["evidence_stage"] = selected_assessment.evidence_stage
             strategy_evidence["knowledge_route"] = strategy_route.to_dict()
+            
+            # V2: Expected Value Engine
+            ev_engine = ExpectedValueEngine()
+            ev_result = ev_engine.calculate_ev(
+                win_rate=strategy_evidence.get("win_rate", 0.5),
+                avg_win_r=strategy_evidence.get("average_win_r", 2.0),
+                avg_loss_r=strategy_evidence.get("average_loss_r", 1.0),
+                sample_size=strategy_evidence.get("sample_size", 0)
+            )
+            strategy_evidence["ev_result"] = {
+                "expected_value_r": ev_result.expected_value_r,
+                "confidence": ev_result.confidence
+            }
         else:
             # A setup remains an observable candidate; lack of a registry fit is
             # reported as uncertainty, never hidden or reclassified as evidence.
@@ -2277,6 +2314,27 @@ class MarketScheduler:
             and capital_state not in AccountCapitalState.BLOCKING
         )
         portfolio_approved = not any(str(getattr(position, "symbol", "")) == str(signal.symbol) for position in open_positions)
+        
+        # V2: Small Account Optimizer
+        account = self.last_capital_state.get("account") or {}
+        symbol_info = await self.executor.get_symbol_info(signal.symbol)
+        economics = AccountEconomics(
+            balance=float(account.get("balance") or 0.0),
+            equity=float(account.get("equity") or 0.0),
+            free_margin=float(account.get("free_margin") or 0.0),
+            minimum_volume=float(symbol_info.get("min_lot") or 0.1),
+            volume_step=float(symbol_info.get("step_lot") or 0.01),
+            contract_size=float(symbol_info.get("contract_size") or 1.0),
+            margin_required=float(signal.risk.get("margin_required") or 0.0),
+            stop_distance=float(signal.risk.get("stop_distance") or 0.0),
+            risk_usd=float(signal.risk.get("risk_usd") or 0.0),
+            expected_value_r=float(strategy_evidence.get("ev_result", {}).get("expected_value_r") or 0.0),
+            reward_usd=float(signal.risk.get("reward_usd") or 0.0),
+            correlation_penalty=0.0, # Placeholder
+            broker_constraints=[]
+        )
+        efficiency = evaluate_small_account_efficiency(economics)
+
         return evaluate_trading_gate(
             setup_valid=bool(signal.validation and signal.validation.valid and (not policy_target or governed_policy_target)),
             broker_symbol_valid=self._analysis_symbol_is_eligible(signal.symbol),
@@ -2309,6 +2367,7 @@ class MarketScheduler:
             rr_filter_enabled=bool(active_rr_policy["filter_enabled"]),
             low_rr_experiment=bool(policy_object.low_rr_experiment),
             target_source=str(getattr(signal, "target_source", "") or ""),
+            capital_efficiency_approved=efficiency["executable"],
         )
 
     async def _execute_signal(self, signal: TradeSignal, df: pd.DataFrame = None) -> bool:
