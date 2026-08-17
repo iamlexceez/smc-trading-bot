@@ -160,6 +160,36 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS decision_records (
+                decision_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                account_mode TEXT NOT NULL,
+                setup_id INTEGER,
+                instrument TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                regime TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                strategy_combination_json TEXT NOT NULL DEFAULT '[]',
+                direction TEXT,
+                entry REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                rr REAL,
+                risk_json TEXT NOT NULL DEFAULT '{}',
+                expected_value REAL,
+                confidence TEXT NOT NULL DEFAULT 'UNKNOWN',
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                contradictions_json TEXT NOT NULL DEFAULT '[]',
+                portfolio_state_json TEXT NOT NULL DEFAULT '{}',
+                execution_state_json TEXT NOT NULL DEFAULT '{}',
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                thesis_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(setup_id) REFERENCES setup_records(id)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS symbol_profiles (
                 account_mode TEXT NOT NULL,
                 symbol TEXT NOT NULL,
@@ -545,6 +575,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await _ensure_column(db, "trade_baskets", "experiment_id", "INTEGER")
         await _ensure_column(db, "trade_baskets", "account_mode", "TEXT NOT NULL DEFAULT 'demo'")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode_status ON trades(account_mode, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_decision_records_context ON decision_records(account_mode, instrument, regime, strategy, created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_evidence_context ON strategy_evidence(account_mode, symbol, regime, strategy_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_transition_context ON strategy_transition_evidence(account_mode, symbol, previous_regime, regime, strategy_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_demo_session ON trades(demo_session_id, status)")
@@ -855,6 +886,57 @@ async def update_setup_record(
     values.append(setup_id)
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute(f"UPDATE setup_records SET {', '.join(assignments)} WHERE id = ?", values)
+        await conn.commit()
+
+
+async def record_decision_record(
+    *,
+    decision_id: str,
+    account_mode: str,
+    instrument: str,
+    timeframe: str,
+    regime: str,
+    strategy: str,
+    decision: str,
+    reason: str,
+    setup_id: Optional[int] = None,
+    strategy_combination: Optional[list | tuple] = None,
+    direction: Optional[str] = None,
+    entry: Optional[float] = None,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+    rr: Optional[float] = None,
+    risk: Optional[dict] = None,
+    expected_value: Optional[float] = None,
+    confidence: str = "UNKNOWN",
+    evidence: Optional[dict] = None,
+    contradictions: Optional[list | tuple] = None,
+    portfolio_state: Optional[dict] = None,
+    execution_state: Optional[dict] = None,
+    thesis: Optional[dict] = None,
+    db_path: str = DB_PATH,
+) -> None:
+    """Persist one explainable trade or no-trade decision without overwriting history."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """INSERT OR REPLACE INTO decision_records
+               (decision_id, timestamp, account_mode, setup_id, instrument, timeframe, regime,
+                strategy, strategy_combination_json, direction, entry, stop_loss, take_profit,
+                rr, risk_json, expected_value, confidence, evidence_json, contradictions_json,
+                portfolio_state_json, execution_state_json, decision, reason, thesis_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(decision_id), now, account_mode, setup_id, instrument, timeframe, regime,
+                strategy, json.dumps(list(strategy_combination or []), sort_keys=True), direction,
+                entry, stop_loss, take_profit, rr, json.dumps(risk or {}, sort_keys=True),
+                expected_value, confidence, json.dumps(evidence or {}, sort_keys=True),
+                json.dumps(list(contradictions or []), sort_keys=True),
+                json.dumps(portfolio_state or {}, sort_keys=True),
+                json.dumps(execution_state or {}, sort_keys=True), decision, reason,
+                json.dumps(thesis or {}, sort_keys=True), now,
+            ),
+        )
         await conn.commit()
 
 

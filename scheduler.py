@@ -53,6 +53,8 @@ from analysis.decision_gates import GateDecision, classify_confidence, classify_
 from data.provider import DataProvider
 from data.universe import DerivMarketUniverse
 from communication.events import DeliveryChannel, EventSeverity, NotificationEvent
+from knowledge.context import build_context, normalize_regime
+from knowledge.router import route_context
 from communication.notification_manager import NotificationManager, SlackWebhookAdapter, TelegramAdapter
 
 logger = logging.getLogger(__name__)
@@ -1600,10 +1602,42 @@ class MarketScheduler:
                 "reason": str(reason),
                 **dict(details or {}),
             }
+            setup_id = getattr(signal, "setup_id", None)
+            detail_data = dict(details or {})
+            strategy = str(detail_data.get("strategy") or getattr(signal, "selected_strategy", None) or "unclassified_observation")
+            thesis = dict(getattr(signal, "thesis", {}) or {})
+            try:
+                await db.record_decision_record(
+                    decision_id=analysis_run_id,
+                    account_mode=self.settings.trading_mode,
+                    instrument=symbol,
+                    timeframe=primary_tf_hint,
+                    regime=str(detail_data.get("regime") or getattr(signal, "regime", None) or "UNKNOWN"),
+                    strategy=strategy,
+                    strategy_combination=detail_data.get("strategy_combination") or thesis.get("strategy_combination") or [],
+                    direction=str(detail_data.get("bias") or getattr(signal, "direction", None) or "") or None,
+                    entry=getattr(signal, "entry_price", None) or getattr(signal, "entry", None),
+                    stop_loss=getattr(signal, "stop_loss", None),
+                    take_profit=getattr(signal, "take_profit", None),
+                    rr=getattr(signal, "rr_ratio", None),
+                    risk=dict(detail_data.get("risk") or getattr(signal, "risk", {}) or {}),
+                    expected_value=detail_data.get("expected_value_r") or getattr(signal, "expected_value_r", None),
+                    confidence=str(detail_data.get("confidence_classification") or getattr(signal, "confidence_classification", None) or "UNKNOWN"),
+                    evidence=dict(detail_data.get("evidence") or getattr(signal, "strategy_evidence", {}) or {}),
+                    contradictions=detail_data.get("contradictions") or getattr(signal, "contradictions", []) or [],
+                    portfolio_state=dict(detail_data.get("portfolio_state") or {}),
+                    execution_state=dict(detail_data.get("execution_state") or {}),
+                    decision=outcome,
+                    reason=str(reason),
+                    setup_id=setup_id,
+                    thesis=thesis or detail_data,
+                )
+            except Exception as exc:
+                logger.warning("Could not persist decision record for %s: %s", symbol, exc)
             try:
                 await db.record_execution_event(
                     account_mode=self.settings.trading_mode, symbol=symbol,
-                    setup_id=getattr(signal, "setup_id", None), status="analysis_outcome",
+                    setup_id=setup_id, status="analysis_outcome",
                     reason=f"{outcome}: {reason}", details=payload,
                 )
             except Exception as exc:
@@ -1822,6 +1856,17 @@ class MarketScheduler:
         regime = profile.regime or str(regime_context.get("regime") or "UNKNOWN")
         previous_regime = profile.previous_regime or "UNKNOWN"
         regime_transition = profile.regime_transition or regime
+        intelligence_context = build_context(
+            symbol=symbol,
+            timeframe=primary_tf,
+            regime=regime,
+            htf_bias=htf_context[0].get("bias") if htf_context else "UNKNOWN",
+            top_down_alignment=("ALIGNED" if len(htf_structures) >= 2 and all(item.trend == structure.trend for item in htf_structures) else "PARTIALLY_ALIGNED" if htf_structures else "UNKNOWN"),
+            observed_features=observed_features,
+            contradictions=tuple(item for item in ("HTF_CONFLICT" if htf_structures and any(item.trend != structure.trend for item in htf_structures) else "",) if item),
+            quote_fresh=True,
+            execution_quality="BROKER_OBSERVED",
+        )
         context_evidence = await db.get_strategy_evidence_for_context(
             self.settings.trading_mode, symbol, regime, primary_tf
         )
@@ -1831,6 +1876,11 @@ class MarketScheduler:
             )
             if previous_regime not in {"", "UNKNOWN", regime} else {}
         )
+        strategy_route = route_context(
+            intelligence_context,
+            evidence_by_strategy=context_evidence,
+            observed_features=observed_features,
+        )
         strategy_assessments = evaluate_strategies(
             regime=regime,
             timeframe=primary_tf,
@@ -1839,6 +1889,9 @@ class MarketScheduler:
             evidence_by_strategy=context_evidence,
             transition_evidence_by_strategy=transition_evidence,
         )
+        routed_ids = set(strategy_route.candidate_strategies)
+        if routed_ids:
+            strategy_assessments = [item for item in strategy_assessments if item.identifier in routed_ids]
         if strategy_assessments:
             selected_assessment = strategy_assessments[0]
             selected_strategy = selected_assessment.identifier
@@ -1850,6 +1903,7 @@ class MarketScheduler:
             })
             strategy_evidence["transition"] = dict(transition_evidence.get(selected_strategy) or {})
             strategy_evidence["evidence_stage"] = selected_assessment.evidence_stage
+            strategy_evidence["knowledge_route"] = strategy_route.to_dict()
         else:
             # A setup remains an observable candidate; lack of a registry fit is
             # reported as uncertainty, never hidden or reclassified as evidence.
@@ -1859,6 +1913,7 @@ class MarketScheduler:
             strategy_evidence = {
                 "sample_size": 0, "expectancy_r": None, "confidence": "UNKNOWN",
                 "transition": {}, "evidence_stage": "exploration",
+                "knowledge_route": strategy_route.to_dict(),
             }
         if setup_id is not None:
             await db.update_setup_record(
