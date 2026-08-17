@@ -48,6 +48,7 @@ DEFAULT_CONTRACTS: tuple[ModuleContract, ...] = (
     ModuleContract("analysis.adaptive_management", "scheduler.position_management", "executor.modify_position", "management_learning", "tests/test_upgrade_safety.py"),
     ModuleContract("communication.notification_manager", "scheduler.notification_retry", "Telegram/Slack adapters", "notification_deliveries", "tests/test_notification_manager.py"),
     ModuleContract("communication.command_bus", "Telegram/Slack handlers", "control_service", "command_audit", "tests/test_command_bus.py"),
+    ModuleContract("analysis.setup_intelligence", "scheduler.analyze_symbol", "scheduler.record_setup", "setup_records", "tests/test_v2_integration.py"),
 )
 
 

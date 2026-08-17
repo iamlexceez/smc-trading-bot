@@ -28,7 +28,7 @@ from analysis.supply_demand import detect_sd_zones, SupplyDemandZone, ZoneType
 from analysis.scoring import TradeSignal, format_signal_report
 from analysis.indicators import pip_value, atr
 from strategy.setup_scorer import score_setup_quality
-from strategy.setup_validator import EntryMode, SetupValidator
+from strategy.setup_validator import EntryMode, SetupValidator, SetupValidationResult, ValidationCheck
 from strategy.selection import evaluate_strategies
 from strategy.registry import get_strategy
 from analysis.sessions import check_trading_session
@@ -1872,6 +1872,13 @@ class MarketScheduler:
             min_rr=required_rr,
             stop_atr_buffer_multiplier=policy.stop_atr_buffer if policy.stop_atr_buffer is not None else float(self.settings.structural_stop_atr_buffer or 0.0),
         )
+        self.invocation_tracker.mark_invoked(
+            "analysis.setup_intelligence",
+            scheduler_entry_point="scheduler.analyze_symbol",
+            data_seen=not df.empty,
+            output_consumed=True,
+            persisted=record_learning,
+        )
         if v2_setup:
             direction = v2_setup.direction
         checks = [
@@ -2149,6 +2156,7 @@ class MarketScheduler:
                 "target_source": validation.target_source,
                 "invalidation": "Initial structural stop breached or opposing confirmed structure",
                 "evidence_stage": strategy_evidence.get("evidence_stage", "exploration"),
+                "v2_evidence": v2_setup.to_dict() if v2_setup else {},
             },
             alternative_theses=[item.__dict__ for item in strategy_assessments[1:]],
             evidence_summary=strategy_evidence,
@@ -2164,6 +2172,8 @@ class MarketScheduler:
                 "decision_index": len(df) - 1,
                 "structure_event_available_index": getattr(structure.last_event, "available_index", None),
                 "confirmation_available_index": getattr(validation.confirmation, "available_index", None),
+                "liquidity_sweep": v2_setup.liquidity_sweep if v2_setup else None,
+                "structure_event": v2_setup.structure_event if v2_setup else None,
             },
             research_decision="RESEARCH_ACCEPTED",
             trading_decision="DEFERRED",
@@ -2193,6 +2203,19 @@ class MarketScheduler:
                 "confidence": confidence_classification,
             },
         )
+        # Attach the full thesis for persistence
+        signal.thesis = {
+            "regime": regime,
+            "bias": direction,
+            "strategy": selected_strategy,
+            "uncertainty": strategy_evidence.get("confidence"),
+            "primary": signal.primary_thesis,
+            "alternatives": signal.alternative_theses,
+            "causality": signal.causality,
+            "evidence_summary": signal.evidence_summary,
+            "management_plan": signal.management_plan,
+            "setup_quality": signal.setup_quality_components,
+        }
         signal.policy_version = policy_version or self.settings.active_model_version
         signal.experiment_id = experiment_id
         signal.experimental_policy = policy.to_dict()

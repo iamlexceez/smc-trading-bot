@@ -83,6 +83,8 @@ class SharedControlService:
             f"Execution: {(components.get('execution_engine') or {}).get('state', 'UNKNOWN')}",
             f"Position manager: {(components.get('position_manager') or {}).get('state', 'UNKNOWN')}",
             f"Learning: {(components.get('learning_engine') or {}).get('state', 'UNKNOWN')}",
+            f"Setup Intelligence V2: {'RUNNING' if (invocation.get('rows') and any(r['module_name'] == 'analysis.setup_intelligence' and r['called'] for r in invocation['rows'])) else 'INITIALIZED'}",
+            f"Legacy Setup Authority: DISABLED",
             f"Last scan: {getattr(self.scheduler, '_last_scan_disposition', {}).get('state', 'UNKNOWN')}",
             f"Invocation matrix: {invocation.get('complete_modules', 0)}/{invocation.get('total_modules', 0)} complete",
         ])
