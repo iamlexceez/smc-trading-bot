@@ -36,3 +36,40 @@ def test_universe_accepts_only_broker_verified_synthetic_or_requested_gold():
     assert synthetic.decision == "ACCEPTED"
     assert fx.decision == "REJECTED" and "Currency" in fx.decision_reason
     assert xau_eur.decision == "REJECTED"
+
+
+def test_capital_state_broker_probe_fails_closed_for_stale_and_invalid_metadata():
+    import time
+    from analysis.capital_state import CapitalStateService
+    from config import TradeSettings
+
+    settings = TradeSettings.defaults()
+    settings.broker_quote_max_age_seconds = 30
+    service = CapitalStateService(settings, SimpleNamespace())
+    valid = {
+        "bid": 100.0, "ask": 100.1, "tick_time": time.time(),
+        "volume_min": 0.1, "volume_max": 10.0, "volume_step": 0.1,
+        "contract_size": 1.0, "margin_required": 1.0,
+    }
+    assert service._validate_probe("Boom 500 Index", valid, 100.0)["usable"]
+
+    stale = {**valid, "tick_time": time.time() - 120}
+    stale_result = service._validate_probe("Boom 500 Index", stale, 100.0)
+    assert not stale_result["usable"]
+    assert stale_result["checks"]["quote"] == "STALE"
+    assert "quote stale" in stale_result["reason"]
+
+    missing_quote = {**valid, "bid": None, "ask": None, "tick_time": None}
+    missing_result = service._validate_probe("Boom 500 Index", missing_quote, 100.0)
+    assert not missing_result["usable"]
+    assert missing_result["checks"]["price"] in {"NOT_EXPOSED", "INVALID"}
+
+    invalid_volume = {**valid, "volume_min": 0.0}
+    invalid_result = service._validate_probe("Boom 500 Index", invalid_volume, 100.0)
+    assert not invalid_result["usable"]
+    assert invalid_result["checks"]["volume"] == "INVALID"
+
+    insufficient_margin = {**valid, "margin_required": 101.0}
+    margin_result = service._validate_probe("Boom 500 Index", insufficient_margin, 100.0)
+    assert not margin_result["usable"]
+    assert margin_result["checks"]["margin_feasibility"] == "INSUFFICIENT_FREE_MARGIN"

@@ -175,6 +175,7 @@ class CapitalStateService:
             "bid": bid,
             "ask": ask,
             "last": None,
+            "tick_time": time.time(),
             "volume_min": (info or {}).get("volume_min", (info or {}).get("min_lot")),
             "volume_max": (info or {}).get("volume_max", (info or {}).get("max_lot")),
             "volume_step": (info or {}).get("volume_step", (info or {}).get("step_lot")),
@@ -191,6 +192,16 @@ class CapitalStateService:
         ask = self._number(probe.get("ask"))
         last = self._number(probe.get("last"))
         valid_prices = [value for value in (ask, bid, last) if value is not None and value > 0]
+        tick_time = self._number(probe.get("tick_time_msc"))
+        if tick_time is not None and tick_time > 10_000_000_000:
+            tick_time /= 1000.0
+        if tick_time is None:
+            tick_time = self._number(probe.get("tick_time"))
+        quote_age = max(0.0, time.time() - tick_time) if tick_time is not None and tick_time > 0 else None
+        quote_status = (
+            "STALE" if quote_age is not None and quote_age > max(1, int(getattr(self.settings, "broker_quote_max_age_seconds", 30)))
+            else "FRESH" if quote_age is not None else "NOT_EXPOSED"
+        )
         price_status = "VALID" if valid_prices else (
             "NOT_EXPOSED" if all(probe.get(field) is None for field in ("bid", "ask", "last")) else "INVALID"
         )
@@ -241,6 +252,8 @@ class CapitalStateService:
             errors.append(str(probe["error"]))
         if price_status != "VALID":
             errors.append(f"price {price_status.lower()}")
+        if quote_status == "STALE":
+            errors.append(f"quote stale ({quote_age:.1f}s)")
         if volume_status != "VALID":
             errors.append(f"volume {volume_status.lower()}")
         if contract_status != "VALID" and not margin_valid:
@@ -254,7 +267,7 @@ class CapitalStateService:
         # if contract-size fields are absent.  ``specification_valid`` answers
         # whether the account state can be determined; ``usable`` additionally
         # answers whether current free margin can fund that order.
-        specification_valid = price_status == "VALID" and volume_status == "VALID" and margin_valid and (contract_status == "VALID" or margin_valid)
+        specification_valid = price_status == "VALID" and quote_status != "STALE" and volume_status == "VALID" and margin_valid and (contract_status == "VALID" or margin_valid)
         usable = specification_valid and margin_feasible
         reason = "Broker-valid executable minimum-volume margin calculation" if usable else "; ".join(errors or ["Broker metadata is not sufficient to prove execution feasibility"])
         return self._as_json({
@@ -262,6 +275,8 @@ class CapitalStateService:
             "metadata": probe,
             "checks": {
                 "price": price_status,
+                "quote": quote_status,
+                "quote_age_seconds": quote_age,
                 "volume": volume_status,
                 "contract": contract_status,
                 "margin": margin_status,

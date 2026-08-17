@@ -394,6 +394,8 @@ class MT5Executor(BaseExecutor):
             "trade_mode": getattr(info, "trade_mode", None),
             "order_mode": getattr(info, "order_mode", None),
             "bid": bid, "ask": ask, "last": last,
+            "tick_time": getattr(tick, "time", None) if tick else None,
+            "tick_time_msc": getattr(tick, "time_msc", None) if tick else None,
             "point": getattr(info, "point", None),
             "digits": getattr(info, "digits", None),
             "tick_size": getattr(info, "trade_tick_size", getattr(info, "point", None)),
