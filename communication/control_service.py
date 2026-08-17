@@ -133,36 +133,68 @@ class SharedControlService:
             for index, symbol in enumerate(core_symbols, 1):
                 row = rankings.get(str(symbol), {})
                 score = dict(row.get("specialization") or {}).get("adjusted_score")
-                lines.append(f"{index}. {symbol} | adjusted specialization={float(score or 0.0):.2f} | role={row.get('role', 'CORE')}")
-                lines.append(f"   Reason: {row.get('role_reason', 'Earned through evidence governance.')}")
+                lines.append(f"{index}. {symbol} | {row.get('role', 'CORE')}")
+                lines.append(f"   Trades: {row.get('sample_size', 0)} | Expectancy: {float(row.get('expectancy_r') or 0.0):+.2f}R")
+                lines.append(f"   Win Rate: {float(row.get('win_rate') or 0.0)*100:.1f}% | Max DD: {float(row.get('max_drawdown_r') or 0.0):.2f}R")
+                lines.append(f"   Score: {float(score or 0.0):.2f}/100")
         else:
             lines.append("No instrument currently qualifies for CORE.")
             lines.append(str(specialization.get("core_selection_explanation") or "Fresh broker-verified specialization evidence is not yet sufficient."))
+        
         non_core = [row for row in specialization.get("rankings", []) if not row.get("selected_core")]
         if non_core:
             lines.append("")
-            lines.append("WHY NOT SELECTED")
+            lines.append("CHALLENGERS / EXPLORATORY")
             for row in non_core[:5]:
                 score = dict(row.get("specialization") or {}).get("adjusted_score")
-                lines.append(f"{row.get('instrument', '?')} | adjusted specialization={float(score or 0.0):.2f} | role={row.get('role', 'RESEARCH')}")
-                lines.append(f"   Reason: {row.get('role_reason', 'Not selected by Core governance.')}")
+                lines.append(f"{row.get('instrument', '?')} | {row.get('role', 'RESEARCH')} | Score: {float(score or 0.0):.2f}")
         return "\n".join(lines)
 
     async def learning(self, request: CommandRequest) -> str:
         kwargs = {"db_path": self.db_path} if self.db_path else {}
         rows = await db.get_strategy_evidence_summary(self.settings.trading_mode, days=30, **kwargs)
-        if not rows:
-            return "LEARNING\nInsufficient evidence is available for a ranked strategy summary."
-        total_samples = sum(int(row.get("sample_size") or 0) for row in rows)
-        best = rows[0]
-        return "\n".join([
-            "LEARNING",
-            f"Contexts: {len(rows)}",
-            f"Samples: {total_samples}",
-            f"Best context: {best.get('strategy_id', 'unknown')} / {best.get('symbol', 'unknown')}",
-            f"Expectancy: {best.get('expectancy_r', 'unknown')} R",
-            f"Confidence: {best.get('confidence', 'UNKNOWN')}",
-        ])
+        perf = await db.get_performance_summary(self.settings.trading_mode, **kwargs)
+        
+        total_trades = int(perf.get("trades", 0))
+        if total_trades < 25: phase = "EXPLORATION"
+        elif total_trades < 100: phase = "DEVELOPING"
+        else: phase = "MATURE"
+        
+        lines = [
+            "LEARNING UPDATE",
+            f"Phase: {phase}",
+            f"Completed MT5 trades: {total_trades}",
+            f"Current DEMO floor: {self.settings.normal_demo_min_setup_score:.1f}",
+            f"Experimental floor: {self.settings.exploration_min_setup_score:.1f}",
+            ""
+        ]
+        
+        if rows:
+            best = rows[0]
+            lines.append(f"Best setup family: {best.get('strategy_id', 'unknown')}")
+            lines.append(f"Best instrument: {best.get('symbol', 'unknown')}")
+            lines.append(f"Best expectancy: {best.get('expectancy_r', 'unknown')}R")
+            lines.append(f"Evidence strength: {best.get('confidence', 'UNKNOWN')}")
+        else:
+            lines.append("Insufficient evidence for ranked summary.")
+            
+        return "\n".join(lines)
+
+    async def scorebuckets(self, request: CommandRequest) -> str:
+        kwargs = {"db_path": self.db_path} if self.db_path else {}
+        buckets = await db.get_score_bucket_performance(self.settings.trading_mode, **kwargs)
+        
+        lines = ["SETUP SCORE PERFORMANCE"]
+        for label in sorted(buckets.keys()):
+            b = buckets[label]
+            if b["trades"] > 0:
+                lines.append(f"{label}:")
+                lines.append(f"   Trades: {b['trades']} | Win Rate: {b['win_rate']:.1f}%")
+                lines.append(f"   Expectancy: {b['expectancy']:+.2f}R | PF: {b['profit_factor']:.2f}")
+            else:
+                lines.append(f"{label}: No trades")
+                
+        return "\n".join(lines)
 
     async def research(self, request: CommandRequest) -> str:
         kwargs = {"db_path": self.db_path} if self.db_path else {}
@@ -268,6 +300,7 @@ def build_command_bus(service: SharedControlService) -> CommandBus:
     bus.register("experiments", service.experiments)
     bus.register("objective", service.objective)
     bus.register("performance", service.performance)
+    bus.register("scorebuckets", service.scorebuckets)
     bus.register("diagnostics", service.diagnostics)
     bus.register("logs", service.logs)
     bus.register("help", service.help)

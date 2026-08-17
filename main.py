@@ -187,6 +187,7 @@ async def main():
         BotCommand("challengers", "Forward-DEMO challenger policies"),
         BotCommand("research", "Falsifiable hypotheses and research queue"),
         BotCommand("performance", "DEMO/LIVE-separated results"),
+        BotCommand("scorebuckets", "Setup score performance by bucket"),
         BotCommand("settings", "Autonomy, alerts, and DEMO/LIVE control"),
         BotCommand("backtest", "Causal policy backtest"),
         BotCommand("activity", "Chart-study notification mode"),

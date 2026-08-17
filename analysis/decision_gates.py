@@ -433,7 +433,10 @@ def evaluate_trading_gate(
     # configuration reason.  It must never be labelled objective-ineligible
     # merely because evidence or promotion status is missing.
     if evidence_gap:
-        threshold = float(exploratory_threshold) if exploratory_threshold is not None else None
+        # Empirical Learning: 40 experimental floor, 50 normal DEMO floor.
+        experimental_floor = float(exploratory_threshold) if exploratory_threshold is not None else 40.0
+        normal_floor = 50.0 # Standard floor for normal DEMO execution
+        
         exploration_failures: list[str] = []
         exploration_codes: list[str] = []
         if not demo_mode:
@@ -442,25 +445,29 @@ def evaluate_trading_gate(
         if not exploration_authorized:
             exploration_failures.append("Controlled DEMO exploration is not authorized")
             exploration_codes.append("EXPLORATION_NOT_AUTHORIZED")
-        if threshold is None:
-            exploration_failures.append("Exploration setup threshold is not configured")
-            exploration_codes.append("EXPLORATION_THRESHOLD_UNCONFIGURED")
-        elif float(setup_quality or 0.0) < threshold:
+        
+        quality_val = float(setup_quality or 0.0)
+        if quality_val < experimental_floor:
             exploration_failures.append(
-                f"Setup quality {float(setup_quality or 0.0):.1f} below exploration threshold {threshold:.1f}"
+                f"Setup quality {quality_val:.1f} below experimental floor {experimental_floor:.1f}"
             )
             exploration_codes.append("SETUP_TOO_WEAK")
+            
         if strategy_threshold is not None and float(strategy_quality or 0.0) < float(strategy_threshold):
             exploration_failures.append(
                 f"Strategy match {float(strategy_quality or 0.0):.1f} below exploration threshold {float(strategy_threshold):.1f}"
             )
             exploration_codes.append("STRATEGY_MATCH_TOO_WEAK")
+            
         if not exploration_failures:
+            is_experimental = quality_val < normal_floor
+            execution_class = "EXPERIMENTAL" if is_experimental else "NORMAL"
+            
             return _decision(
                 trading_decision="CONTROLLED_FORWARD_DEMO",
                 final_state="EXPLORATORY_DEMO",
                 reason=(
-                    "Current setup passed all hard gates and the controlled DEMO exploration standard; "
+                    f"Current setup passed all hard gates and the empirical {execution_class.lower()} DEMO standard; "
                     + ("this is an explicit LOW_RR_EXPERIMENT and remains experimental. " if experimental_low_rr else "")
                     + "insufficient evidence and strategy governance remain informational and will be updated from the broker-realized outcome."
                 ),
@@ -475,12 +482,12 @@ def evaluate_trading_gate(
                 strategy_status=current_strategy_status,
                 hard_gate_results=hard_gate_results,
                 objective_status=objective_status,
-                            exploration_status="PASS",
-            broker_status=broker_status,
-            portfolio_status=portfolio_status,
-            risk_status=risk_status,
-            execution_class="EXPLORATION",
-        )
+                exploration_status="PASS",
+                broker_status=broker_status,
+                portfolio_status=portfolio_status,
+                risk_status=risk_status,
+                execution_class=execution_class,
+            )
         return _decision(
 
             trading_decision="NO_TRADE" if "SETUP_TOO_WEAK" in exploration_codes or "STRATEGY_MATCH_TOO_WEAK" in exploration_codes else "EXECUTION_BLOCKED",

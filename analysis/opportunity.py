@@ -310,12 +310,18 @@ def rank_opportunities(
             mandatory_reasons.append("no legitimate structural or strategy-specific target")
         if rr_filter_enabled and minimum_rr > 0.0 and actual_rr < minimum_rr:
             mandatory_reasons.append(f"actual RR 1:{actual_rr:.2f} below minimum 1:{minimum_rr:.2f}")
-        if continuation_requires_htf and htf_relationship != "ALIGNED":
-            mandatory_reasons.append(f"continuation HTF condition {htf_relationship}")
-        if minimum_quality_threshold > 0.0 and quality < minimum_quality_threshold:
-            mandatory_reasons.append(f"setup score {quality:.1f} below minimum {minimum_quality_threshold:.1f}")
-        if htf_relationship == "CONFLICTED":
-            mandatory_reasons.append("HTF conflict is unresolved")
+        # Empirical Learning: Relax HTF alignment and quality thresholds for DEMO
+        if self.settings.trading_mode == "live":
+            if continuation_requires_htf and htf_relationship != "ALIGNED":
+                mandatory_reasons.append(f"continuation HTF condition {htf_relationship}")
+            if minimum_quality_threshold > 0.0 and quality < minimum_quality_threshold:
+                mandatory_reasons.append(f"setup score {quality:.1f} below minimum {minimum_quality_threshold:.1f}")
+            if htf_relationship == "CONFLICTED":
+                mandatory_reasons.append("HTF conflict is unresolved")
+        else:
+            # DEMO mode: Record as features but don't hard-block plausible setups (score >= 40)
+            if quality < 40.0:
+                mandatory_reasons.append(f"setup score {quality:.1f} below empirical floor 40.0")
         current_setup_eligible = not mandatory_reasons
         evidence_gap = evidence_classification in {"INSUFFICIENT", "EMERGING", "PRELIMINARY"} or completed_confidence in {"UNKNOWN", "UNVALIDATED", "LOW"}
         exploration_quality_ok = quality >= exploration_setup_threshold and strategy_score >= exploration_strategy_threshold

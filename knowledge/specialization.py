@@ -21,12 +21,11 @@ SPECIALIZATION_WEIGHTS = {
 }
 
 SAMPLE_TIERS = (
-    (0, "UNVALIDATED"),
-    (1, "VERY_WEAK"),
-    (20, "PRELIMINARY"),
-    (50, "DEVELOPING"),
-    (100, "ESTABLISHED"),
-    (200, "STRONG"),
+    (0, "UNKNOWN"),
+    (10, "EARLY"),
+    (25, "DEVELOPING"),
+    (50, "MEANINGFUL"),
+    (100, "STRONG"),
 )
 
 

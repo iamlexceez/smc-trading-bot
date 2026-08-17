@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-ROLES = ("CORE", "CHALLENGER", "RESEARCH", "QUARANTINED")
+ROLES = ("CORE", "CANDIDATE", "EXPLORATORY", "UNDER_REVIEW", "QUARANTINED")
 
 
 @dataclass(frozen=True)
@@ -48,17 +48,27 @@ def classify_instrument(
     name = str(instrument or "").strip()
     if not broker_eligible:
         return InstrumentClassification(name, "QUARANTINED", False, sample, expectancy, drawdown, reliability, "Broker eligibility is not currently verified.")
-    if sample == 0 or expectancy is None:
-        return InstrumentClassification(name, "RESEARCH", True, sample, expectancy, drawdown, reliability, "No completed evidence is available; instrument remains in research.")
-    if expectancy <= 0:
-        return InstrumentClassification(name, "QUARANTINED", True, sample, expectancy, drawdown, reliability, "Negative expectancy is negative evidence, not an unknown sample.")
-    if sample < max(1, int(minimum_sample_size)):
-        return InstrumentClassification(name, "RESEARCH", True, sample, expectancy, drawdown, reliability, "Positive evidence exists but the configured sample depth is not complete.")
-    if drawdown is None or reliability is None:
-        return InstrumentClassification(name, "CHALLENGER", True, sample, expectancy, drawdown, reliability, "Positive evidence exists, but drawdown or execution reliability is unknown.")
-    if drawdown <= float(max_manageable_drawdown_r) and reliability >= float(minimum_execution_reliability):
-        return InstrumentClassification(name, "CORE", True, sample, expectancy, drawdown, reliability, "Positive out-of-sample/forward evidence is stable and execution is reliable.")
-    return InstrumentClassification(name, "CHALLENGER", True, sample, expectancy, drawdown, reliability, "Positive evidence exists but stability or execution criteria are not yet core-grade.")
+    
+    # Empirical Learning Lifecycle
+    if sample < 10:
+        return InstrumentClassification(name, "EXPLORATORY", True, sample, expectancy, drawdown, reliability, "Insufficient sample (<10) for evaluation.")
+    
+    if expectancy is not None and expectancy <= 0:
+        return InstrumentClassification(name, "UNDER_REVIEW", True, sample, expectancy, drawdown, reliability, "Negative expectancy observed; demoted to under-review.")
+    
+    if drawdown is not None and drawdown > float(max_manageable_drawdown_r):
+        return InstrumentClassification(name, "UNDER_REVIEW", True, sample, expectancy, drawdown, reliability, f"Drawdown {drawdown:.2f}R exceeds limit {max_manageable_drawdown_r:.2f}R.")
+
+    if sample < 50:
+        return InstrumentClassification(name, "CANDIDATE", True, sample, expectancy, drawdown, reliability, "Positive evidence exists but sample size (<50) is developing.")
+    
+    if reliability is not None and reliability < float(minimum_execution_reliability):
+        return InstrumentClassification(name, "CANDIDATE", True, sample, expectancy, drawdown, reliability, "Execution reliability below core standard.")
+
+    if expectancy is not None and expectancy > 0 and sample >= 50:
+        return InstrumentClassification(name, "CORE", True, sample, expectancy, drawdown, reliability, "Strong empirical evidence and stable execution.")
+        
+    return InstrumentClassification(name, "CANDIDATE", True, sample, expectancy, drawdown, reliability, "Developing evidence profile.")
 
 
 __all__ = ["ROLES", "InstrumentClassification", "classify_instrument"]

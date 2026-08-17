@@ -126,9 +126,18 @@ class TradeSettings:
     # Controlled DEMO exploration is explicit policy configuration. It never
     # authorizes LIVE exposure and never bypasses downstream broker/risk gates.
     exploration_enabled: bool = True
-    exploration_min_setup_score: float = 80.0
-    exploration_min_strategy_score: float = 80.0
+    exploration_min_setup_score: float = 40.0
+    exploration_min_strategy_score: float = 40.0
     exploration_risk_multiplier: float = 0.5
+    normal_demo_min_setup_score: float = 50.0
+    core_universe_size: int = 10
+    min_core_universe_size: int = 6
+    recalibration_frequency_hours: int = 24
+    min_sample_unknown: int = 10
+    min_sample_early: int = 25
+    min_sample_meaningful: int = 50
+    min_sample_strong: int = 100
+    exploration_budget_pct: float = 20.0
     is_paused: bool = False
     # Explains why bot-wide automation is paused. This prevents verified
     # broker recovery or standalone-scope activation from overriding a
@@ -341,6 +350,19 @@ class TradeSettings:
             displacement_range_ratio_min=float(d.get("displacement_range_ratio_min", 1.20)),
             structural_stop_atr_buffer=float(d.get("structural_stop_atr_buffer", 0.15)),
             max_chase_distance_atr=float(d.get("max_chase_distance_atr", 0.50)),
+            exploration_enabled=parse_bool(d.get("exploration_enabled", "true"), True),
+            exploration_min_setup_score=float(d.get("exploration_min_setup_score", 40.0)),
+            exploration_min_strategy_score=float(d.get("exploration_min_strategy_score", 40.0)),
+            exploration_risk_multiplier=float(d.get("exploration_risk_multiplier", 0.5)),
+            normal_demo_min_setup_score=float(d.get("normal_demo_min_setup_score", 50.0)),
+            core_universe_size=int(d.get("core_universe_size", 10)),
+            min_core_universe_size=int(d.get("min_core_universe_size", 6)),
+            recalibration_frequency_hours=int(d.get("recalibration_frequency_hours", 24)),
+            min_sample_unknown=int(d.get("min_sample_unknown", 10)),
+            min_sample_early=int(d.get("min_sample_early", 25)),
+            min_sample_meaningful=int(d.get("min_sample_meaningful", 50)),
+            min_sample_strong=int(d.get("min_sample_strong", 100)),
+            exploration_budget_pct=float(d.get("exploration_budget_pct", 20.0)),
             autonomous_learning_mode=parse_bool(d.get("autonomous_learning_mode", "true"), True),
             # Existing installations are deliberately migrated into the new
             # demo learning default once. Later explicit pause/stop controls
@@ -457,6 +479,19 @@ class TradeSettings:
             displacement_range_ratio_min=float(os.getenv("DISPLACEMENT_RANGE_RATIO_MIN", "1.20")),
             structural_stop_atr_buffer=float(os.getenv("STRUCTURAL_STOP_ATR_BUFFER", "0.15")),
             max_chase_distance_atr=float(os.getenv("MAX_CHASE_DISTANCE_ATR", "0.50")),
+            exploration_enabled=os.getenv("EXPLORATION_ENABLED", "true").lower() == "true",
+            exploration_min_setup_score=float(os.getenv("EXPLORATION_MIN_SETUP_SCORE", "40.0")),
+            exploration_min_strategy_score=float(os.getenv("EXPLORATION_MIN_STRATEGY_SCORE", "40.0")),
+            exploration_risk_multiplier=float(os.getenv("EXPLORATION_RISK_MULTIPLIER", "0.5")),
+            normal_demo_min_setup_score=float(os.getenv("NORMAL_DEMO_MIN_SETUP_SCORE", "50.0")),
+            core_universe_size=int(os.getenv("CORE_UNIVERSE_SIZE", "10")),
+            min_core_universe_size=int(os.getenv("MIN_CORE_UNIVERSE_SIZE", "6")),
+            recalibration_frequency_hours=int(os.getenv("RECALIBRATION_FREQUENCY_HOURS", "24")),
+            min_sample_unknown=int(os.getenv("MIN_SAMPLE_UNKNOWN", "10")),
+            min_sample_early=int(os.getenv("MIN_SAMPLE_EARLY", "25")),
+            min_sample_meaningful=int(os.getenv("MIN_SAMPLE_MEANINGFUL", "50")),
+            min_sample_strong=int(os.getenv("MIN_SAMPLE_STRONG", "100")),
+            exploration_budget_pct=float(os.getenv("EXPLORATION_BUDGET_PCT", "20.0")),
             autonomous_learning_mode=True,
             auto_trade=os.getenv("AUTO_TRADE", "true").lower() == "true",
             is_paused=False,

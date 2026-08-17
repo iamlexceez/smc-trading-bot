@@ -48,7 +48,8 @@ def select_diversified_core(
     threshold = max(0.0, min(1.0, float(correlation_threshold)))
     for item in rankings:
         instrument = str(item.get("instrument") or "")
-        if item.get("role") not in {"CORE", "CORE_STRONG"}:
+        # Empirical Learning: Core can be filled by Candidates if Core slots are empty
+        if item.get("role") not in {"CORE", "CANDIDATE"}:
             continue
         if len(selected) >= limit:
             rejected.append({"instrument": instrument, "reason": "Core ceiling reached; no empty slots are filled."})

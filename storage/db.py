@@ -3835,3 +3835,56 @@ async def list_module_invocation_evidence(db_path: str = DB_PATH) -> list[dict]:
     for row in rows:
         row["snapshot"] = json.loads(row.pop("snapshot_json") or "{}")
     return rows
+
+async def get_score_bucket_performance(account_mode: str, db_path: str = DB_PATH) -> dict:
+    """Group realized DEMO trades by setup score buckets and return performance metrics."""
+    query = """
+        SELECT 
+            t.pnl_r,
+            s.score as setup_score
+        FROM trades t
+        JOIN setup_records s ON t.setup_id = s.setup_id
+        WHERE t.account_mode = ? AND t.status = 'closed'
+        AND (t.ticket IS NULL OR t.ticket NOT IN (SELECT ticket FROM capital_reduction_actions WHERE ticket IS NOT NULL AND action = 'order_filled'))
+    """
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(query, (account_mode,))
+        rows = await cursor.fetchall()
+
+    buckets = {
+        "40-49": [],
+        "50-59": [],
+        "60-69": [],
+        "70-79": [],
+        "80-89": [],
+        "90-100": []
+    }
+    
+    for row in rows:
+        score = float(row['setup_score'] or 0.0)
+        pnl_r = float(row['pnl_r'] or 0.0)
+        
+        if 40 <= score < 50: buckets["40-49"].append(pnl_r)
+        elif 50 <= score < 60: buckets["50-59"].append(pnl_r)
+        elif 60 <= score < 70: buckets["60-69"].append(pnl_r)
+        elif 70 <= score < 80: buckets["70-79"].append(pnl_r)
+        elif 80 <= score < 90: buckets["80-89"].append(pnl_r)
+        elif 90 <= score <= 100: buckets["90-100"].append(pnl_r)
+
+    results = {}
+    for label, pnls in buckets.items():
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+        gross_profit = sum(wins)
+        gross_loss = abs(sum(losses))
+        
+        results[label] = {
+            "trades": len(pnls),
+            "win_rate": (len(wins) / len(pnls) * 100) if pnls else 0.0,
+            "expectancy": (sum(pnls) / len(pnls)) if pnls else 0.0,
+            "profit_factor": (gross_profit / gross_loss) if gross_loss else (float("inf") if gross_profit else 0.0),
+            "total_r": sum(pnls)
+        }
+    
+    return results
