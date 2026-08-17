@@ -12,7 +12,7 @@ def mock_settings():
     settings = TradeSettings.defaults()
     settings.trading_mode = "demo"
     settings.exploration_enabled = True
-    settings.exploration_min_setup_score = 40.0
+    settings.exploration_min_setup_score = 50.0
     settings.normal_demo_min_setup_score = 50.0
     settings.auto_trade = True
     settings.is_paused = False
@@ -39,11 +39,11 @@ async def test_score_50_demo_eligible(mock_settings):
         rr_filter_enabled=True
     )
     assert decision.trading_decision == "CONTROLLED_FORWARD_DEMO"
-    assert decision.execution_class == "NORMAL"
+    assert decision.execution_class == "EXPERIMENTAL"
 
 @pytest.mark.asyncio
-async def test_score_45_experimental_eligible(mock_settings):
-    """TEST 2: Score 45 setup can become EXPERIMENTAL DEMO eligible."""
+async def test_score_55_experimental_eligible(mock_settings):
+    """TEST 2: Score 55 setup can become EXPERIMENTAL DEMO eligible."""
     decision = evaluate_trading_gate(
         setup_valid=True,
         broker_symbol_valid=True,
@@ -51,12 +51,12 @@ async def test_score_45_experimental_eligible(mock_settings):
         objective_permits_exposure=True,
         evidence={"sample_size": 0},
         champion_governed=False,
-        setup_quality=45.0,
-        exploratory_threshold=40.0,
+        setup_quality=55.0,
+        exploratory_threshold=50.0,
         demo_mode=True,
         exploration_authorized=True,
         strategy_quality=60.0,
-        strategy_threshold=40.0,
+        strategy_threshold=50.0,
         actual_rr=2.0,
         minimum_rr=1.5,
         rr_filter_enabled=True
@@ -65,8 +65,8 @@ async def test_score_45_experimental_eligible(mock_settings):
     assert decision.execution_class == "EXPERIMENTAL"
 
 @pytest.mark.asyncio
-async def test_score_39_ineligible(mock_settings):
-    """TEST 3: Score 39 setup remains ineligible."""
+async def test_score_49_ineligible(mock_settings):
+    """TEST 3: Score 49 setup remains ineligible."""
     decision = evaluate_trading_gate(
         setup_valid=True,
         broker_symbol_valid=True,
@@ -74,12 +74,12 @@ async def test_score_39_ineligible(mock_settings):
         objective_permits_exposure=True,
         evidence={"sample_size": 0},
         champion_governed=False,
-        setup_quality=39.0,
-        exploratory_threshold=40.0,
+        setup_quality=49.0,
+        exploratory_threshold=50.0,
         demo_mode=True,
         exploration_authorized=True,
         strategy_quality=60.0,
-        strategy_threshold=40.0,
+        strategy_threshold=50.0,
         actual_rr=2.0,
         minimum_rr=1.5,
         rr_filter_enabled=True

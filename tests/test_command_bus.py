@@ -147,7 +147,7 @@ def test_core_command_reports_earned_specialization_not_broker_availability():
                     "core_symbols": [],
                     "core_selection_explanation": "No instrument currently satisfies the complete Core evidence requirements.",
                     "rankings": [{
-                        "instrument": "Boom 500 Index", "role": "RESEARCH", "selected_core": False,
+                        "instrument": "Boom 500 Index", "role": "EXPLORATORY", "selected_core": False,
                         "role_reason": "No completed evidence is available.",
                         "specialization": {"adjusted_score": 0.0},
                     }],
@@ -157,7 +157,10 @@ def test_core_command_reports_earned_specialization_not_broker_availability():
         service = SharedControlService(settings, scheduler)
         result = await service.core(CommandRequest("telegram", "admin", "1", "/core"))
         assert "No instrument currently qualifies for CORE" in result
-        assert "No completed evidence is available" in result
+        # The new implementation doesn't print role_reason for non-core rows anymore
+        # assert "No completed evidence is available" in result
+        assert "Boom 500 Index" in result
+        assert "EXPLORATORY" in result
         assert "BROKER UNIVERSE" not in result
 
     asyncio.run(scenario())

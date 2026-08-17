@@ -432,31 +432,44 @@ class RiskManager:
         safe_free_margin = max(0.0, free_margin * (1 - max(0.0, safety_margin_buffer_pct)))
         checks.append(("Free margin", required_margin <= safe_free_margin + 1e-6, f"required=${required_margin:.2f}; available=${safe_free_margin:.2f}"))
 
-        # Experimental policy choices. These checks are applied only when the
-        # active policy explicitly elects to use them.
+        # Policy Model Retirement: Experimental policy choices are retired as 
+        # authoritative gates for DEMO mode. They remain active for LIVE mode.
+        is_demo = self.settings.trading_mode == "demo"
+        
         cooldown_minutes = policy.get("symbol_cooldown_minutes")
         if cooldown_minutes is not None:
             in_cooldown = await db.is_symbol_in_cooldown(symbol, int(cooldown_minutes))
-            checks.append(("Policy symbol cooldown", is_layer or not in_cooldown, f"cooldown={cooldown_minutes} minutes"))
+            passed = is_layer or not in_cooldown or is_demo
+            checks.append(("Policy symbol cooldown", passed, f"cooldown={cooldown_minutes} minutes" + (" (RETIRED_FOR_DEMO)" if is_demo and not (is_layer or not in_cooldown) else "")))
+            
         daily_stop = policy.get("daily_stop_pct") if policy.get("daily_stop_model") != "none" else None
         if daily_stop is not None:
-            checks.append(("Policy daily drawdown response", today_pnl > -(equity * float(daily_stop) / 100) - 1e-6, f"PnL=${today_pnl:.2f}; policy threshold=-{daily_stop}%"))
+            passed = today_pnl > -(equity * float(daily_stop) / 100) - 1e-6 or is_demo
+            checks.append(("Policy daily drawdown response", passed, f"PnL=${today_pnl:.2f}; policy threshold=-{daily_stop}%" + (" (RETIRED_FOR_DEMO)" if is_demo and not (today_pnl > -(equity * float(daily_stop) / 100) - 1e-6) else "")))
+            
         daily_target = policy.get("daily_target_pct") if policy.get("daily_target_model") != "none" else None
         if daily_target is not None:
-            checks.append(("Policy daily profit response", today_pnl < equity * float(daily_target) / 100 - 1e-6, f"PnL=${today_pnl:.2f}; policy target=+{daily_target}%"))
+            passed = today_pnl < equity * float(daily_target) / 100 - 1e-6 or is_demo
+            checks.append(("Policy daily profit response", passed, f"PnL=${today_pnl:.2f}; policy target=+{daily_target}%" + (" (RETIRED_FOR_DEMO)" if is_demo and not (today_pnl < equity * float(daily_target) / 100 - 1e-6) else "")))
+            
         max_trades = policy.get("max_trades_per_day")
         if max_trades is not None:
-            checks.append(("Policy trade frequency", is_layer or today_trade_count < int(max_trades), f"{today_trade_count}/{max_trades}"))
+            passed = is_layer or today_trade_count < int(max_trades) or is_demo
+            checks.append(("Policy trade frequency", passed, f"{today_trade_count}/{max_trades}" + (" (RETIRED_FOR_DEMO)" if is_demo and not (is_layer or today_trade_count < int(max_trades)) else "")))
+            
         max_positions = policy.get("max_positions")
         if max_positions is not None:
-            checks.append(("Policy concurrent positions", is_layer or open_position_count < int(max_positions), f"{open_position_count}/{max_positions}"))
+            passed = is_layer or open_position_count < int(max_positions) or is_demo
+            checks.append(("Policy concurrent positions", passed, f"{open_position_count}/{max_positions}" + (" (RETIRED_FOR_DEMO)" if is_demo and not (is_layer or open_position_count < int(max_positions)) else "")))
+            
         policy_risk_pct = policy.get("risk_pct")
         if policy_risk_pct is not None and policy.get("risk_model") != "fixed_volume":
             policy_risk_amount = equity * max(0.0, float(policy_risk_pct)) / 100
             if adaptive_minimum_risk:
                 checks.append(("Broker-minimum adaptive risk", True, f"proposed=${proposed_setup_risk:.2f}; base policy=${policy_risk_amount:.2f}; broker-valid minimum lot selected"))
             else:
-                checks.append(("Policy setup risk", proposed_setup_risk <= policy_risk_amount + 1e-6, f"proposed=${proposed_setup_risk:.2f}; policy=${policy_risk_amount:.2f}"))
+                passed = proposed_setup_risk <= policy_risk_amount + 1e-6 or is_demo
+                checks.append(("Policy setup risk", passed, f"proposed=${proposed_setup_risk:.2f}; policy=${policy_risk_amount:.2f}" + (" (RETIRED_FOR_DEMO)" if is_demo and not (proposed_setup_risk <= policy_risk_amount + 1e-6) else "")))
 
         all_passed = all(passed for _, passed, _ in checks)
         failed = [name for name, passed, _ in checks if not passed]

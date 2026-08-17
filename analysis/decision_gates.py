@@ -237,6 +237,7 @@ def evaluate_trading_gate(
     setup_confidence: str | None = None,
     strategy_status: str | None = None,
     capital_efficiency_approved: bool = True,
+    retired_veto: str | None = None,
 ) -> GateDecision:
     """Return the one authoritative pre-order policy decision.
 
@@ -373,54 +374,55 @@ def evaluate_trading_gate(
             risk_status=risk_status,
         )
 
-    # Negative or invalidated evidence is evidence of a bad hypothesis, not a
-    # lack of evidence.  Structural conflict remains explicitly deferred.
-    if evidence_classification in {"NEGATIVE", "INVALIDATED"}:
-        label = f"Negative or invalidated evidence ({evidence_classification})"
-        return _decision(
-            trading_decision="TRADE_REJECTED",
-            final_state="REJECTED",
-            reason=label,
-            reason_codes=["NEGATIVE_EVIDENCE" if evidence_classification == "NEGATIVE" else "INVALIDATED_STRATEGY"],
-            failures=[label],
-            advisories=[],
-            evidence_classification=evidence_classification,
-            confidence_classification=confidence_classification,
-            sample_size=sample_size,
-            setup_quality=setup_quality,
-            setup_confidence=current_setup_confidence,
-            strategy_status=current_strategy_status,
-            hard_gate_results=hard_gate_results,
-            objective_status=objective_status,
-            exploration_status="NOT_ELIGIBLE",
-            broker_status=broker_status,
-            portfolio_status=portfolio_status,
-            risk_status=risk_status,
-        )
+    # Policy Model Retirement: Negative, invalidated, or conflicted evidence
+    # no longer independently vetoes a DEMO experiment. These remain active
+    # for LIVE mode and are reported as advisories in DEMO.
+    if not demo_mode:
+        if evidence_classification in {"NEGATIVE", "INVALIDATED"}:
+            label = f"Negative or invalidated evidence ({evidence_classification})"
+            return _decision(
+                trading_decision="TRADE_REJECTED",
+                final_state="REJECTED",
+                reason=label,
+                reason_codes=["NEGATIVE_EVIDENCE" if evidence_classification == "NEGATIVE" else "INVALIDATED_STRATEGY"],
+                failures=[label],
+                advisories=[],
+                evidence_classification=evidence_classification,
+                confidence_classification=confidence_classification,
+                sample_size=sample_size,
+                setup_quality=setup_quality,
+                setup_confidence=current_setup_confidence,
+                strategy_status=current_strategy_status,
+                hard_gate_results=hard_gate_results,
+                objective_status=objective_status,
+                exploration_status="NOT_ELIGIBLE",
+                broker_status=broker_status,
+                portfolio_status=portfolio_status,
+                risk_status=risk_status,
+            )
 
-    if evidence_classification == "CONFLICTED" or structural_conflict:
-        label = "Unresolved structural or historical conflict"
-        return _decision(
-            trading_decision="DEFERRED",
-            final_state="WAITING_FOR_CONFIRMATION",
-            reason=label,
-            reason_codes=["STRUCTURE_CONFLICT"],
-            failures=[label],
-            advisories=[],
-            evidence_classification=evidence_classification,
-            confidence_classification=confidence_classification,
-            sample_size=sample_size,
-            setup_quality=setup_quality,
-            setup_confidence=current_setup_confidence,
-            strategy_status=current_strategy_status,
-            hard_gate_results=hard_gate_results,
-            objective_status=objective_status,
-            exploration_status="DEFERRED",
-            broker_status=broker_status,
-            portfolio_status=portfolio_status,
-            risk_status=risk_status,
-        )
-
+        if evidence_classification == "CONFLICTED" or structural_conflict:
+            label = "Unresolved structural or historical conflict"
+            return _decision(
+                trading_decision="DEFERRED",
+                final_state="WAITING_FOR_CONFIRMATION",
+                reason=label,
+                reason_codes=["STRUCTURE_CONFLICT"],
+                failures=[label],
+                advisories=[],
+                evidence_classification=evidence_classification,
+                confidence_classification=confidence_classification,
+                sample_size=sample_size,
+                setup_quality=setup_quality,
+                setup_confidence=current_setup_confidence,
+                strategy_status=current_strategy_status,
+                hard_gate_results=hard_gate_results,
+                objective_status=objective_status,
+                exploration_status="DEFERRED",
+                broker_status=broker_status,
+                portfolio_status=portfolio_status,
+                risk_status=risk_status,
+            )
     evidence_gap = evidence_classification in {"INSUFFICIENT", "EMERGING", "PRELIMINARY"} or confidence_classification in {"LOW", "UNVALIDATED"}
     advisories: list[str] = []
     if evidence_gap:
@@ -428,14 +430,78 @@ def evaluate_trading_gate(
         advisories.append(f"EVIDENCE_CONFIDENCE:{confidence_classification}")
         advisories.append(f"STRATEGY_GOVERNANCE:{current_strategy_status}")
 
+    if not demo_mode:
+        # LIVE mode: Evidence/Governance are hard blocks.
+        if evidence_classification in {"NEGATIVE", "INVALIDATED"}:
+            label = f"Evidence state {evidence_classification} blocks live execution"
+            return _decision(
+                trading_decision="TRADE_REJECTED",
+                final_state="REJECTED",
+                reason=label,
+                reason_codes=["NEGATIVE_EVIDENCE"],
+                failures=[label],
+                advisories=advisories,
+                evidence_classification=evidence_classification,
+                confidence_classification=confidence_classification,
+                sample_size=sample_size,
+                setup_quality=setup_quality,
+                setup_confidence=current_setup_confidence,
+                strategy_status=current_strategy_status,
+                hard_gate_results=hard_gate_results,
+                objective_status=objective_status,
+                exploration_status="REJECTED",
+                broker_status=broker_status,
+                portfolio_status=portfolio_status,
+                risk_status=risk_status,
+            )
+
+        if evidence_classification == "CONFLICTED" or structural_conflict:
+            label = "Unresolved structural or historical conflict"
+            return _decision(
+                trading_decision="DEFERRED",
+                final_state="WAITING_FOR_CONFIRMATION",
+                reason=label,
+                reason_codes=["STRUCTURE_CONFLICT"],
+                failures=[label],
+                advisories=advisories,
+                evidence_classification=evidence_classification,
+                confidence_classification=confidence_classification,
+                sample_size=sample_size,
+                setup_quality=setup_quality,
+                setup_confidence=current_setup_confidence,
+                strategy_status=current_strategy_status,
+                hard_gate_results=hard_gate_results,
+                objective_status=objective_status,
+                exploration_status="DEFERRED",
+                broker_status=broker_status,
+                portfolio_status=portfolio_status,
+                risk_status=risk_status,
+            )
+    else:
+        # DEMO mode: Record these as advisories but don't block.
+        if evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"} or structural_conflict or retired_veto:
+            if evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"}:
+                advisories.append(f"RETIRED_POLICY_VETO:{evidence_classification}")
+            if structural_conflict:
+                advisories.append("RETIRED_POLICY_VETO:STRUCTURAL_CONFLICT")
+            if retired_veto:
+                advisories.append(f"RETIRED_POLICY_VETO:{retired_veto}")
+
     # A positive but under-evidenced hypothesis must either qualify for a
     # controlled DEMO experiment or be rejected for a concrete current-setup/
     # configuration reason.  It must never be labelled objective-ineligible
     # merely because evidence or promotion status is missing.
-    if evidence_gap:
-        # Empirical Learning: 40 experimental floor, 50 normal DEMO floor.
-        experimental_floor = float(exploratory_threshold) if exploratory_threshold is not None else 40.0
-        normal_floor = 50.0 # Standard floor for normal DEMO execution
+    # Real-MT5 Learning: 50 initial experimental threshold for DEMO.
+    # Evidence gap or retired policy vetoes proceed to exploration logic.
+    is_experimental_candidate = (
+        evidence_gap 
+        or evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"}
+        or structural_conflict
+        or retired_veto
+    )
+    
+    if is_experimental_candidate:
+        experimental_floor = float(exploratory_threshold) if exploratory_threshold is not None else 50.0
         
         exploration_failures: list[str] = []
         exploration_codes: list[str] = []
@@ -460,16 +526,13 @@ def evaluate_trading_gate(
             exploration_codes.append("STRATEGY_MATCH_TOO_WEAK")
             
         if not exploration_failures:
-            is_experimental = quality_val < normal_floor
-            execution_class = "EXPERIMENTAL" if is_experimental else "NORMAL"
-            
             return _decision(
                 trading_decision="CONTROLLED_FORWARD_DEMO",
                 final_state="EXPLORATORY_DEMO",
                 reason=(
-                    f"Current setup passed all hard gates and the empirical {execution_class.lower()} DEMO standard; "
+                    "Current setup passed all hard gates and the Real-MT5 experimental DEMO standard; "
                     + ("this is an explicit LOW_RR_EXPERIMENT and remains experimental. " if experimental_low_rr else "")
-                    + "insufficient evidence and strategy governance remain informational and will be updated from the broker-realized outcome."
+                    + "policy models are retired as execution authorities and will be updated from the broker-realized outcome."
                 ),
                 reason_codes=["CONTROLLED_DEMO_EXPLORATION", "EVIDENCE_COLLECTION_REQUIRED"] + (["LOW_RR_EXPERIMENT"] if experimental_low_rr else []),
                 failures=[],
@@ -486,7 +549,7 @@ def evaluate_trading_gate(
                 broker_status=broker_status,
                 portfolio_status=portfolio_status,
                 risk_status=risk_status,
-                execution_class=execution_class,
+                execution_class="EXPERIMENTAL",
             )
         return _decision(
 

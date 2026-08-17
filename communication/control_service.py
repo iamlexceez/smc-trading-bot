@@ -76,6 +76,7 @@ class SharedControlService:
         components = runtime.get("components") or {}
         tracker = getattr(self.scheduler, "invocation_tracker", None)
         invocation = tracker.summary() if tracker is not None else {}
+        is_demo = self.settings.trading_mode == "demo"
         return "\n".join([
             "ENGINE",
             f"Market scanner: {(components.get('market_scanner') or {}).get('state', 'UNKNOWN')}",
@@ -84,6 +85,7 @@ class SharedControlService:
             f"Position manager: {(components.get('position_manager') or {}).get('state', 'UNKNOWN')}",
             f"Learning: {(components.get('learning_engine') or {}).get('state', 'UNKNOWN')}",
             f"Setup Intelligence V2: {'RUNNING' if (invocation.get('rows') and any(r['module_name'] == 'analysis.setup_intelligence' and r['called'] for r in invocation['rows'])) else 'INITIALIZED'}",
+            f"Policy models: {'RETIRED AS EXECUTION AUTHORITY' if is_demo else 'ACTIVE'}",
             f"Legacy Setup Authority: DISABLED",
             f"Last scan: {getattr(self.scheduler, '_last_scan_disposition', {}).get('state', 'UNKNOWN')}",
             f"Invocation matrix: {invocation.get('complete_modules', 0)}/{invocation.get('total_modules', 0)} complete",
@@ -162,8 +164,8 @@ class SharedControlService:
         
         lines = [
             "LEARNING UPDATE",
-            f"Phase: {phase}",
-            f"Completed MT5 trades: {total_trades}",
+            f"Learning state: {phase}",
+            f"Real DEMO samples: {total_trades}",
             f"Current DEMO floor: {self.settings.normal_demo_min_setup_score:.1f}",
             f"Experimental floor: {self.settings.exploration_min_setup_score:.1f}",
             ""
@@ -235,12 +237,23 @@ class SharedControlService:
 
     async def performance(self, request: CommandRequest) -> str:
         kwargs = {"db_path": self.db_path} if self.db_path else {}
-        summary = await db.get_performance_summary(self.settings.trading_mode, days=7, **kwargs)
+        summary = await db.get_performance_summary(self.settings.trading_mode, **kwargs)
+        is_demo = self.settings.trading_mode == "demo"
+        title = "REAL DEMO MT5 PERFORMANCE" if is_demo else "LIVE PERFORMANCE"
+        
         return "\n".join([
-            "PERFORMANCE — LAST 7 DAYS",
-            f"Trades: {summary.get('trades', summary.get('trade_count', 'unknown'))}",
-            f"PnL: {summary.get('pnl', summary.get('total_pnl', 'unknown'))}",
-            f"Win rate: {summary.get('win_rate', 'unknown')}",
+            title,
+            f"Total trades: {summary.get('trades', 0)}",
+            f"Wins: {summary.get('wins', 0)}",
+            f"Losses: {summary.get('losses', 0)}",
+            f"Breakeven: {summary.get('breakeven', 0)}",
+            "",
+            f"Win rate: {float(summary.get('win_rate', 0)):.1f}%",
+            f"Average R: {float(summary.get('average_r', 0)):+.2f}R",
+            f"Expectancy: {float(summary.get('expectancy_r', 0)):+.2f}R",
+            f"Profit factor: {float(summary.get('profit_factor', 0)):.2f}",
+            "",
+            f"Sample maturity: {summary.get('sample_maturity', 'UNKNOWN')}",
         ])
 
     async def diagnostics(self, request: CommandRequest) -> str:

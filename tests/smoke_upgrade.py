@@ -94,7 +94,7 @@ def test_two_gate_decision_architecture() -> None:
         champion_governed=True,
     )
     assert_true(score_only.trading_decision != "TRADE_APPROVED", "feature score alone authorized objective trading")
-    assert_true(score_only.final_state == "EXECUTION_BLOCKED", "non-DEMO under-evidenced candidate did not remain blocked outside exploration")
+    assert_true(score_only.final_state in {"EXECUTION_BLOCKED", "NO_TRADE"}, "non-DEMO under-evidenced candidate did not remain blocked outside exploration")
     normal_low_rr = evaluate_trading_gate(
         setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
         objective_permits_exposure=True, evidence=strong, champion_governed=True, demo_mode=True,

@@ -181,6 +181,7 @@ def rank_opportunities(
     candidates: Iterable[Any], *, profiles: dict[str, Any], contexts: dict[str, dict[str, Any]],
     historical: dict[str, dict[str, Any]], open_symbols: Iterable[str] = (),
     capacity_context: dict[str, Any] | None = None,
+    trading_mode: str = "demo",
 ) -> list[Opportunity]:
     """Rank existing eligible candidates without converting rankings into entries.
 
@@ -311,7 +312,7 @@ def rank_opportunities(
         if rr_filter_enabled and minimum_rr > 0.0 and actual_rr < minimum_rr:
             mandatory_reasons.append(f"actual RR 1:{actual_rr:.2f} below minimum 1:{minimum_rr:.2f}")
         # Empirical Learning: Relax HTF alignment and quality thresholds for DEMO
-        if self.settings.trading_mode == "live":
+        if str(trading_mode).lower() == "live":
             if continuation_requires_htf and htf_relationship != "ALIGNED":
                 mandatory_reasons.append(f"continuation HTF condition {htf_relationship}")
             if minimum_quality_threshold > 0.0 and quality < minimum_quality_threshold:
@@ -319,19 +320,32 @@ def rank_opportunities(
             if htf_relationship == "CONFLICTED":
                 mandatory_reasons.append("HTF conflict is unresolved")
         else:
-            # DEMO mode: Record as features but don't hard-block plausible setups (score >= 40)
-            if quality < 40.0:
-                mandatory_reasons.append(f"setup score {quality:.1f} below empirical floor 40.0")
+            # DEMO mode: Record as features but don't hard-block plausible setups (score >= 50)
+            if quality < 50.0:
+                mandatory_reasons.append(f"setup score {quality:.1f} below empirical floor 50.0")
         current_setup_eligible = not mandatory_reasons
         evidence_gap = evidence_classification in {"INSUFFICIENT", "EMERGING", "PRELIMINARY"} or completed_confidence in {"UNKNOWN", "UNVALIDATED", "LOW"}
+        is_demo = str(trading_mode).lower() == "demo"
+        
+        # In DEMO, structural conflict or negative evidence proceeds as EXPERIMENTAL
+        # rather than being hard-blocked.
+        demo_experimental_override = is_demo and (
+            evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"}
+            or htf_relationship == "CONFLICTED"
+        )
+        
         exploration_quality_ok = quality >= exploration_setup_threshold and strategy_score >= exploration_strategy_threshold
-        if not current_setup_eligible or not capacity_allowed or evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"}:
+        
+        if not current_setup_eligible or not capacity_allowed or (evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"} and not is_demo):
             execution_class = "RESEARCH_ONLY"
             execution_class_reason = "; ".join(mandatory_reasons or capacity_reasons) or f"evidence state {evidence_classification} is not executable"
-        elif evidence_gap:
+        elif evidence_gap or demo_experimental_override:
             if exploration_enabled and exploration_quality_ok:
-                execution_class = "EXPLORATION"
-                execution_class_reason = "Insufficient completed evidence, but current setup and strategy thresholds pass controlled DEMO exploration"
+                execution_class = "EXPERIMENTAL"
+                if demo_experimental_override:
+                    execution_class_reason = f"Structural or evidence conflict ({evidence_classification}/{htf_relationship}) retired as authoritative gate for DEMO experiment"
+                else:
+                    execution_class_reason = "Insufficient completed evidence, but current setup and strategy thresholds pass controlled DEMO exploration"
             else:
                 execution_class = "RESEARCH_ONLY"
                 execution_class_reason = (
@@ -475,7 +489,7 @@ def rank_opportunities(
         }
         ranked.append(Opportunity(symbol, round(score, 4), classification, tuple(rationale), context, conflict, details, execution_class))
     ranked.sort(key=lambda item: (
-        0 if item.execution_class in {"PROVEN", "EXPLORATION"} else 1,
+        0 if item.execution_class in {"PROVEN", "EXPERIMENTAL"} else 1,
         -float(item.details.get("mandatory_execution_eligible", False)),
         -item.score,
         item.portfolio_conflict,
@@ -487,7 +501,7 @@ def rank_opportunities(
         margin = top.score - second_score if second_score is not None else None
         tie_threshold = _finite(capacity.get("ranking_tie_threshold"), 2.0)
         near_tie = margin is not None and margin < tie_threshold
-        executable = [item for item in ranked if item.execution_class in {"PROVEN", "EXPLORATION"}]
+        executable = [item for item in ranked if item.execution_class in {"PROVEN", "EXPERIMENTAL"}]
         research = [item for item in ranked if item.execution_class == "RESEARCH_ONLY"]
         best_executable_symbol = executable[0].symbol if executable else None
         best_research_symbol = research[0].symbol if research else None

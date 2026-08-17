@@ -47,6 +47,7 @@ class TradeSignal:
     policy_version: str = ""
     experiment_id: Optional[int] = None
     experimental_policy: dict[str, Any] = field(default_factory=dict)
+    retired_veto: Optional[str] = None
     passed: bool = False
     rejection_reason: str = ""
     regime: str = "UNKNOWN"

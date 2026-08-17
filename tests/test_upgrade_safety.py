@@ -143,13 +143,13 @@ def test_weak_setup_with_insufficient_evidence_is_rejected() -> None:
         evidence={"evidence_classification": "INSUFFICIENT"},
         champion_governed=False, portfolio_approved=True,
         required_htf_context_available=True,
-        setup_quality=61.0, exploratory_threshold=80.0,
-        strategy_quality=84.0, strategy_threshold=80.0,
+        setup_quality=41.0, exploratory_threshold=50.0,
+        strategy_quality=84.0, strategy_threshold=50.0,
         demo_mode=True, exploration_authorized=True,
     )
     assert decision.trading_decision == "NO_TRADE"
     assert decision.final_state == "NO_TRADE"
-    assert "below exploration threshold" in decision.reason
+    assert "below experimental floor" in decision.reason
 
 
 def test_insufficient_evidence_does_not_override_hard_gate() -> None:
@@ -193,12 +193,15 @@ def test_conflicted_top_down_context_is_explicitly_waiting() -> None:
         required_htf_context_available=True,
         setup_quality=90.0,
         exploration_authorized=True,
-        exploratory_threshold=80.0,
+        exploratory_threshold=50.0,
         demo_mode=True,
         experiment_id=17,
     )
-    assert decision.final_state == "WAITING_FOR_CONFIRMATION"
-    assert decision.trading_decision == "DEFERRED"
+    # In the new implementation, structural conflict in DEMO proceeds to exploration
+    # but with a RETIRED_POLICY_VETO:STRUCTURAL_CONFLICT advisory.
+    assert decision.trading_decision == "CONTROLLED_FORWARD_DEMO"
+    assert decision.execution_class == "EXPERIMENTAL"
+    assert any("STRUCTURAL_CONFLICT" in a for a in decision.advisories)
 
 
 def test_forward_demo_challenger_is_allowed_to_trade_in_isolated_demo() -> None:
@@ -250,10 +253,10 @@ def test_execution_classes_and_gated_ranking_are_explicit() -> None:
         setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
         objective_permits_exposure=True, evidence={"evidence_classification": "INSUFFICIENT"},
         champion_governed=False, portfolio_approved=True, required_htf_context_available=True,
-        setup_quality=85.0, exploratory_threshold=80.0, strategy_quality=85.0,
-        strategy_threshold=80.0, demo_mode=True, exploration_authorized=True,
+        setup_quality=85.0, exploratory_threshold=50.0, strategy_quality=85.0,
+        strategy_threshold=50.0, demo_mode=True, exploration_authorized=True,
     )
-    assert exploration.execution_class == "EXPLORATION"
+    assert exploration.execution_class == "EXPERIMENTAL"
 
     proven = evaluate_trading_gate(
         setup_valid=True, broker_symbol_valid=True, valid_market_data=True,
@@ -315,10 +318,13 @@ def test_htf_conflict_and_near_tie_are_visible() -> None:
         [candidate("A"), candidate("B")], profiles={},
         contexts={"A": {"regime": "TRENDING", "adx": 30.0, "atr_ratio": 1.0, "momentum": 0.4}, "B": {"regime": "TRENDING", "adx": 30.0, "atr_ratio": 1.0, "momentum": 0.4}},
         historical={}, capacity_context={"new_exposure_allowed": True, "exploration_enabled": True, "ranking_tie_threshold": 2.0},
+        trading_mode="demo"
     )
-    assert all(item.execution_class == "RESEARCH_ONLY" for item in ranked)
+    # In DEMO, conflicted HTF proceeds as EXPERIMENTAL
+    assert all(item.execution_class == "EXPERIMENTAL" for item in ranked)
     assert ranked[0].details["htf_relationship"] == "CONFLICTED"
     assert ranked[0].details["ranking_label"] == "RANKING_TIE"
     assert ranked[1].details["ranking_label"] == "RANKING_TIE"
-    assert ranked[0].details["best_executable_symbol"] is None
-    assert ranked[0].details["best_research_symbol"] in {"A", "B"}
+    # In the new logic, EXPERIMENTAL is considered executable
+    assert ranked[0].details["best_executable_symbol"] in {"A", "B"}
+    assert ranked[0].details["best_research_symbol"] is None

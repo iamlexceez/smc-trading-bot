@@ -126,8 +126,8 @@ class TradeSettings:
     # Controlled DEMO exploration is explicit policy configuration. It never
     # authorizes LIVE exposure and never bypasses downstream broker/risk gates.
     exploration_enabled: bool = True
-    exploration_min_setup_score: float = 40.0
-    exploration_min_strategy_score: float = 40.0
+    exploration_min_setup_score: float = 50.0
+    exploration_min_strategy_score: float = 50.0
     exploration_risk_multiplier: float = 0.5
     normal_demo_min_setup_score: float = 50.0
     core_universe_size: int = 10
@@ -351,8 +351,8 @@ class TradeSettings:
             structural_stop_atr_buffer=float(d.get("structural_stop_atr_buffer", 0.15)),
             max_chase_distance_atr=float(d.get("max_chase_distance_atr", 0.50)),
             exploration_enabled=parse_bool(d.get("exploration_enabled", "true"), True),
-            exploration_min_setup_score=float(d.get("exploration_min_setup_score", 40.0)),
-            exploration_min_strategy_score=float(d.get("exploration_min_strategy_score", 40.0)),
+            exploration_min_setup_score=float(d.get("exploration_min_setup_score", 50.0)),
+            exploration_min_strategy_score=float(d.get("exploration_min_strategy_score", 50.0)),
             exploration_risk_multiplier=float(d.get("exploration_risk_multiplier", 0.5)),
             normal_demo_min_setup_score=float(d.get("normal_demo_min_setup_score", 50.0)),
             core_universe_size=int(d.get("core_universe_size", 10)),
@@ -480,8 +480,8 @@ class TradeSettings:
             structural_stop_atr_buffer=float(os.getenv("STRUCTURAL_STOP_ATR_BUFFER", "0.15")),
             max_chase_distance_atr=float(os.getenv("MAX_CHASE_DISTANCE_ATR", "0.50")),
             exploration_enabled=os.getenv("EXPLORATION_ENABLED", "true").lower() == "true",
-            exploration_min_setup_score=float(os.getenv("EXPLORATION_MIN_SETUP_SCORE", "40.0")),
-            exploration_min_strategy_score=float(os.getenv("EXPLORATION_MIN_STRATEGY_SCORE", "40.0")),
+            exploration_min_setup_score=float(os.getenv("EXPLORATION_MIN_SETUP_SCORE", "50.0")),
+            exploration_min_strategy_score=float(os.getenv("EXPLORATION_MIN_STRATEGY_SCORE", "50.0")),
             exploration_risk_multiplier=float(os.getenv("EXPLORATION_RISK_MULTIPLIER", "0.5")),
             normal_demo_min_setup_score=float(os.getenv("NORMAL_DEMO_MIN_SETUP_SCORE", "50.0")),
             core_universe_size=int(os.getenv("CORE_UNIVERSE_SIZE", "10")),

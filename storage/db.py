@@ -46,8 +46,14 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 rr_ratio REAL,
                 status TEXT DEFAULT 'open',
                 pnl REAL DEFAULT 0,
+                pnl_r REAL,
+                mae_r REAL,
+                mfe_r REAL,
                 executor TEXT DEFAULT 'paper',
+                execution_type TEXT,
                 account_mode TEXT NOT NULL DEFAULT 'demo',
+                exit_reason TEXT,
+                ticket INTEGER,
                 raw_signal TEXT
             )
         """)
@@ -671,6 +677,13 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await _ensure_column(db, "trades", "account_mode", "TEXT NOT NULL DEFAULT 'demo'")
         await _ensure_column(db, "trades", "ticket", "INTEGER")
         await _ensure_column(db, "trades", "setup_id", "INTEGER")
+        await _ensure_column(db, "trades", "execution_type", "TEXT")
+        await _ensure_column(db, "trades", "mae_r", "REAL")
+        await _ensure_column(db, "trades", "mfe_r", "REAL")
+        
+        # Real-MT5 Learning: Migrate older trades to explicit execution types.
+        await db.execute("UPDATE trades SET execution_type = 'REAL_DEMO_MT5' WHERE execution_type IS NULL AND account_mode = 'demo'")
+        await db.execute("UPDATE trades SET execution_type = 'REAL_LIVE_MT5' WHERE execution_type IS NULL AND account_mode = 'live'")
         await _ensure_column(db, "trades", "initial_risk", "REAL DEFAULT 0")
         await _ensure_column(db, "trades", "exit_price", "REAL")
         await _ensure_column(db, "trades", "exit_reason", "TEXT")
@@ -865,17 +878,20 @@ async def record_trade(
     executor: str, raw_signal: str, account_mode: str = "demo", ticket: Optional[int] = None,
     setup_id: Optional[int] = None, initial_risk: float = 0.0,
     policy_version: Optional[str] = None, experiment_id: Optional[int] = None,
-    demo_session_id: Optional[int] = None, objective_phase_id: Optional[int] = None, db_path: str = DB_PATH
+    demo_session_id: Optional[int] = None, objective_phase_id: Optional[int] = None, 
+    execution_type: Optional[str] = None, db_path: str = DB_PATH
 ) -> int:
+    if execution_type is None:
+        execution_type = "REAL_DEMO_MT5" if account_mode == "demo" else "REAL_LIVE_MT5"
     async with aiosqlite.connect(db_path) as db:
         now = datetime.now(timezone.utc).isoformat()
         cursor = await db.execute(
             """INSERT INTO trades (timestamp, symbol, direction, entry_price, sl_price, tp_price,
-               lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk,
+               lot_size, score, rr_ratio, executor, execution_type, account_mode, ticket, setup_id, initial_risk,
                raw_signal, policy_version, experiment_id, demo_session_id, objective_phase_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (now, symbol, direction, entry_price, sl_price, tp_price,
-             lot_size, score, rr_ratio, executor, account_mode, ticket, setup_id, initial_risk,
+             lot_size, score, rr_ratio, executor, execution_type, account_mode, ticket, setup_id, initial_risk,
              raw_signal, policy_version, experiment_id, demo_session_id, objective_phase_id)
         )
         await db.commit()
@@ -902,6 +918,8 @@ async def close_trade(
         ("pnl_r", pnl_r),
         ("max_favorable_r", max_favorable_r),
         ("max_adverse_r", max_adverse_r),
+        ("mfe_r", max_favorable_r),
+        ("mae_r", max_adverse_r),
     ):
         if value is not None:
             assignments.append(f"{column} = ?")
@@ -2501,11 +2519,13 @@ async def fail_objective_phase(
 
 async def get_performance_summary(account_mode: str, days: Optional[int] = None, db_path: str = DB_PATH) -> dict:
     """Compute closed-trade performance for exactly one account mode."""
+    exec_type = "REAL_DEMO_MT5" if account_mode == "demo" else "REAL_LIVE_MT5"
     clauses = [
         "status = 'closed'", "account_mode = ?",
+        "execution_type = ?",
         "(ticket IS NULL OR ticket NOT IN (SELECT ticket FROM capital_reduction_actions WHERE ticket IS NOT NULL AND action = 'order_filled'))",
     ]
-    values: list = [account_mode]
+    values: list = [account_mode, exec_type]
     if days is not None:
         clauses.append("timestamp >= ?")
         values.append((datetime.utcnow() - timedelta(days=days)).isoformat())
@@ -2519,10 +2539,15 @@ async def get_performance_summary(account_mode: str, days: Optional[int] = None,
         rows = [dict(row) for row in await cursor.fetchall()]
 
     pnls = [float(row.get("pnl") or 0.0) for row in rows]
+    pnls_r = [float(row.get("pnl_r") or 0.0) for row in rows]
     wins = [value for value in pnls if value > 0]
     losses = [value for value in pnls if value < 0]
+    wins_r = [value for value in pnls_r if value > 0]
+    losses_r = [value for value in pnls_r if value < 0]
+    
     gross_profit = sum(wins)
     gross_loss = abs(sum(losses))
+    
     running_pnl = 0.0
     high_water = 0.0
     max_drawdown = 0.0
@@ -2531,16 +2556,24 @@ async def get_performance_summary(account_mode: str, days: Optional[int] = None,
         high_water = max(high_water, running_pnl)
         max_drawdown = max(max_drawdown, high_water - running_pnl)
 
+    total_trades = len(pnls)
+    if total_trades < 25: maturity = "EXPLORATORY"
+    elif total_trades < 100: maturity = "DEVELOPING"
+    else: maturity = "MATURE"
+
     return {
         "account_mode": account_mode,
-        "trades": len(pnls),
+        "trades": total_trades,
         "wins": len(wins),
         "losses": len(losses),
+        "breakeven": len([p for p in pnls if abs(p) < 1e-6]),
         "pnl": sum(pnls),
-        "win_rate": (len(wins) / len(pnls) * 100) if pnls else 0.0,
-        "average_pnl": (sum(pnls) / len(pnls)) if pnls else 0.0,
+        "expectancy_r": (sum(pnls_r) / len(pnls_r)) if pnls_r else 0.0,
+        "win_rate": (len(wins) / total_trades * 100) if total_trades else 0.0,
+        "average_r": (sum(pnls_r) / len(pnls_r)) if pnls_r else 0.0,
         "profit_factor": (gross_profit / gross_loss) if gross_loss else (float("inf") if gross_profit else 0.0),
         "max_drawdown": max_drawdown,
+        "sample_maturity": maturity,
     }
 
 

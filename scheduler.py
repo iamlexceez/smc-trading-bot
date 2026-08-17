@@ -2083,7 +2083,10 @@ class MarketScheduler:
         policy_ok, policy_reason = policy.accepts(
             score=quality.score, rr_ratio=validation.rr_ratio, features=features,
         )
-        if not policy_ok:
+        # Policy Model Retirement: In DEMO mode, policy vetoes are retired as 
+        # authoritative gates. They are recorded but do not block experimentation.
+        is_demo = self.settings.trading_mode == "demo"
+        if not policy_ok and not is_demo:
             self.telemetry.increment("setups_rejected")
             self.telemetry.record_rejection(policy_reason)
             if setup_id is not None:
@@ -2094,6 +2097,9 @@ class MarketScheduler:
                 fingerprint=f"{bar_time}:{direction}:{policy.fingerprint}:{policy_reason}",
             )
             return await record_analysis_outcome("NO_SETUP", policy_reason, details={"regime": regime, "bias": direction, "strategy": selected_strategy, "actual_rr": validation.rr_ratio},)
+        
+        # In DEMO, if policy_ok is False, we tag it as a retired veto.
+        retired_veto = policy_reason if not policy_ok and is_demo else None
 
         evidence_classification = classify_evidence(strategy_evidence)
         confidence_classification = classify_confidence(strategy_evidence)
@@ -2145,6 +2151,7 @@ class MarketScheduler:
             quality_factors=quality.factors,
             target_source=validation.target_source or (validation.target_pool.kind.value if validation.target_pool else "policy_rr_fallback"),
             setup_id=setup_id,
+            retired_veto=retired_veto,
             passed=True,
             rejection_reason="",
             regime=regime,
@@ -2392,7 +2399,8 @@ class MarketScheduler:
             rr_filter_enabled=bool(active_rr_policy["filter_enabled"]),
             low_rr_experiment=bool(policy_object.low_rr_experiment),
             target_source=str(getattr(signal, "target_source", "") or ""),
-            capital_efficiency_approved=efficiency["executable"],
+            capital_efficiency_approved=efficiency.passed,
+            retired_veto=getattr(signal, "retired_veto", None),
         )
 
     async def _execute_signal(self, signal: TradeSignal, df: pd.DataFrame = None) -> bool:
@@ -2816,6 +2824,11 @@ class MarketScheduler:
                     ],
                     "legacy_factors": [{"name": factor.name, "score": factor.score, "detail": factor.detail} for factor in signal.factors],
                 }
+                # Real-MT5 Learning: Explicitly classify execution type.
+                execution_type = "REAL_DEMO_MT5" if self.settings.trading_mode == "demo" else "REAL_LIVE_MT5"
+                if self.executor.name == "paper":
+                    execution_type = "PAPER"
+
                 trade_id = await db.record_trade(
                     symbol=symbol,
                     direction=signal.direction,
@@ -2826,6 +2839,7 @@ class MarketScheduler:
                     score=signal.score,
                     rr_ratio=signal.rr_ratio,
                     executor=self.executor.name,
+                    execution_type=execution_type,
                     raw_signal=json.dumps(raw_signal),
                     account_mode=self.settings.trading_mode,
                     ticket=result.ticket,
@@ -3269,6 +3283,7 @@ class MarketScheduler:
         ranked = rank_opportunities(
             candidates, profiles=profiles, contexts=contexts, historical=historical,
             open_symbols=open_symbols, capacity_context=capacity_context,
+            trading_mode=self.settings.trading_mode,
         )
         by_symbol = {signal.symbol: signal for signal in candidates}
         for rank, opportunity in enumerate(ranked, start=1):
