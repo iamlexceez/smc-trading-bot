@@ -241,3 +241,54 @@ def test_feature_importance_records_classify_unknown_redundant_and_supported():
 
     sparse = governance.feature_importance_records(rows[:6])
     assert all(row["evidence_state"] == "INSUFFICIENT_EVIDENCE" for row in sparse)
+
+
+def test_combination_evidence_records_incremental_value_without_confluence_bloat():
+    from analysis.research_governance import ResearchGovernance
+    from config import TradeSettings
+
+    governance = ResearchGovernance(TradeSettings.defaults())
+    rows = []
+    for index in range(20):
+        rows.append({
+            "symbol": "Boom 500 Index", "strategy_id": "s1", "regime": "TRENDING", "timeframe": "M15",
+            "pnl_r": 0.9 if index < 10 else 0.1,
+            "features": {
+                "a": index < 15,
+                "b": index < 15,
+                "neutral": index < 5,
+            },
+        })
+    records = governance.combination_evidence_records(rows)
+    by_id = {row["combination_id"]: row for row in records}
+    assert by_id["s1:a+b"]["state"] == "REDUNDANT"
+    assert by_id["s1:a+neutral"]["state"] == "PROMOTABLE_CANDIDATE"
+
+    sparse = governance.combination_evidence_records(rows[:4])
+    assert all(row["state"] == "INSUFFICIENT_EVIDENCE" for row in sparse)
+
+
+def test_instrument_lifecycle_requires_superiority_and_governs_demotion():
+    from knowledge.lifecycle import challenger_replacement, lifecycle_transition
+
+    challenger = {
+        "sample_size": 100, "adjusted_score": 86, "expectancy_r": 0.5,
+        "out_of_sample_expectancy_r": 0.3, "forward_expectancy_r": 0.4,
+        "max_drawdown_r": 1.0, "stability_score": 85, "execution_reliability": 0.98,
+        "account_size_suitability_score": 90, "portfolio_contribution_score": 80,
+    }
+    core = {"adjusted_score": 80, "forward_expectancy_r": 0.2, "max_drawdown_r": 1.1, "execution_reliability": 0.96}
+    promoted = challenger_replacement(challenger, core)
+    assert promoted.new_role == "CORE"
+    assert promoted.replacement_eligible is True
+
+    deferred = challenger_replacement({**challenger, "forward_expectancy_r": 0.21}, core)
+    assert deferred.new_role == "CHALLENGER"
+    assert deferred.replacement_eligible is False
+
+    declining = lifecycle_transition("CORE", {"broker_eligible": True, "rolling_expectancy_r": -0.1})
+    assert declining.new_role == "DECLINING"
+    reviewed = lifecycle_transition("DECLINING", {"broker_eligible": True, "rolling_expectancy_r": -0.1}, review_cycles=1)
+    assert reviewed.new_role == "REVIEW"
+    quarantined = lifecycle_transition("REVIEW", {"broker_eligible": True, "execution_reliability_issue": True}, review_cycles=1)
+    assert quarantined.new_role == "QUARANTINED"

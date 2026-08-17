@@ -46,6 +46,7 @@ from analysis.account_monitor import AccountReconciliationEngine
 from analysis.capital_state import AccountCapitalState, CapitalStateService
 from analysis.capital_protection import calculate_capital_protection
 from analysis.runtime_telemetry import RuntimeTelemetry
+from analysis.invocation_matrix import InvocationTracker
 from analysis.objectives import phase_for_equity
 from analysis.objective_phases import plan_objective_phases
 from analysis.opportunity import market_context, rank_opportunities
@@ -109,6 +110,7 @@ class MarketScheduler:
         # Initialize Self-Optimizer
         self.optimizer = SelfOptimizer(self.settings)
         self.research_governance = ResearchGovernance(self.settings)
+        self.invocation_tracker = InvocationTracker()
         self.last_research_governance: dict = {}
         self.last_opportunity_ranking: list[dict] = []
         # Read-only latest scan disposition for Telegram diagnostics. It never
@@ -154,6 +156,14 @@ class MarketScheduler:
         # one guard preserves exactly-once broker-confirmed transitions.
         self._objective_phase_lock = asyncio.Lock()
         self._last_protection_signature: tuple[str, int] | None = None
+
+    async def _persist_invocation_matrix(self) -> None:
+        """Persist runtime invocation evidence without affecting scan/execution."""
+        try:
+            for row in self.invocation_tracker.snapshot():
+                await db.upsert_module_invocation_evidence(row)
+        except Exception as exc:
+            logger.warning("Invocation-matrix persistence failed: %s", exc)
 
     def _set_scan_gate(self, state: str, reason: str, **details) -> None:
         """Retain the latest scan disposition for read-only diagnostics."""
@@ -576,9 +586,14 @@ class MarketScheduler:
                 "execution_reliability": None,
                 "account_size_suitability_score": None,
             }
+        self.invocation_tracker.mark_invoked(
+            "analysis.research_governance", scheduler_entry_point="scheduler.refresh_research_governance",
+            data_seen=bool(outcomes or broker_usable_symbols), output_consumed=True,
+        )
         snapshot = self.research_governance.governance_snapshot(
             broker_usable_symbols, outcomes, models, instrument_metadata=specialization_metadata
         )
+        profile_persisted = 0
         for profile in snapshot.get("instrument_specialization", {}).get("rankings", []):
             try:
                 await db.upsert_instrument_specialization_profile(
@@ -586,6 +601,7 @@ class MarketScheduler:
                     instrument=str(profile.get("instrument") or ""),
                     profile=profile,
                 )
+                profile_persisted += 1
             except Exception as exc:
                 # Profile telemetry cannot block universe refresh or execution.
                 logger.warning("Could not persist specialization profile for %s: %s", profile.get("instrument"), exc)
@@ -606,10 +622,43 @@ class MarketScheduler:
                 )
             except Exception as exc:
                 logger.warning("Could not persist feature-importance evidence for %s/%s: %s", evidence.get("symbol"), evidence.get("feature_name"), exc)
+        self.invocation_tracker.mark_invoked(
+            "knowledge.specialization", scheduler_entry_point="scheduler.refresh_research_governance",
+            data_seen=bool(broker_usable_symbols), output_consumed=True, persisted=profile_persisted > 0,
+            notes=f"Persisted {profile_persisted} specialization profiles.",
+        )
+        combination_records = self.research_governance.combination_evidence_records(outcomes)
+        combination_persisted = 0
+        for evidence in combination_records:
+            try:
+                await db.record_strategy_combination_evidence(
+                    account_mode=self.settings.trading_mode,
+                    symbol=str(evidence.get("symbol") or ""),
+                    regime=str(evidence.get("regime") or "UNKNOWN"),
+                    timeframe=str(evidence.get("timeframe") or "UNKNOWN"),
+                    combination_id=str(evidence.get("combination_id") or ""),
+                    concepts=list(evidence.get("concepts") or []),
+                    single_a_expectancy_r=evidence.get("single_a_expectancy_r"),
+                    single_b_expectancy_r=evidence.get("single_b_expectancy_r"),
+                    combined_expectancy_r=evidence.get("combined_expectancy_r"),
+                    incremental_expectancy_r=evidence.get("incremental_expectancy_r"),
+                    sample_size=int(evidence.get("sample_size") or 0),
+                    state=str(evidence.get("state") or "INSUFFICIENT_EVIDENCE"),
+                    reason=str(evidence.get("reason") or ""),
+                )
+                combination_persisted += 1
+            except Exception as exc:
+                logger.warning("Could not persist combination evidence for %s: %s", evidence.get("combination_id"), exc)
+        self.invocation_tracker.mark_invoked(
+            "knowledge.combinations", scheduler_entry_point="scheduler.refresh_research_governance",
+            data_seen=bool(outcomes), output_consumed=True, persisted=combination_persisted > 0,
+            notes=f"Persisted {combination_persisted} of {len(combination_records)} outcome-derived combination records.",
+        )
         selected = await self._apply_operational_objective(broker_usable_symbols, snapshot)
         self._set_execution_selected_symbols(selected)
         self.settings.enabled_symbols = selected
         self.last_research_governance = snapshot
+        await self._persist_invocation_matrix()
         logger.info(
             "[EXECUTION UNIVERSE] state=%s broker_usable=%s selected=%s disabled=%s top_strategies=%s",
             snapshot["market_selection"]["state"],

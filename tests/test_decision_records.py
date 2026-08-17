@@ -107,3 +107,37 @@ def test_instrument_specialization_profile_persists_and_reads_back(tmp_path: Pat
         assert profile["profile"]["role"] == "CORE"
 
     asyncio.run(scenario())
+
+
+def test_research_hypothesis_provenance_persists(tmp_path: Path):
+    async def scenario():
+        path = tmp_path / "hypothesis.db"
+        await db.init_db(str(path))
+        hypothesis_id = await db.upsert_research_hypothesis(
+            account_mode="demo", hypothesis_key="sweep_bos", statement="Sweep plus BOS may improve expectancy",
+            source="public_research", source_identifier="source-123", author_methodology="methodology-a",
+            retrieved_at="2026-08-17T00:00:00+00:00", feature_name="sweep",
+            concepts=["liquidity_sweep", "bos"], strategy_rules={"entry": "confirmation"},
+            market_assumptions={"market": "synthetic"}, timeframe_assumptions={"entry": "M15"},
+            entry_conditions={"sweep": True}, exit_conditions={"target": "liquidity"},
+            risk_rules={"policy": "experimental"}, known_limitations="Requires forward validation",
+            hypothesis_version="2", independent_variable="sweep_bos", dependent_variable="expectancy_r",
+            market="Deriv Synthetic Indices", instrument="Boom 500 Index", timeframe="M15",
+            regime="TRENDING", success_metric="expectancy_r > 0", failure_metric="expectancy_r <= 0",
+            evaluation_period="2025-01-01/2026-01-01", candidate_values=["enabled", "disabled"],
+            db_path=str(path),
+        )
+        async with db.aiosqlite.connect(str(path)) as conn:
+            conn.row_factory = db.aiosqlite.Row
+            row = await (await conn.execute(
+                "SELECT source_identifier, author_methodology, concepts_json, independent_variable, instrument, hypothesis_version FROM research_hypotheses WHERE id = ?",
+                (hypothesis_id,),
+            )).fetchone()
+        assert row["source_identifier"] == "source-123"
+        assert row["author_methodology"] == "methodology-a"
+        assert "liquidity_sweep" in row["concepts_json"]
+        assert row["independent_variable"] == "sweep_bos"
+        assert row["instrument"] == "Boom 500 Index"
+        assert row["hypothesis_version"] == "2"
+
+    asyncio.run(scenario())

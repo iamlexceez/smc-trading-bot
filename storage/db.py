@@ -260,6 +260,24 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS module_invocation_evidence (
+                module_name TEXT PRIMARY KEY,
+                imported INTEGER NOT NULL DEFAULT 0,
+                called INTEGER NOT NULL DEFAULT 0,
+                scheduled INTEGER NOT NULL DEFAULT 0,
+                data_seen INTEGER NOT NULL DEFAULT 0,
+                output_consumed INTEGER NOT NULL DEFAULT 0,
+                persisted INTEGER NOT NULL DEFAULT 0,
+                integration_tested INTEGER NOT NULL DEFAULT 0,
+                invocation_count INTEGER NOT NULL DEFAULT 0,
+                last_invoked_at TEXT,
+                last_scheduler_entry_point TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                snapshot_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS symbol_profiles (
                 account_mode TEXT NOT NULL,
                 symbol TEXT NOT NULL,
@@ -309,7 +327,28 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 hypothesis_key TEXT NOT NULL,
                 statement TEXT NOT NULL,
                 source TEXT NOT NULL,
+                source_identifier TEXT NOT NULL DEFAULT '',
+                author_methodology TEXT NOT NULL DEFAULT '',
+                retrieved_at TEXT,
                 feature_name TEXT,
+                concepts_json TEXT NOT NULL DEFAULT '[]',
+                strategy_rules_json TEXT NOT NULL DEFAULT '{}',
+                market_assumptions_json TEXT NOT NULL DEFAULT '{}',
+                timeframe_assumptions_json TEXT NOT NULL DEFAULT '{}',
+                entry_conditions_json TEXT NOT NULL DEFAULT '{}',
+                exit_conditions_json TEXT NOT NULL DEFAULT '{}',
+                risk_rules_json TEXT NOT NULL DEFAULT '{}',
+                known_limitations TEXT NOT NULL DEFAULT '',
+                hypothesis_version TEXT NOT NULL DEFAULT '1',
+                independent_variable TEXT NOT NULL DEFAULT '',
+                dependent_variable TEXT NOT NULL DEFAULT '',
+                market TEXT NOT NULL DEFAULT '',
+                instrument TEXT NOT NULL DEFAULT '',
+                timeframe TEXT NOT NULL DEFAULT '',
+                regime TEXT NOT NULL DEFAULT '',
+                success_metric TEXT NOT NULL DEFAULT '',
+                failure_metric TEXT NOT NULL DEFAULT '',
+                evaluation_period TEXT NOT NULL DEFAULT '',
                 candidate_values_json TEXT NOT NULL,
                 evidence_json TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'open',
@@ -596,6 +635,27 @@ async def init_db(db_path: str = DB_PATH) -> None:
         await _ensure_column(db, "research_hypotheses", "why_proposed", "TEXT NOT NULL DEFAULT ''")
         await _ensure_column(db, "research_hypotheses", "data_tested_json", "TEXT NOT NULL DEFAULT '[]'")
         await _ensure_column(db, "research_hypotheses", "sample_size", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "research_hypotheses", "source_identifier", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "author_methodology", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "retrieved_at", "TEXT")
+        await _ensure_column(db, "research_hypotheses", "concepts_json", "TEXT NOT NULL DEFAULT '[]'")
+        await _ensure_column(db, "research_hypotheses", "strategy_rules_json", "TEXT NOT NULL DEFAULT '{}'")
+        await _ensure_column(db, "research_hypotheses", "market_assumptions_json", "TEXT NOT NULL DEFAULT '{}'")
+        await _ensure_column(db, "research_hypotheses", "timeframe_assumptions_json", "TEXT NOT NULL DEFAULT '{}'")
+        await _ensure_column(db, "research_hypotheses", "entry_conditions_json", "TEXT NOT NULL DEFAULT '{}'")
+        await _ensure_column(db, "research_hypotheses", "exit_conditions_json", "TEXT NOT NULL DEFAULT '{}'")
+        await _ensure_column(db, "research_hypotheses", "risk_rules_json", "TEXT NOT NULL DEFAULT '{}'")
+        await _ensure_column(db, "research_hypotheses", "known_limitations", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "hypothesis_version", "TEXT NOT NULL DEFAULT '1'")
+        await _ensure_column(db, "research_hypotheses", "independent_variable", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "dependent_variable", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "market", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "instrument", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "timeframe", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "regime", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "success_metric", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "failure_metric", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "research_hypotheses", "evaluation_period", "TEXT NOT NULL DEFAULT ''")
         await _ensure_column(db, "research_hypotheses", "historical_sample_size", "INTEGER NOT NULL DEFAULT 0")
         await _ensure_column(db, "research_hypotheses", "forward_sample_size", "INTEGER NOT NULL DEFAULT 0")
         await _ensure_column(db, "research_hypotheses", "result", "TEXT NOT NULL DEFAULT 'Not tested yet'")
@@ -1467,6 +1527,27 @@ async def upsert_research_hypothesis(
     source: str,
     feature_name: Optional[str],
     candidate_values: list | tuple,
+    source_identifier: str = "",
+    author_methodology: str = "",
+    retrieved_at: Optional[str] = None,
+    concepts: Optional[list | tuple] = None,
+    strategy_rules: Optional[dict] = None,
+    market_assumptions: Optional[dict] = None,
+    timeframe_assumptions: Optional[dict] = None,
+    entry_conditions: Optional[dict] = None,
+    exit_conditions: Optional[dict] = None,
+    risk_rules: Optional[dict] = None,
+    known_limitations: str = "",
+    hypothesis_version: str = "1",
+    independent_variable: str = "",
+    dependent_variable: str = "",
+    market: str = "",
+    instrument: str = "",
+    timeframe: str = "",
+    regime: str = "",
+    success_metric: str = "",
+    failure_metric: str = "",
+    evaluation_period: str = "",
     evidence: Optional[dict] = None,
     classification: str = "HYPOTHESIS",
     why_proposed: str = "",
@@ -1487,13 +1568,37 @@ async def upsert_research_hypothesis(
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute(
             """INSERT INTO research_hypotheses
-               (account_mode, hypothesis_key, statement, source, feature_name,
-                candidate_values_json, evidence_json, classification, why_proposed,
-                data_tested_json, sample_size, historical_sample_size, forward_sample_size,
-                result, evidence_strength, decision, current_plan, what_would_change,
-                live_promotion_allowed, status, created_at, last_tested_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+               (account_mode, hypothesis_key, statement, source, source_identifier, author_methodology,
+                retrieved_at, feature_name, concepts_json, strategy_rules_json, market_assumptions_json,
+                timeframe_assumptions_json, entry_conditions_json, exit_conditions_json, risk_rules_json,
+                known_limitations, hypothesis_version, independent_variable, dependent_variable, market,
+                instrument, timeframe, regime, success_metric, failure_metric, evaluation_period,
+                candidate_values_json, evidence_json, classification, why_proposed, data_tested_json,
+                sample_size, historical_sample_size, forward_sample_size, result, evidence_strength, decision,
+                current_plan, what_would_change, live_promotion_allowed, status, created_at, last_tested_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'open', ?, ?)
                ON CONFLICT(account_mode, hypothesis_key, statement) DO UPDATE SET
+                 source_identifier = excluded.source_identifier,
+                 author_methodology = excluded.author_methodology,
+                 retrieved_at = excluded.retrieved_at,
+                 concepts_json = excluded.concepts_json,
+                 strategy_rules_json = excluded.strategy_rules_json,
+                 market_assumptions_json = excluded.market_assumptions_json,
+                 timeframe_assumptions_json = excluded.timeframe_assumptions_json,
+                 entry_conditions_json = excluded.entry_conditions_json,
+                 exit_conditions_json = excluded.exit_conditions_json,
+                 risk_rules_json = excluded.risk_rules_json,
+                 known_limitations = excluded.known_limitations,
+                 hypothesis_version = excluded.hypothesis_version,
+                 independent_variable = excluded.independent_variable,
+                 dependent_variable = excluded.dependent_variable,
+                 market = excluded.market,
+                 instrument = excluded.instrument,
+                 timeframe = excluded.timeframe,
+                 regime = excluded.regime,
+                 success_metric = excluded.success_metric,
+                 failure_metric = excluded.failure_metric,
+                 evaluation_period = excluded.evaluation_period,
                  evidence_json = excluded.evidence_json,
                  classification = excluded.classification,
                  why_proposed = excluded.why_proposed,
@@ -1510,12 +1615,19 @@ async def upsert_research_hypothesis(
                  last_tested_at = excluded.last_tested_at,
                  status = CASE WHEN research_hypotheses.status = 'archived' THEN 'archived' ELSE 'open' END""",
             (
-                account_mode, hypothesis_key, statement, source, feature_name,
-                json.dumps(list(candidate_values)), json.dumps(evidence or {}, sort_keys=True),
+                account_mode, hypothesis_key, statement, source, str(source_identifier or ""),
+                str(author_methodology or ""), retrieved_at, feature_name,
+                json.dumps(list(concepts or []), sort_keys=True), json.dumps(strategy_rules or {}, sort_keys=True),
+                json.dumps(market_assumptions or {}, sort_keys=True), json.dumps(timeframe_assumptions or {}, sort_keys=True),
+                json.dumps(entry_conditions or {}, sort_keys=True), json.dumps(exit_conditions or {}, sort_keys=True),
+                json.dumps(risk_rules or {}, sort_keys=True), str(known_limitations or ""), str(hypothesis_version or "1"),
+                str(independent_variable or ""), str(dependent_variable or ""), str(market or ""), str(instrument or ""),
+                str(timeframe or ""), str(regime or ""), str(success_metric or ""), str(failure_metric or ""),
+                str(evaluation_period or ""), json.dumps(list(candidate_values)), json.dumps(evidence or {}, sort_keys=True),
                 str(classification or "HYPOTHESIS"), str(why_proposed or ""), json.dumps(list(data_tested or [])),
                 max(0, int(sample_size or 0)), max(0, int(historical_sample_size or 0)), max(0, int(forward_sample_size or 0)),
                 str(result or "Not tested yet"), str(evidence_strength or "UNKNOWN"), str(decision or "INCONCLUSIVE"),
-                str(current_plan or ""), str(what_would_change or ""), 0, now,
+                str(current_plan or ""), str(what_would_change or ""), now,
                 now if int(sample_size or 0) > 0 else None,
             ),
         )
@@ -3684,4 +3796,42 @@ async def get_expert_knowledge_journal(
         row["data_tested"] = json.loads(row.pop("data_tested_json") or "[]")
         row["evidence"] = json.loads(row.pop("evidence_json") or "{}")
         row["live_promotion_allowed"] = False
+    return rows
+
+
+async def upsert_module_invocation_evidence(record: dict, db_path: str = DB_PATH) -> None:
+    """Persist one invocation-matrix row; telemetry failures never authorize trades."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """INSERT INTO module_invocation_evidence
+               (module_name, imported, called, scheduled, data_seen, output_consumed,
+                persisted, integration_tested, invocation_count, last_invoked_at,
+                last_scheduler_entry_point, notes, snapshot_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(module_name) DO UPDATE SET
+                 imported=excluded.imported, called=excluded.called, scheduled=excluded.scheduled,
+                 data_seen=excluded.data_seen, output_consumed=excluded.output_consumed,
+                 persisted=excluded.persisted, integration_tested=excluded.integration_tested,
+                 invocation_count=excluded.invocation_count, last_invoked_at=excluded.last_invoked_at,
+                 last_scheduler_entry_point=excluded.last_scheduler_entry_point, notes=excluded.notes,
+                 snapshot_json=excluded.snapshot_json, updated_at=excluded.updated_at""",
+            (
+                str(record.get("module_name") or ""), int(bool(record.get("imported"))), int(bool(record.get("scheduled"))),
+                int(bool(record.get("called"))), int(bool(record.get("data_seen"))), int(bool(record.get("output_consumed"))),
+                int(bool(record.get("persisted"))), int(bool(record.get("integration_tested"))), int(record.get("invocation_count") or 0),
+                record.get("last_invoked_at"), str(record.get("last_scheduler_entry_point") or ""),
+                str(record.get("notes") or ""), json.dumps(record, sort_keys=True), now,
+            ),
+        )
+        await conn.commit()
+
+
+async def list_module_invocation_evidence(db_path: str = DB_PATH) -> list[dict]:
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM module_invocation_evidence ORDER BY module_name")
+        rows = [dict(row) for row in await cursor.fetchall()]
+    for row in rows:
+        row["snapshot"] = json.loads(row.pop("snapshot_json") or "{}")
     return rows

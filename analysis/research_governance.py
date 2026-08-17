@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from itertools import combinations
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Iterable
@@ -122,6 +123,54 @@ class ResearchGovernance:
                     "symbol": symbol, "strategy_id": strategy_id, "regime": regime, "timeframe": timeframe,
                     "feature_name": feature_name, "importance": importance, "stability": stability,
                     "incremental_value": incremental, "sample_size": sample_size, "evidence_state": state,
+                })
+        return records
+
+    def combination_evidence_records(self, outcomes: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Compare pairwise concept combinations using only completed outcomes."""
+        groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        for row in outcomes:
+            if row.get("pnl_r") is None:
+                continue
+            key = (
+                str(row.get("symbol") or ""),
+                str(row.get("strategy_id") or row.get("setup_type") or "UNKNOWN"),
+                str(row.get("regime") or "UNKNOWN"),
+                str(row.get("timeframe") or "UNKNOWN"),
+            )
+            groups[key].append(row)
+        records: list[dict[str, Any]] = []
+        for (symbol, strategy_id, regime, timeframe), rows in groups.items():
+            feature_names = sorted({
+                str(name) for row in rows for name, value in dict(row.get("features") or {}).items()
+                if isinstance(value, bool)
+            })
+            for feature_a, feature_b in combinations(feature_names, 2):
+                rows_a = [row for row in rows if bool((row.get("features") or {}).get(feature_a))]
+                rows_b = [row for row in rows if bool((row.get("features") or {}).get(feature_b))]
+                rows_ab = [row for row in rows if bool((row.get("features") or {}).get(feature_a)) and bool((row.get("features") or {}).get(feature_b))]
+                if min(len(rows_a), len(rows_b), len(rows_ab)) < 5:
+                    records.append({
+                        "symbol": symbol, "strategy_id": strategy_id, "regime": regime, "timeframe": timeframe,
+                        "combination_id": f"{strategy_id}:{feature_a}+{feature_b}", "concepts": [feature_a, feature_b],
+                        "single_a_expectancy_r": None, "single_b_expectancy_r": None,
+                        "combined_expectancy_r": None, "incremental_expectancy_r": None,
+                        "sample_size": len(rows_ab), "state": "INSUFFICIENT_EVIDENCE",
+                        "reason": "At least five realized observations are required for each component and combination.",
+                    })
+                    continue
+                expectancy_a = float(PolicyEvaluator.evaluate(rows_a).to_dict().get("expectancy_r") or 0.0)
+                expectancy_b = float(PolicyEvaluator.evaluate(rows_b).to_dict().get("expectancy_r") or 0.0)
+                expectancy_ab = float(PolicyEvaluator.evaluate(rows_ab).to_dict().get("expectancy_r") or 0.0)
+                incremental = expectancy_ab - expectancy_a
+                state = "REDUNDANT" if abs(incremental) < 0.05 else "PROMOTABLE_CANDIDATE" if incremental > 0 else "HARMFUL"
+                records.append({
+                    "symbol": symbol, "strategy_id": strategy_id, "regime": regime, "timeframe": timeframe,
+                    "combination_id": f"{strategy_id}:{feature_a}+{feature_b}", "concepts": [feature_a, feature_b],
+                    "single_a_expectancy_r": expectancy_a, "single_b_expectancy_r": expectancy_b,
+                    "combined_expectancy_r": expectancy_ab, "incremental_expectancy_r": incremental,
+                    "sample_size": len(rows_ab), "state": state,
+                    "reason": f"Incremental expectancy of {incremental:+.4f}R for {feature_b} conditional on {feature_a}.",
                 })
         return records
 
