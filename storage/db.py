@@ -1786,7 +1786,8 @@ async def get_policy_trade_outcomes(
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute(
-            f"""SELECT t.*, s.features_json, s.validation_json
+            f"""SELECT t.*, s.features_json, s.validation_json, s.strategy_id AS setup_strategy_id,
+                       s.regime AS setup_regime, s.timeframe AS setup_timeframe, s.setup_type
                 FROM trades t LEFT JOIN setup_records s ON s.id = t.setup_id
                 WHERE {' AND '.join(clauses)} ORDER BY t.timestamp ASC, t.id ASC""",
             values,
@@ -1795,6 +1796,9 @@ async def get_policy_trade_outcomes(
     for row in rows:
         row["features"] = json.loads(row.pop("features_json") or "{}")
         row["validation"] = json.loads(row.pop("validation_json") or "{}")
+        row["strategy_id"] = row.pop("setup_strategy_id", None) or row.get("setup_type") or "UNKNOWN"
+        row["regime"] = row.pop("setup_regime", None) or row.get("regime") or "UNKNOWN"
+        row["timeframe"] = row.pop("setup_timeframe", None) or row.get("timeframe") or "UNKNOWN"
     return rows
 
 

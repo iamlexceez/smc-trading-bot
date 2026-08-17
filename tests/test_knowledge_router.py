@@ -201,3 +201,22 @@ def test_specialization_governance_requires_complete_core_evidence_and_does_not_
     )
     assert len(complete["core_symbols"]) == 1
     assert complete["core_symbols"][0] in {"Boom 500 Index", "Boom 100 Index"}
+
+
+def test_core_portfolio_selection_rejects_highly_correlated_candidates():
+    from knowledge.portfolio import pearson_correlation, select_diversified_core
+
+    assert pearson_correlation([1, 2, 3], [2, 4, 6]) > 0.99
+    rankings = [
+        {"instrument": "A", "role": "CORE", "specialization": {"adjusted_score": 90}},
+        {"instrument": "B", "role": "CORE", "specialization": {"adjusted_score": 85}},
+        {"instrument": "C", "role": "CORE", "specialization": {"adjusted_score": 80}},
+    ]
+    selection = select_diversified_core(
+        rankings,
+        return_series={"A": [1, 2, 3], "B": [2, 4, 6], "C": [3, 1, 2]},
+        max_core_instruments=3,
+        correlation_threshold=0.85,
+    )
+    assert selection.selected == ("A", "C")
+    assert selection.rejected[0]["instrument"] == "B"

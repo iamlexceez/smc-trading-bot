@@ -192,6 +192,7 @@ class TradeSettings:
     core_adjusted_score_threshold: float = 75.0
     core_max_drawdown_r: float = 2.0
     core_min_execution_reliability: float = 0.95
+    core_max_correlation: float = 0.85
     market_ranking_min_sample_size: int = 10
     market_ranking_lookback_days: int = 365
     strategy_ranking_limit: int = 3
@@ -405,6 +406,7 @@ class TradeSettings:
             core_adjusted_score_threshold=max(0.0, min(100.0, float(d.get("core_adjusted_score_threshold", 75.0)))),
             core_max_drawdown_r=max(0.0, float(d.get("core_max_drawdown_r", 2.0))),
             core_min_execution_reliability=max(0.0, min(1.0, float(d.get("core_min_execution_reliability", 0.95)))),
+            core_max_correlation=max(0.0, min(1.0, float(d.get("core_max_correlation", 0.85)))),
             market_ranking_min_sample_size=max(1, int(d.get("market_ranking_min_sample_size", 10))),
             market_ranking_lookback_days=max(1, int(d.get("market_ranking_lookback_days", 365))),
             strategy_ranking_limit=max(1, min(3, int(d.get("strategy_ranking_limit", 3)))),
@@ -475,6 +477,7 @@ class TradeSettings:
             core_adjusted_score_threshold=max(0.0, min(100.0, float(os.getenv("CORE_ADJUSTED_SCORE_THRESHOLD", "75.0")))),
             core_max_drawdown_r=max(0.0, float(os.getenv("CORE_MAX_DRAWDOWN_R", "2.0"))),
             core_min_execution_reliability=max(0.0, min(1.0, float(os.getenv("CORE_MIN_EXECUTION_RELIABILITY", "0.95")))),
+            core_max_correlation=max(0.0, min(1.0, float(os.getenv("CORE_MAX_CORRELATION", "0.85")))),
             market_ranking_min_sample_size=max(1, int(os.getenv("MARKET_RANKING_MIN_SAMPLE_SIZE", "10"))),
             market_ranking_lookback_days=max(1, int(os.getenv("MARKET_RANKING_LOOKBACK_DAYS", "365"))),
             strategy_ranking_limit=max(1, min(3, int(os.getenv("STRATEGY_RANKING_LIMIT", "3")))),

@@ -25,6 +25,7 @@ from typing import Any, Iterable
 from analysis.policies import PolicyEvaluator
 from config import TradeSettings
 from knowledge.instruments import classify_instrument
+from knowledge.portfolio import select_diversified_core
 from knowledge.specialization import score_specialization
 
 
@@ -96,6 +97,26 @@ class ResearchGovernance:
             rows = by_symbol.get(symbol, [])
             metric = PolicyEvaluator.evaluate(rows).to_dict()
             meta = dict(metadata.get(symbol) or {})
+            fit_buckets: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+            for row in rows:
+                fit_key = (
+                    str(row.get("strategy_id") or row.get("setup_type") or "UNKNOWN"),
+                    str(row.get("regime") or "UNKNOWN"),
+                    str(row.get("timeframe") or "UNKNOWN"),
+                )
+                fit_buckets[fit_key].append(row)
+            fit_matrix = []
+            for (strategy_id, fit_regime, timeframe), bucket in fit_buckets.items():
+                fit_metric = PolicyEvaluator.evaluate(bucket).to_dict()
+                fit_matrix.append({
+                    "strategy": strategy_id, "regime": fit_regime, "timeframe": timeframe,
+                    "sample_size": int(fit_metric.get("sample_size") or 0),
+                    "expectancy_r": fit_metric.get("expectancy_r"),
+                    "max_drawdown_r": fit_metric.get("max_drawdown_r"),
+                })
+            fit_matrix.sort(key=lambda item: (-(float(item.get("expectancy_r") or 0.0)), -item["sample_size"], item["strategy"], item["regime"], item["timeframe"]))
+            best_fit = [item for item in fit_matrix if (item.get("expectancy_r") is not None and float(item.get("expectancy_r") or 0.0) > 0)][:3]
+            worst_fit = sorted(fit_matrix, key=lambda item: (float(item.get("expectancy_r") or 0.0), -item["sample_size"], item["strategy"], item["regime"], item["timeframe"]))[:3]
             regimes = {str(row.get("regime") or "UNKNOWN").upper() for row in rows}
             statistical = self._score_component(metric.get("expectancy_r"), center=0.0, scale=2.0)
             if statistical is not None and metric.get("profit_factor") is not None:
@@ -145,11 +166,34 @@ class ResearchGovernance:
                 "expectancy_r": metric.get("expectancy_r"), "max_drawdown_r": metric.get("max_drawdown_r"),
                 "sample_size": len(rows), "out_of_sample_sample": int(meta.get("out_of_sample_sample") or 0),
                 "forward_sample": int(meta.get("forward_sample") or len(rows)), "broker_eligible": broker_eligible,
+                "strategy_fit_matrix": fit_matrix,
+                "best_strategies": [item["strategy"] for item in best_fit],
+                "best_regimes": [item["regime"] for item in best_fit],
+                "best_timeframes": [item["timeframe"] for item in best_fit],
+                "worst_strategies": [item["strategy"] for item in worst_fit],
+                "worst_regimes": [item["regime"] for item in worst_fit],
+                "worst_timeframes": [item["timeframe"] for item in worst_fit],
             })
         rankings.sort(key=lambda item: (-float(item["specialization"]["adjusted_score"]), item["instrument"]))
-        core = [item for item in rankings if item["role"] in {"CORE", "CORE_STRONG"}][:max(0, min(10, int(self.settings.max_core_instruments)))]
-        core_symbols = [item["instrument"] for item in core]
+        return_series = {
+            symbol: [float(row.get("pnl_r")) for row in by_symbol.get(symbol, []) if row.get("pnl_r") is not None]
+            for symbol in universe
+        }
+        portfolio_selection = select_diversified_core(
+            rankings,
+            return_series=return_series,
+            max_core_instruments=self.settings.max_core_instruments,
+            correlation_threshold=self.settings.core_max_correlation,
+        )
+        core_symbols = list(portfolio_selection.selected)
         core_set = set(core_symbols)
+        correlation_rejections = {item.get("instrument"): item for item in portfolio_selection.rejected}
+        for item in rankings:
+            rejection = correlation_rejections.get(item.get("instrument"))
+            if rejection and item.get("role") in {"CORE", "CORE_STRONG"}:
+                item["role"] = "CHALLENGER"
+                item["role_reason"] = str(rejection.get("reason"))
+            item["portfolio_correlations"] = dict(rejection.get("correlations") or {}) if rejection else {}
         for rank, item in enumerate(rankings, 1):
             item["rank"] = rank
             item["selected_core"] = item["instrument"] in core_set
@@ -157,6 +201,8 @@ class ResearchGovernance:
             "maximum_core_instruments": max(0, min(10, int(self.settings.max_core_instruments))),
             "core_symbols": core_symbols,
             "rankings": rankings,
+            "portfolio_rejections": list(portfolio_selection.rejected),
+            "correlation_threshold": portfolio_selection.correlation_threshold,
             "core_selection_explanation": (
                 "Core instruments were earned through adjusted specialization score, evidence depth, broker eligibility, drawdown, and execution requirements."
                 if core_symbols else "No instrument currently satisfies the complete Core evidence, execution, and account-economics requirements; empty Core slots remain empty."
