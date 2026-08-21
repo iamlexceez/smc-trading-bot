@@ -25,6 +25,7 @@ async def _ensure_column(conn: aiosqlite.Connection, table: str, column: str, de
 
 async def init_db(db_path: str = DB_PATH) -> None:
     async with aiosqlite.connect(db_path) as db:
+        await db.execute("PRAGMA foreign_keys = ON;")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 id INTEGER PRIMARY KEY DEFAULT 1,
@@ -544,6 +545,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 last_trade_time TEXT NOT NULL
             )
         """)
+        await db.commit()
         await db.execute("""
             CREATE TABLE IF NOT EXISTS trade_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
