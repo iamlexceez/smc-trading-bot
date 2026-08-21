@@ -188,7 +188,6 @@ class CapitalReductionEngine:
         leverage = max(1.0, self._number(account.get("leverage"), 1.0))
         free_margin = max(0.0, self._number(account.get("free_margin")))
         candidates: list[ReductionPlan] = []
-        fallback_candidates: list[ReductionPlan] = []
         inspected: list[dict] = []
         symbols = tuple(self.broker_usable_symbols) or tuple(self.settings.available_symbols) or tuple(self.settings.enabled_symbols)
         for symbol in symbols:
@@ -247,12 +246,6 @@ class CapitalReductionEngine:
                     "would_overshoot": True,
                 })
                 inspected.append(diagnostic)
-                # Also track as potential fallback candidate if margin allows
-                if margin_capacity >= minimum and minimum * loss_per_lot <= free_margin:
-                    fb_loss = minimum * loss_per_lot
-                    req_margin = minimum * margin_per_lot
-                    if req_margin <= free_margin:
-                        fallback_candidates.append(ReductionPlan(symbol=symbol, direction="BUY", volume=minimum, entry_price=ask, expected_loss=fb_loss, loss_per_lot=loss_per_lot, required_margin=req_margin, minimum_loss=minimum_loss, maximum_reduction=margin_capacity * loss_per_lot))
                 continue
             volume = self._floor_volume(min(margin_capacity, maximum, permitted_loss / loss_per_lot), minimum, maximum, step)
             if volume <= 0:
@@ -280,10 +273,6 @@ class CapitalReductionEngine:
             candidates.append(ReductionPlan(symbol=symbol, direction="BUY", volume=volume, entry_price=ask, expected_loss=expected_loss, loss_per_lot=loss_per_lot, required_margin=required_margin, minimum_loss=minimum_loss, maximum_reduction=margin_capacity * loss_per_lot))
         diagnostics["candidates"] = inspected
         diagnostics["valid_candidate_count"] = len(candidates)
-        if not candidates and fallback_candidates:
-            candidates = fallback_candidates
-            diagnostics["valid_candidate_count"] = len(candidates)
-            diagnostics["used_fallback"] = True
         if not candidates:
             best = min(
                 inspected,
