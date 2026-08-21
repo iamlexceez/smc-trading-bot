@@ -11,6 +11,8 @@ Open **Command Prompt** on the VPS and run the following from `C:\smc-trading-bo
 ```cmd
 git pull origin main
 venv\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.txt
+venv\Scripts\python.exe -m pip install pytest pytest-asyncio coverage ruff
+venv\Scripts\python.exe -m pytest -q
 venv\Scripts\python.exe tests\smoke_upgrade.py
 start_bot.bat
 ```
