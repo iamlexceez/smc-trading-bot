@@ -1237,7 +1237,7 @@ class MarketScheduler:
         # their separate evidence-selected execution cohort.
         self.capital_reduction.broker_usable_symbols = tuple(self._analysis_eligible_symbols)
         result = await self.capital_reduction.run_once()
-        if result.get("state") in {"completed", "blocked", "failed", "paused"}:
+        if result.get("state") in {"completed", "blocked", "failed", "paused", "executing", "open", "closed", "waiting"}:
             session_id = result.get("session_id", "?")
             candidate = result.get("best_candidate") or {}
             candidate_text = (
@@ -1252,6 +1252,10 @@ class MarketScheduler:
                 "blocked": "⚠️ **CAPITAL REDUCTION BLOCKED**",
                 "failed": "❌ **CAPITAL REDUCTION FAILED**",
                 "paused": "⏸ **CAPITAL REDUCTION PAUSED**",
+                "executing": "⚡ **CAPITAL REDUCTION EXECUTING**",
+                "open": "🟢 **CAPITAL REDUCTION ORDER OPEN**",
+                "closed": "🎯 **CAPITAL REDUCTION ROUND COMPLETED**",
+                "waiting": "⏳ **CAPITAL REDUCTION PROGRESSING**",
             }.get(state, "🔥 **CAPITAL REDUCTION**")
             state_text = "ACTIVE" if state == "blocked" else state.upper()
             current = float(result.get("current_equity", result.get("equity")) or 0.0)

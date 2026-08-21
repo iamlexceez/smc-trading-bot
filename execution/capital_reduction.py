@@ -463,11 +463,12 @@ class CapitalReductionEngine:
             immediate_submit = getattr(self.executor, "execute_immediate_close_order", None)
             if callable(immediate_submit):
                 try:
-                    result = await immediate_submit(
+                    res_obj = await immediate_submit(
                         symbol=plan.symbol, direction=plan.direction, lot_size=plan.volume,
                         magic=int(self.settings.magic_number) + 91_000, comment=comment,
                     )
-                    if result is not None:
+                    if res_obj is not None:
+                        result = res_obj
                         submission = {"route": "broker_preflighted_immediate_close", "sl": 0.0, "tp": 0.0}
                 except Exception as exc:
                     return {"state": "blocked", "reason": f"immediate-close broker preflight raised {type(exc).__name__}", "session_id": session["id"]}
