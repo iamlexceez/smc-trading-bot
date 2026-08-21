@@ -3368,7 +3368,7 @@ class MarketScheduler:
         eligible = [
             item for item in ranked
             if bool(item.details.get("capacity_allowed", True))
-            and item.execution_class in {"PROVEN", "EXPLORATION"}
+            and item.execution_class in {"PROVEN", "EXPERIMENTAL"}
         ]
         research_only = [item for item in ranked if item.execution_class == "RESEARCH_ONLY"]
         if not eligible:
