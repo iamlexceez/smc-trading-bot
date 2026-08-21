@@ -107,3 +107,30 @@ async def test_order_check_and_send_receive_positional_request(monkeypatch):
     assert result.success is True
     assert [kind for kind, _ in calls] == ["check", "send"]
     executor._thread_pool.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_order_request_retries_keyword_form_for_vps_binding(monkeypatch):
+    fake_mt5 = PositionalOnlyMT5()
+    fake_mt5.TRADE_RETCODE_DONE = 10009
+    calls = []
+
+    def order_check(*args, **kwargs):
+        if args:
+            calls.append("positional")
+            return None
+        calls.append("keyword")
+        assert kwargs["request"] == {"action": 1}
+        return SimpleNamespace(retcode=10009, comment="done")
+
+    fake_mt5.order_check = order_check
+    fake_mt5.last_error = lambda: (-2, "Unnamed arguments not allowed")
+    monkeypatch.setattr(mt5_executor_module, "mt5", fake_mt5, raising=False)
+    monkeypatch.setattr(mt5_executor_module, "MT5_AVAILABLE", True)
+
+    executor = mt5_executor_module.MT5Executor(1, "password", "server")
+    result = await executor._mt5_request("order_check", {"action": 1})
+
+    assert result.retcode == 10009
+    assert calls == ["positional", "keyword"]
+    executor._thread_pool.shutdown(wait=True)

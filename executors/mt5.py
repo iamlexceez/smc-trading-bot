@@ -48,6 +48,67 @@ class MT5Executor(BaseExecutor):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._thread_pool, lambda: func(*args, **kwargs))
 
+    @staticmethod
+    def _is_unnamed_argument_error(error) -> bool:
+        """Recognize the VPS-specific MT5 binding error without masking broker errors."""
+        if not isinstance(error, (tuple, list)) or len(error) < 2:
+            return False
+        try:
+            code = int(error[0])
+        except (TypeError, ValueError):
+            return False
+        message = str(error[1] or "").lower()
+        return code == -2 and "unnamed argument" in message
+
+    async def _mt5_request(self, method_name: str, request: dict):
+        """Call order_check/order_send across strict MT5 Python binding variants.
+
+        The official binding documents a positional request parameter, while some
+        Windows builds expose a wrapper that rejects the positional form with
+        ``Unnamed arguments not allowed``. Retry the alternate form only for that
+        exact binding error; every broker validation result remains authoritative.
+        """
+        method = getattr(mt5, method_name)
+        try:
+            result = await self._run_sync(method, request)
+        except TypeError:
+            result = None
+            last_error = (-2, "Unnamed arguments not allowed")
+        else:
+            if result is not None:
+                return result
+            last_error = await self._run_sync(mt5.last_error)
+        if not self._is_unnamed_argument_error(last_error):
+            return None
+        try:
+            return await self._run_sync(method, request=request)
+        except TypeError:
+            return None
+
+    async def _mt5_margin(self, action, symbol: str, volume: float, price: float):
+        """Call order_calc_margin across strict positional/keyword MT5 builds."""
+        try:
+            result = await self._run_sync(mt5.order_calc_margin, action, symbol, volume, price)
+        except TypeError:
+            result = None
+            last_error = (-2, "Unnamed arguments not allowed")
+        else:
+            if result is not None:
+                return result
+            last_error = await self._run_sync(mt5.last_error)
+        if not self._is_unnamed_argument_error(last_error):
+            return None
+        try:
+            return await self._run_sync(
+                mt5.order_calc_margin,
+                action=action,
+                symbol=symbol,
+                volume=volume,
+                price=price,
+            )
+        except TypeError:
+            return None
+
     async def connect(self) -> bool:
         if not MT5_AVAILABLE:
             logger.error("MetaTrader5 package not available")
@@ -424,7 +485,7 @@ class MT5Executor(BaseExecutor):
             if price is None or float(price) <= 0 or volume <= 0:
                 result["margin_error"] = "No positive executable price or minimum volume for margin calculation"
             else:
-                margin = await self._run_sync(mt5.order_calc_margin, order_type, symbol, volume, float(price))
+                margin = await self._mt5_margin(order_type, symbol, volume, float(price))
                 result["margin_required"] = margin
                 result["margin_source"] = "order_calc_margin"
                 if margin is None:
@@ -566,7 +627,7 @@ class MT5Executor(BaseExecutor):
         try:
             order_type = getattr(mt5, "ORDER_TYPE_BUY", 0) if buy else getattr(mt5, "ORDER_TYPE_SELL", 1)
             result["price"] = float(test_price)
-            margin = await self._run_sync(mt5.order_calc_margin, order_type, symbol, float(normalized), float(test_price))
+            margin = await self._mt5_margin(order_type, symbol, float(normalized), float(test_price))
             result["margin"] = float(margin) if margin is not None else None
             if margin is None:
                 last_err = await self._run_sync(mt5.last_error)
@@ -787,7 +848,7 @@ class MT5Executor(BaseExecutor):
             "deviation": 20, "magic": magic, "comment": comment or "CAPITAL_REDUCTION",
             "type_time": mt5.ORDER_TIME_GTC, "type_filling": filling_mode,
         }
-        check = await self._run_sync(mt5.order_check, request)
+        check = await self._mt5_request("order_check", request)
         if check is None:
             last_err = await self._run_sync(mt5.last_error)
             return ExecutionResult(success=False, message=f"Immediate-close MT5 order_check returned None: {last_err}", entry_price=price, lot_size=float(lot_size))
@@ -797,7 +858,7 @@ class MT5Executor(BaseExecutor):
                 f"price={price:.10g}, stops_level={getattr(info, 'trade_stops_level', 0)}, "
                 f"freeze_level={getattr(info, 'trade_freeze_level', 0)}"
             ), entry_price=price, lot_size=float(lot_size))
-        result = await self._run_sync(mt5.order_send, request)
+        result = await self._mt5_request("order_send", request)
         if result is None:
             last_err = await self._run_sync(mt5.last_error)
             return ExecutionResult(success=False, message=f"Immediate-close order_send returned None: {last_err}", entry_price=price, lot_size=float(lot_size))
@@ -871,7 +932,7 @@ class MT5Executor(BaseExecutor):
 
         # MT5 validates the exact server-side stop rules without submitting an
         # order. This catches broker-specific constraints beyond symbol_info.
-        check = await self._run_sync(mt5.order_check, request)
+        check = await self._mt5_request("order_check", request)
         if check is None:
             last_err = await self._run_sync(mt5.last_error)
             return ExecutionResult(success=False, message=f"Pre-submit MT5 order_check returned None: {last_err}", entry_price=float(price or 0.0), sl=sl, tp=tp, lot_size=float(lot_size))
@@ -901,7 +962,7 @@ class MT5Executor(BaseExecutor):
                 if not retry.get("valid"):
                     continue
                 request.update({"price": float(retry["entry_price"]), "sl": float(retry["sl"]), "tp": float(retry["tp"])})
-                check = await self._run_sync(mt5.order_check, request)
+                check = await self._mt5_request("order_check", request)
                 if self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
                     price, sl, tp = float(request["price"]), float(request["sl"]), float(request["tp"])
                     logger.info("MT5 order_check accepted stop buffer of %s tick(s) for %s %s", extra_ticks, symbol, direction)
@@ -909,7 +970,7 @@ class MT5Executor(BaseExecutor):
         if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
             return ExecutionResult(success=False, message=(f"Pre-submit MT5 order_check failed: retcode={check.retcode}, comment={check.comment}; " f"price={float(request['price']):.10g}, sl={float(request['sl']):.10g}, tp={float(request['tp']):.10g}, " f"stops_level={getattr(info, 'trade_stops_level', 0)}, freeze_level={getattr(info, 'trade_freeze_level', 0)}"), entry_price=float(request["price"] or 0.0), sl=float(request["sl"]), tp=float(request["tp"]), lot_size=float(lot_size))
 
-        result = await self._run_sync(mt5.order_send, request)
+        result = await self._mt5_request("order_send", request)
         if result is not None and result.retcode == invalid_stops_code:
             # A quote can move after order_check. Re-read the broker quote and
             # retry once with freshly normalized levels; never loop or force it.
@@ -926,9 +987,9 @@ class MT5Executor(BaseExecutor):
                 )
                 if retry.get("valid"):
                     request.update({"price": float(retry["entry_price"]), "sl": float(retry["sl"]), "tp": float(retry["tp"])})
-                    retry_check = await self._run_sync(mt5.order_check, request)
+                    retry_check = await self._mt5_request("order_check", request)
                     if self._order_check_succeeded(retry_check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
-                        result = await self._run_sync(mt5.order_send, request)
+                        result = await self._mt5_request("order_send", request)
                         sl, tp, price = float(retry["sl"]), float(retry["tp"]), float(retry["entry_price"])
 
         if result is None:
@@ -999,7 +1060,7 @@ class MT5Executor(BaseExecutor):
             "type_filling": filling_mode,
         }
 
-        result = await self._run_sync(mt5.order_send, request)
+        result = await self._mt5_request("order_send", request)
         return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
 
     async def close_partial(self, ticket: int, volume: float) -> bool:
@@ -1050,7 +1111,7 @@ class MT5Executor(BaseExecutor):
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": filling_mode,
         }
-        result = await self._run_sync(mt5.order_send, request)
+        result = await self._mt5_request("order_send", request)
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             last_err = await self._run_sync(mt5.last_error)
             logger.error("Partial close failed for #%s: %s", ticket, last_err if result is None else result.comment)
@@ -1105,12 +1166,12 @@ class MT5Executor(BaseExecutor):
             "magic": pos.magic,
         }
 
-        check = await self._run_sync(mt5.order_check, request)
+        check = await self._mt5_request("order_check", request)
         if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
             last_err = await self._run_sync(mt5.last_error)
             logger.error("modify_position pre-submit MT5 order_check failed for #%s: %s", ticket, last_err if check is None else check.comment)
             return False
-        result = await self._run_sync(mt5.order_send, request)
+        result = await self._mt5_request("order_send", request)
         if result is None:
             last_err = await self._run_sync(mt5.last_error)
             logger.error(f"modify_position order_send returned None: {last_err}")
