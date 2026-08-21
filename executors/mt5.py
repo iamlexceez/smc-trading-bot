@@ -789,6 +789,55 @@ class MT5Executor(BaseExecutor):
             cls._round_to_tick(float(tp) + distance, tick_size, digits, upward=True),
         )
 
+    @staticmethod
+    def _market_execution_mode(info) -> int | None:
+        value = getattr(info, "trade_exemode", None)
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _select_filling_mode(info):
+        """Select only a filling mode advertised by the broker symbol."""
+        supported = int(getattr(info, "filling_mode", 0) or 0)
+        fok_flag = int(getattr(mt5, "SYMBOL_FILLING_FOK", 1))
+        ioc_flag = int(getattr(mt5, "SYMBOL_FILLING_IOC", 2))
+        market_execution = int(getattr(mt5, "SYMBOL_TRADE_EXECUTION_MARKET", 2))
+        execution = MT5Executor._market_execution_mode(info)
+        if supported & fok_flag:
+            return getattr(mt5, "ORDER_FILLING_FOK", 0)
+        if supported & ioc_flag:
+            return getattr(mt5, "ORDER_FILLING_IOC", 1)
+        if execution != market_execution:
+            return getattr(mt5, "ORDER_FILLING_RETURN", 2)
+        return None
+
+    @staticmethod
+    def _build_market_request(*, info, symbol: str, volume: float, order_type, price: float, sl: float, tp: float, magic: int, comment: str):
+        """Build a DEAL request without market-only fields that invalidate it."""
+        filling_mode = MT5Executor._select_filling_mode(info)
+        if filling_mode is None:
+            return None, "Broker advertised no compatible market filling mode"
+        market_execution = int(getattr(mt5, "SYMBOL_TRADE_EXECUTION_MARKET", 2))
+        execution = MT5Executor._market_execution_mode(info)
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": float(volume),
+            "type": order_type,
+            "sl": float(sl),
+            "tp": float(tp),
+            "deviation": 20,
+            "magic": magic,
+            "comment": comment,
+            "type_filling": filling_mode,
+        }
+        if execution != market_execution:
+            request["price"] = float(price)
+            request["type_time"] = mt5.ORDER_TIME_GTC
+        return request, ""
+
     async def execute_immediate_close_order(
         self, symbol: str, direction: str, lot_size: float, magic: int, comment: str = ""
     ) -> ExecutionResult:
@@ -842,12 +891,12 @@ class MT5Executor(BaseExecutor):
         sl = float(stop_check["sl"]) if stop_check.get("valid") else raw_sl
         tp = float(stop_check["tp"]) if stop_check.get("valid") else raw_tp
 
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lot_size),
-            "type": order_type, "price": price, "sl": sl, "tp": tp,
-            "deviation": 20, "magic": magic, "comment": comment or "CAPITAL_REDUCTION",
-            "type_time": mt5.ORDER_TIME_GTC, "type_filling": filling_mode,
-        }
+        request, request_reason = self._build_market_request(
+            info=info, symbol=symbol, volume=float(lot_size), order_type=order_type,
+            price=price, sl=sl, tp=tp, magic=magic, comment=comment or "CAPITAL_REDUCTION",
+        )
+        if request is None:
+            return ExecutionResult(success=False, message=request_reason, entry_price=price, sl=sl, tp=tp, lot_size=float(lot_size))
         check = await self._mt5_request("order_check", request)
         if check is None:
             last_err = await self._run_sync(mt5.last_error)
@@ -904,31 +953,12 @@ class MT5Executor(BaseExecutor):
         if stop_check.get("changed"):
             logger.info("Broker-normalized entry stops for %s %s: sl=%s tp=%s minimum_distance=%s", symbol, direction, sl, tp, stop_check.get("minimum_distance"))
 
-        # Determine filling mode dynamically
-        filling_mode = mt5.ORDER_FILLING_IOC
-        sym_filling = getattr(info, 'filling_mode', 0)
-        
-        if sym_filling & 1:
-            filling_mode = mt5.ORDER_FILLING_FOK
-        elif sym_filling & 2:
-            filling_mode = mt5.ORDER_FILLING_IOC
-        else:
-            filling_mode = mt5.ORDER_FILLING_RETURN
-
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": float(lot_size),
-            "type": order_type,
-            "price": price,
-            "sl": float(sl),
-            "tp": float(tp),
-            "deviation": 20,
-            "magic": magic,
-            "comment": comment or "SMC Bot",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": filling_mode,
-        }
+        request, request_reason = self._build_market_request(
+            info=info, symbol=symbol, volume=float(lot_size), order_type=order_type,
+            price=float(price), sl=sl, tp=tp, magic=magic, comment=comment or "SMC Bot",
+        )
+        if request is None:
+            return ExecutionResult(success=False, message=request_reason, entry_price=float(price or 0.0), sl=sl, tp=tp, lot_size=float(lot_size))
 
         # MT5 validates the exact server-side stop rules without submitting an
         # order. This catches broker-specific constraints beyond symbol_info.

@@ -134,3 +134,37 @@ async def test_order_request_retries_keyword_form_for_vps_binding(monkeypatch):
     assert result.retcode == 10009
     assert calls == ["positional", "keyword"]
     executor._thread_pool.shutdown(wait=True)
+
+
+def test_market_execution_request_omits_price_and_time_fields(monkeypatch):
+    fake_mt5 = PositionalOnlyMT5()
+    fake_mt5.SYMBOL_FILLING_FOK = 1
+    fake_mt5.SYMBOL_FILLING_IOC = 2
+    fake_mt5.SYMBOL_TRADE_EXECUTION_MARKET = 2
+    fake_mt5.ORDER_FILLING_FOK = 0
+    fake_mt5.ORDER_FILLING_IOC = 1
+    fake_mt5.ORDER_FILLING_RETURN = 2
+    fake_mt5.TRADE_ACTION_DEAL = 1
+    fake_mt5.ORDER_TIME_GTC = 0
+    monkeypatch.setattr(mt5_executor_module, "mt5", fake_mt5, raising=False)
+
+    info = SimpleNamespace(
+        filling_mode=2,
+        trade_exemode=2,
+    )
+    request, reason = mt5_executor_module.MT5Executor._build_market_request(
+        info=info,
+        symbol="Synthetic Index",
+        volume=0.1,
+        order_type=0,
+        price=105450.336,
+        sl=105400.0,
+        tp=105500.0,
+        magic=1,
+        comment="CAPITAL_REDUCTION",
+    )
+
+    assert not reason
+    assert request["type_filling"] == 1
+    assert "price" not in request
+    assert "type_time" not in request
