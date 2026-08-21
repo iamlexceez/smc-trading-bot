@@ -762,9 +762,28 @@ class MT5Executor(BaseExecutor):
             filling_mode = mt5.ORDER_FILLING_IOC
         else:
             filling_mode = mt5.ORDER_FILLING_RETURN
+        point = float(getattr(info, "point", 0.0) or 0.0)
+        tick_size = float(getattr(info, "trade_tick_size", point) or point)
+        digits = int(getattr(info, "digits", 0) or 0)
+        stops_level = float(getattr(info, "trade_stops_level", 0.0) or 0.0)
+        freeze_level = float(getattr(info, "trade_freeze_level", 0.0) or 0.0)
+        min_dist = max(stops_level, freeze_level, 10) * point if point > 0 else price * 0.001
+        if is_buy:
+            raw_sl = price - min_dist * 2.0
+            raw_tp = price + min_dist * 4.0
+        else:
+            raw_sl = price + min_dist * 2.0
+            raw_tp = price - min_dist * 4.0
+        stop_check = self._normalise_protective_levels(
+            direction=direction, bid=float(getattr(tick, "bid", 0.0) or 0.0), ask=float(getattr(tick, "ask", 0.0) or 0.0),
+            sl=raw_sl, tp=raw_tp, point=point, tick_size=tick_size, digits=digits, stops_level=stops_level, freeze_level=freeze_level,
+        )
+        sl = float(stop_check["sl"]) if stop_check.get("valid") else raw_sl
+        tp = float(stop_check["tp"]) if stop_check.get("valid") else raw_tp
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lot_size),
-            "type": order_type, "price": price, "sl": 0.0, "tp": 0.0,
+            "type": order_type, "price": price, "sl": sl, "tp": tp,
             "deviation": 20, "magic": magic, "comment": comment or "CAPITAL_REDUCTION",
             "type_time": mt5.ORDER_TIME_GTC, "type_filling": filling_mode,
         }
