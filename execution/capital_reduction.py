@@ -237,8 +237,7 @@ class CapitalReductionEngine:
                 inspected.append(diagnostic)
                 continue
             permitted_loss = remaining + tapered_overshoot
-            overshoot_allowed = (target <= 1.0)
-            if not overshoot_allowed and minimum_loss > permitted_loss + 1e-8:
+            if minimum_loss > permitted_loss + 1e-8:
                 diagnostic.update({
                     "status": "rejected", "reason": "broker minimum-volume loss exceeds configured overshoot envelope",
                     "overshoot": minimum_loss - remaining, "closest_volume": minimum,
