@@ -3104,13 +3104,18 @@ class MarketScheduler:
 
         capital_session = await db.get_active_capital_reduction_session("demo")
         if capital_session:
-            reason = f"Capital reduction session #{capital_session['id']} is {capital_session['status']}; normal strategy scanning is suspended."
-            self._set_scan_gate("CAPITAL_REDUCTION_ACTIVE", reason, analysis_symbols=0)
-            self._set_scan_disposition("CAPITAL_REDUCTION_BLOCKED", reason)
-            self.telemetry.component_blocked("analysis_engine", reason)
-            self.telemetry.component_waiting("execution_engine", "Normal new entries are suspended during capital reduction")
-            logger.info(reason)
-            return {"state": "CAPITAL_REDUCTION_BLOCKED", "reason": reason}
+            runtime_state = str((capital_session.get("metadata") or {}).get("runtime_state") or "").upper()
+            # If the session is actively executing or reducing, suspend normal scans.
+            # If it is recoverably blocked or searching with no immediate executable order,
+            # allow normal scanning to continue so the bot isn't locked up.
+            if runtime_state in {"EXECUTING", "OPEN", "CLOSING"}:
+                reason = f"Capital reduction session #{capital_session['id']} is executing; normal strategy scanning is suspended."
+                self._set_scan_gate("CAPITAL_REDUCTION_ACTIVE", reason, analysis_symbols=0)
+                self._set_scan_disposition("CAPITAL_REDUCTION_BLOCKED", reason)
+                self.telemetry.component_blocked("analysis_engine", reason)
+                self.telemetry.component_waiting("execution_engine", "Normal new entries are suspended during capital reduction execution")
+                logger.info(reason)
+                return {"state": "CAPITAL_REDUCTION_BLOCKED", "reason": reason}
 
         # Check if this is a manual scan bypass
         is_manual = getattr(self, "_manual_scan_requested", False)
