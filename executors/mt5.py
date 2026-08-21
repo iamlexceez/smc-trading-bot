@@ -814,8 +814,8 @@ class MT5Executor(BaseExecutor):
         return None
 
     @staticmethod
-    def _build_market_request(*, info, symbol: str, volume: float, order_type, price: float, sl: float, tp: float, magic: int, comment: str):
-        """Build a DEAL request without market-only fields that invalidate it."""
+    def _build_market_request(*, info, symbol: str, volume: float, order_type, price: float, sl: float, tp: float, magic: int, comment: str, position: int | None = None, include_protection: bool = True):
+        """Build a DEAL request without fields invalid for the broker execution mode."""
         filling_mode = MT5Executor._select_filling_mode(info)
         if filling_mode is None:
             return None, "Broker advertised no compatible market filling mode"
@@ -826,17 +826,60 @@ class MT5Executor(BaseExecutor):
             "symbol": symbol,
             "volume": float(volume),
             "type": order_type,
-            "sl": float(sl),
-            "tp": float(tp),
             "deviation": 20,
             "magic": magic,
             "comment": comment,
             "type_filling": filling_mode,
         }
+        if include_protection:
+            request.update({"sl": float(sl), "tp": float(tp)})
+        if position is not None:
+            request["position"] = int(position)
         if execution != market_execution:
             request["price"] = float(price)
             request["type_time"] = mt5.ORDER_TIME_GTC
         return request, ""
+
+    @staticmethod
+    def _market_request_variants(info, request: dict):
+        """Yield broker-advertised request variants for read-only order_check retries."""
+        seen = set()
+        execution = MT5Executor._market_execution_mode(info)
+        market_execution = int(getattr(mt5, "SYMBOL_TRADE_EXECUTION_MARKET", 2))
+        supported = int(getattr(info, "filling_mode", 0) or 0)
+        fills = []
+        if supported & int(getattr(mt5, "SYMBOL_FILLING_FOK", 1)):
+            fills.append(getattr(mt5, "ORDER_FILLING_FOK", 0))
+        if supported & int(getattr(mt5, "SYMBOL_FILLING_IOC", 2)):
+            fills.append(getattr(mt5, "ORDER_FILLING_IOC", 1))
+        if execution != market_execution:
+            fills.append(getattr(mt5, "ORDER_FILLING_RETURN", 2))
+        for filling in fills:
+            candidate = dict(request)
+            candidate["type_filling"] = filling
+            if execution == market_execution:
+                candidate.pop("price", None)
+                candidate.pop("type_time", None)
+            key = tuple(sorted((str(k), repr(v)) for k, v in candidate.items()))
+            if key not in seen:
+                seen.add(key)
+                yield candidate
+
+    async def _preflight_market_request(self, info, request: dict):
+        """Preflight the request and bounded broker-advertised variants only."""
+        check = await self._mt5_request("order_check", request)
+        if self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
+            return request, check
+        original_key = tuple(sorted((str(k), repr(v)) for k, v in request.items()))
+        for candidate in self._market_request_variants(info, request):
+            candidate_key = tuple(sorted((str(k), repr(v)) for k, v in candidate.items()))
+            if candidate_key == original_key:
+                continue
+            candidate_check = await self._mt5_request("order_check", candidate)
+            if self._order_check_succeeded(candidate_check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
+                logger.info("MT5 order_check accepted a broker-compatible request variant for %s", request.get("symbol"))
+                return candidate, candidate_check
+        return request, check
 
     async def execute_immediate_close_order(
         self, symbol: str, direction: str, lot_size: float, magic: int, comment: str = ""
@@ -897,14 +940,14 @@ class MT5Executor(BaseExecutor):
         )
         if request is None:
             return ExecutionResult(success=False, message=request_reason, entry_price=price, sl=sl, tp=tp, lot_size=float(lot_size))
-        check = await self._mt5_request("order_check", request)
+        request, check = await self._preflight_market_request(info, request)
         if check is None:
             last_err = await self._run_sync(mt5.last_error)
             return ExecutionResult(success=False, message=f"Immediate-close MT5 order_check returned None: {last_err}", entry_price=price, lot_size=float(lot_size))
         if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
             return ExecutionResult(success=False, message=(
                 f"Immediate-close MT5 order_check failed: retcode={check.retcode}, comment={check.comment}; "
-                f"price={price:.10g}, stops_level={getattr(info, 'trade_stops_level', 0)}, "
+                f"price={float(request.get('price', price)):.10g}, stops_level={getattr(info, 'trade_stops_level', 0)}, "
                 f"freeze_level={getattr(info, 'trade_freeze_level', 0)}"
             ), entry_price=price, lot_size=float(lot_size))
         result = await self._mt5_request("order_send", request)
@@ -1065,31 +1108,18 @@ class MT5Executor(BaseExecutor):
         opposite_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
         price = tick.bid if opposite_type == mt5.ORDER_TYPE_SELL else tick.ask
 
-        # Determine filling mode dynamically
-        filling_mode = mt5.ORDER_FILLING_IOC
-        sym_filling = getattr(info, 'filling_mode', 0)
-        
-        if sym_filling & 1:
-            filling_mode = mt5.ORDER_FILLING_FOK
-        elif sym_filling & 2:
-            filling_mode = mt5.ORDER_FILLING_IOC
-        else:
-            filling_mode = mt5.ORDER_FILLING_RETURN
-
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": pos.volume,
-            "type": opposite_type,
-            "position": ticket,
-            "price": price,
-            "deviation": 20,
-            "magic": pos.magic,
-            "comment": "SMC Bot Close",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": filling_mode,
-        }
-
+        request, request_reason = self._build_market_request(
+            info=info, symbol=symbol, volume=float(pos.volume), order_type=opposite_type,
+            price=float(price), sl=0.0, tp=0.0, magic=int(pos.magic), comment="SMC Bot Close",
+            position=int(ticket), include_protection=False,
+        )
+        if request is None:
+            logger.error("Close request rejected before preflight for #%s: %s", ticket, request_reason)
+            return False
+        request, check = await self._preflight_market_request(info, request)
+        if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
+            logger.error("Close order_check failed for #%s: %s", ticket, await self._run_sync(mt5.last_error) if check is None else getattr(check, "comment", "unknown"))
+            return False
         result = await self._mt5_request("order_send", request)
         return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
 
@@ -1119,28 +1149,18 @@ class MT5Executor(BaseExecutor):
 
         opposite_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
         price = tick.bid if opposite_type == mt5.ORDER_TYPE_SELL else tick.ask
-        filling_mode = mt5.ORDER_FILLING_IOC
-        sym_filling = getattr(info, "filling_mode", 0)
-        if sym_filling & 1:
-            filling_mode = mt5.ORDER_FILLING_FOK
-        elif sym_filling & 2:
-            filling_mode = mt5.ORDER_FILLING_IOC
-        else:
-            filling_mode = mt5.ORDER_FILLING_RETURN
-
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": pos.symbol,
-            "volume": float(close_volume),
-            "type": opposite_type,
-            "position": ticket,
-            "price": price,
-            "deviation": 20,
-            "magic": pos.magic,
-            "comment": "SMC Bot Partial Close",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": filling_mode,
-        }
+        request, request_reason = self._build_market_request(
+            info=info, symbol=pos.symbol, volume=float(close_volume), order_type=opposite_type,
+            price=float(price), sl=0.0, tp=0.0, magic=int(pos.magic), comment="SMC Bot Partial Close",
+            position=int(ticket), include_protection=False,
+        )
+        if request is None:
+            logger.error("Partial close request rejected before preflight for #%s: %s", ticket, request_reason)
+            return False
+        request, check = await self._preflight_market_request(info, request)
+        if not self._order_check_succeeded(check, getattr(mt5, "TRADE_RETCODE_DONE", None)):
+            logger.error("Partial close order_check failed for #%s: %s", ticket, await self._run_sync(mt5.last_error) if check is None else getattr(check, "comment", "unknown"))
+            return False
         result = await self._mt5_request("order_send", request)
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             last_err = await self._run_sync(mt5.last_error)
