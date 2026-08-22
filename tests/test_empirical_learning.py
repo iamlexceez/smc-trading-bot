@@ -39,11 +39,11 @@ async def test_score_50_demo_eligible(mock_settings):
         rr_filter_enabled=True
     )
     assert decision.trading_decision == "CONTROLLED_FORWARD_DEMO"
-    assert decision.execution_class == "EXPERIMENTAL"
+    assert decision.execution_class == "EXPLORATION"
 
 @pytest.mark.asyncio
 async def test_score_55_experimental_eligible(mock_settings):
-    """TEST 2: Score 55 setup can become EXPERIMENTAL DEMO eligible."""
+    """TEST 2: Score 55 setup can become controlled DEMO exploration eligible."""
     decision = evaluate_trading_gate(
         setup_valid=True,
         broker_symbol_valid=True,
@@ -62,7 +62,7 @@ async def test_score_55_experimental_eligible(mock_settings):
         rr_filter_enabled=True
     )
     assert decision.trading_decision == "CONTROLLED_FORWARD_DEMO"
-    assert decision.execution_class == "EXPERIMENTAL"
+    assert decision.execution_class == "EXPLORATION"
 
 @pytest.mark.asyncio
 async def test_score_49_ineligible(mock_settings):
@@ -112,23 +112,14 @@ async def test_insufficient_evidence_does_not_block(mock_settings):
 
 def test_instrument_lifecycle():
     """TEST 11, 12, 13: Instrument lifecycle promotion/demotion."""
-    # Exploratory
     c1 = classify_instrument("V75", broker_eligible=True, evidence={"sample_size": 5}, minimum_sample_size=50, max_manageable_drawdown_r=2.0, minimum_execution_reliability=0.95)
     assert c1.role == "EXPLORATORY"
-    
-    # Candidate
     c2 = classify_instrument("V75", broker_eligible=True, evidence={"sample_size": 20, "expectancy_r": 0.5}, minimum_sample_size=50, max_manageable_drawdown_r=2.0, minimum_execution_reliability=0.95)
     assert c2.role == "CANDIDATE"
-    
-    # Core
     c3 = classify_instrument("V75", broker_eligible=True, evidence={"sample_size": 60, "expectancy_r": 0.5, "max_drawdown_r": 1.0, "execution_reliability": 0.98}, minimum_sample_size=50, max_manageable_drawdown_r=2.0, minimum_execution_reliability=0.95)
     assert c3.role == "CORE"
-    
-    # Under Review (Negative Expectancy)
     c4 = classify_instrument("V75", broker_eligible=True, evidence={"sample_size": 60, "expectancy_r": -0.2}, minimum_sample_size=50, max_manageable_drawdown_r=2.0, minimum_execution_reliability=0.95)
     assert c4.role == "UNDER_REVIEW"
-    
-    # Under Review (High Drawdown)
     c5 = classify_instrument("V75", broker_eligible=True, evidence={"sample_size": 60, "expectancy_r": 0.5, "max_drawdown_r": 5.0}, minimum_sample_size=50, max_manageable_drawdown_r=2.0, minimum_execution_reliability=0.95)
     assert c5.role == "UNDER_REVIEW"
 
