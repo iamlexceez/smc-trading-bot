@@ -239,20 +239,7 @@ def evaluate_trading_gate(
     capital_efficiency_approved: bool = True,
     retired_veto: str | None = None,
 ) -> GateDecision:
-    """Return the one authoritative pre-order policy decision.
-
-    Evidence and governance are *not* hard gates.  They are used as follows:
-
-    * negative/invalidated evidence rejects the hypothesis;
-    * conflicted evidence defers it for confirmation;
-    * insufficient evidence in DEMO can become controlled exploration when the
-      current setup and strategy-match thresholds pass;
-    * validated positive evidence may proceed without champion status; and
-    * broker/account/objective/portfolio/risk/data/setup gates remain hard.
-
-    The executor still performs the final broker stop, volume, margin, duplicate,
-    order-check, and submit validation after this decision.
-    """
+    """Return the one authoritative pre-order policy decision."""
     data = dict(evidence or {})
     evidence_classification = classify_evidence(data)
     confidence_classification = classify_confidence(data)
@@ -292,18 +279,23 @@ def evaluate_trading_gate(
             "setup_geometry": "SETUP_INVALID",
             "objective": "OBJECTIVE_INCOMPATIBLE",
             "portfolio": "PORTFOLIO_LIMIT",
-                    "required_htf_context": "HTF_CONTEXT_UNAVAILABLE",
-        "risk_policy": "RISK_POLICY_INVALID",
-        "capital_efficiency": "CAPITAL_INEFFICIENT",
-    }[name]
-
+            "required_htf_context": "HTF_CONTEXT_UNAVAILABLE",
+            "risk_policy": "RISK_POLICY_INVALID",
+            "capital_efficiency": "CAPITAL_INEFFICIENT",
+        }[name]
         for name in hard_failures
     ]
     objective_status = "PASS" if objective_permits_exposure else "BLOCKED"
     broker_status = "PASS" if broker_symbol_valid and valid_market_data else "BLOCKED"
     observed_rr = float(actual_rr or 0.0)
     normal_rr_floor = float(minimum_rr or 0.0) if rr_filter_enabled and float(minimum_rr or 0.0) > 0.0 else 2.0
-    experimental_low_rr = bool(low_rr_experiment and observed_rr > 0.0 and observed_rr < normal_rr_floor)
+    # A lower-than-normal RR is an experimental hypothesis only when explicitly
+    # authorized as such. DEMO mode alone does not silently disable RR policy;
+    # this keeps ordinary policy enforcement testable while allowing the
+    # experiment engine to deliberately create low-RR learning candidates.
+    experimental_low_rr = bool(
+        low_rr_experiment and observed_rr > 0.0 and observed_rr < normal_rr_floor
+    )
     portfolio_status = "PASS" if portfolio_approved else "BLOCKED"
     risk_status = "PASS" if risk_valid else "BLOCKED"
     capital_efficiency_status = "PASS" if capital_efficiency_approved else "BLOCKED"
@@ -329,6 +321,7 @@ def evaluate_trading_gate(
             broker_status=broker_status,
             portfolio_status=portfolio_status,
             risk_status=risk_status,
+            capital_efficiency_status=capital_efficiency_status,
         )
 
     if low_rr_experiment and not demo_mode:
@@ -351,6 +344,7 @@ def evaluate_trading_gate(
             broker_status=broker_status,
             portfolio_status=portfolio_status,
             risk_status=risk_status,
+            capital_efficiency_status=capital_efficiency_status,
         )
     if rr_filter_enabled and observed_rr > 0.0 and observed_rr < float(minimum_rr) and not experimental_low_rr:
         return _decision(
@@ -372,11 +366,9 @@ def evaluate_trading_gate(
             broker_status=broker_status,
             portfolio_status=portfolio_status,
             risk_status=risk_status,
+            capital_efficiency_status=capital_efficiency_status,
         )
 
-    # Policy Model Retirement: Negative, invalidated, or conflicted evidence
-    # no longer independently vetoes a DEMO experiment. These remain active
-    # for LIVE mode and are reported as advisories in DEMO.
     if not demo_mode:
         if evidence_classification in {"NEGATIVE", "INVALIDATED"}:
             label = f"Negative or invalidated evidence ({evidence_classification})"
@@ -399,8 +391,8 @@ def evaluate_trading_gate(
                 broker_status=broker_status,
                 portfolio_status=portfolio_status,
                 risk_status=risk_status,
+                capital_efficiency_status=capital_efficiency_status,
             )
-
         if evidence_classification == "CONFLICTED" or structural_conflict:
             label = "Unresolved structural or historical conflict"
             return _decision(
@@ -422,87 +414,32 @@ def evaluate_trading_gate(
                 broker_status=broker_status,
                 portfolio_status=portfolio_status,
                 risk_status=risk_status,
+                capital_efficiency_status=capital_efficiency_status,
             )
+
     evidence_gap = evidence_classification in {"INSUFFICIENT", "EMERGING", "PRELIMINARY"} or confidence_classification in {"LOW", "UNVALIDATED"}
     advisories: list[str] = []
     if evidence_gap:
         advisories.append(f"EVIDENCE_COLLECTION_REQUIRED:{evidence_classification}")
         advisories.append(f"EVIDENCE_CONFIDENCE:{confidence_classification}")
         advisories.append(f"STRATEGY_GOVERNANCE:{current_strategy_status}")
+    if demo_mode and (evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"} or structural_conflict or retired_veto):
+        if evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"}:
+            advisories.append(f"RETIRED_POLICY_VETO:{evidence_classification}")
+        if structural_conflict:
+            advisories.append("RETIRED_POLICY_VETO:STRUCTURAL_CONFLICT")
+        if retired_veto:
+            advisories.append(f"RETIRED_POLICY_VETO:{retired_veto}")
 
-    if not demo_mode:
-        # LIVE mode: Evidence/Governance are hard blocks.
-        if evidence_classification in {"NEGATIVE", "INVALIDATED"}:
-            label = f"Evidence state {evidence_classification} blocks live execution"
-            return _decision(
-                trading_decision="TRADE_REJECTED",
-                final_state="REJECTED",
-                reason=label,
-                reason_codes=["NEGATIVE_EVIDENCE"],
-                failures=[label],
-                advisories=advisories,
-                evidence_classification=evidence_classification,
-                confidence_classification=confidence_classification,
-                sample_size=sample_size,
-                setup_quality=setup_quality,
-                setup_confidence=current_setup_confidence,
-                strategy_status=current_strategy_status,
-                hard_gate_results=hard_gate_results,
-                objective_status=objective_status,
-                exploration_status="REJECTED",
-                broker_status=broker_status,
-                portfolio_status=portfolio_status,
-                risk_status=risk_status,
-            )
-
-        if evidence_classification == "CONFLICTED" or structural_conflict:
-            label = "Unresolved structural or historical conflict"
-            return _decision(
-                trading_decision="DEFERRED",
-                final_state="WAITING_FOR_CONFIRMATION",
-                reason=label,
-                reason_codes=["STRUCTURE_CONFLICT"],
-                failures=[label],
-                advisories=advisories,
-                evidence_classification=evidence_classification,
-                confidence_classification=confidence_classification,
-                sample_size=sample_size,
-                setup_quality=setup_quality,
-                setup_confidence=current_setup_confidence,
-                strategy_status=current_strategy_status,
-                hard_gate_results=hard_gate_results,
-                objective_status=objective_status,
-                exploration_status="DEFERRED",
-                broker_status=broker_status,
-                portfolio_status=portfolio_status,
-                risk_status=risk_status,
-            )
-    else:
-        # DEMO mode: Record these as advisories but don't block.
-        if evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"} or structural_conflict or retired_veto:
-            if evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"}:
-                advisories.append(f"RETIRED_POLICY_VETO:{evidence_classification}")
-            if structural_conflict:
-                advisories.append("RETIRED_POLICY_VETO:STRUCTURAL_CONFLICT")
-            if retired_veto:
-                advisories.append(f"RETIRED_POLICY_VETO:{retired_veto}")
-
-    # A positive but under-evidenced hypothesis must either qualify for a
-    # controlled DEMO experiment or be rejected for a concrete current-setup/
-    # configuration reason.  It must never be labelled objective-ineligible
-    # merely because evidence or promotion status is missing.
-    # Real-MT5 Learning: 50 initial experimental threshold for DEMO.
-    # Evidence gap or retired policy vetoes proceed to exploration logic.
     is_experimental_candidate = (
-        evidence_gap 
+        evidence_gap
         or evidence_classification in {"NEGATIVE", "INVALIDATED", "CONFLICTED"}
         or structural_conflict
         or retired_veto
+        or experimental_low_rr
     )
-    
     if is_experimental_candidate:
         experimental_floor = float(exploratory_threshold) if exploratory_threshold is not None else 50.0
-        
         exploration_failures: list[str] = []
         exploration_codes: list[str] = []
         if not demo_mode:
@@ -511,20 +448,17 @@ def evaluate_trading_gate(
         if not exploration_authorized:
             exploration_failures.append("Controlled DEMO exploration is not authorized")
             exploration_codes.append("EXPLORATION_NOT_AUTHORIZED")
-        
         quality_val = float(setup_quality or 0.0)
         if quality_val < experimental_floor:
             exploration_failures.append(
                 f"Setup quality {quality_val:.1f} below experimental floor {experimental_floor:.1f}"
             )
             exploration_codes.append("SETUP_TOO_WEAK")
-            
         if strategy_threshold is not None and float(strategy_quality or 0.0) < float(strategy_threshold):
             exploration_failures.append(
                 f"Strategy match {float(strategy_quality or 0.0):.1f} below exploration threshold {float(strategy_threshold):.1f}"
             )
             exploration_codes.append("STRATEGY_MATCH_TOO_WEAK")
-            
         if not exploration_failures:
             return _decision(
                 trading_decision="CONTROLLED_FORWARD_DEMO",
@@ -549,10 +483,10 @@ def evaluate_trading_gate(
                 broker_status=broker_status,
                 portfolio_status=portfolio_status,
                 risk_status=risk_status,
-                execution_class="EXPERIMENTAL",
+                capital_efficiency_status=capital_efficiency_status,
+                execution_class="EXPLORATION",
             )
         return _decision(
-
             trading_decision="NO_TRADE" if "SETUP_TOO_WEAK" in exploration_codes or "STRATEGY_MATCH_TOO_WEAK" in exploration_codes else "EXECUTION_BLOCKED",
             final_state="NO_TRADE" if "SETUP_TOO_WEAK" in exploration_codes or "STRATEGY_MATCH_TOO_WEAK" in exploration_codes else "EXECUTION_BLOCKED",
             reason="; ".join(exploration_failures),
@@ -571,11 +505,9 @@ def evaluate_trading_gate(
             broker_status=broker_status,
             portfolio_status=portfolio_status,
             risk_status=risk_status,
+            capital_efficiency_status=capital_efficiency_status,
         )
 
-    # Positive completed evidence can authorize normal execution. An explicit
-    # low-RR hypothesis remains experimental even after positive evidence; the
-    # existing governance process must promote it before it can become normal.
     if experimental_low_rr:
         return _decision(
             trading_decision="CONTROLLED_FORWARD_DEMO",
@@ -596,10 +528,9 @@ def evaluate_trading_gate(
             broker_status=broker_status,
             portfolio_status=portfolio_status,
             risk_status=risk_status,
+            capital_efficiency_status=capital_efficiency_status,
             execution_class="EXPLORATION",
         )
-    # Positive completed evidence can authorize normal execution. Champion /
-    # challenger status is deliberately reported, never used as a hidden block.
     return _decision(
         trading_decision="TRADE_APPROVED",
         final_state="EXECUTION_APPROVED",
@@ -619,6 +550,7 @@ def evaluate_trading_gate(
         broker_status=broker_status,
         portfolio_status=portfolio_status,
         risk_status=risk_status,
+        capital_efficiency_status=capital_efficiency_status,
         execution_class="PROVEN",
     )
 
