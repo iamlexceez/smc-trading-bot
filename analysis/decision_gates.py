@@ -289,11 +289,13 @@ def evaluate_trading_gate(
     broker_status = "PASS" if broker_symbol_valid and valid_market_data else "BLOCKED"
     observed_rr = float(actual_rr or 0.0)
     normal_rr_floor = float(minimum_rr or 0.0) if rr_filter_enabled and float(minimum_rr or 0.0) > 0.0 else 2.0
-    # In DEMO, lower-RR hypotheses remain observable learning candidates. The
-    # actual RR is preserved and downstream LIVE policy remains authoritative.
+    # A lower-than-normal RR is an experimental hypothesis only when explicitly
+    # authorized as such. DEMO mode alone does not silently disable RR policy;
+    # this keeps ordinary policy enforcement testable while allowing the
+    # experiment engine to deliberately create low-RR learning candidates.
     experimental_low_rr = bool(
-        demo_mode and observed_rr > 0.0 and observed_rr < normal_rr_floor
-    ) or bool(low_rr_experiment and observed_rr > 0.0 and observed_rr < normal_rr_floor)
+        low_rr_experiment and observed_rr > 0.0 and observed_rr < normal_rr_floor
+    )
     portfolio_status = "PASS" if portfolio_approved else "BLOCKED"
     risk_status = "PASS" if risk_valid else "BLOCKED"
     capital_efficiency_status = "PASS" if capital_efficiency_approved else "BLOCKED"
